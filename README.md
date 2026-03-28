@@ -52,3 +52,5 @@ curl -X POST https://your-app.up.railway.app/admin/create-license \
 ```
 
 This creates the license and emails it automatically.
+
+# Updated 03/27/2026 19:41:21
