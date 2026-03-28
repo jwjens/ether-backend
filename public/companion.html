@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Ether">
+<title>Ether Operator</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; user-select: none; }
+
+  :root {
+    --bg:     #07070e;
+    --bg2:    #0d0d1a;
+    --bg3:    #141420;
+    --border: rgba(255,255,255,0.07);
+    --text:   rgba(255,255,255,0.88);
+    --text2:  rgba(255,255,255,0.5);
+    --text3:  rgba(255,255,255,0.22);
+    --cyan:   #38bdf8;
+    --green:  #34d399;
+    --red:    #f87171;
+    --amber:  #fbbf24;
+    --purple: #a78bfa;
+  }
+
+  html, body {
+    height: 100%; background: var(--bg);
+    color: var(--text); font-family: 'Syne', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased; overflow: hidden;
+  }
+
+  /* ── CarPlay detection — wider layout ── */
+  @media (min-width: 800px) {
+    .carplay-hidden { display: none; }
+    .main-grid { grid-template-columns: 1fr 1fr !important; }
+    .control-grid { grid-template-columns: repeat(4, 1fr) !important; }
+  }
+
+  /* ── Layout ── */
+  .app {
+    height: 100vh; display: flex; flex-direction: column;
+    padding: env(safe-area-inset-top, 12px) env(safe-area-inset-right, 12px)
+             env(safe-area-inset-bottom, 12px) env(safe-area-inset-left, 12px);
+    padding-top: max(env(safe-area-inset-top), 12px);
+    gap: 10px;
+  }
+
+  /* ── On Air status bar ── */
+  .status-bar {
+    display: flex; align-items: center; gap: 10;
+    padding: 10px 14px; border-radius: 14px;
+    border: 1px solid var(--border);
+    background: var(--bg2);
+    flex-shrink: 0;
+    transition: all 0.3s;
+  }
+  .status-bar.live {
+    background: rgba(239,68,68,0.08);
+    border-color: rgba(248,113,113,0.25);
+  }
+  .live-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--text3); flex-shrink: 0;
+    transition: all 0.3s;
+  }
+  .live-dot.live {
+    background: var(--red);
+    box-shadow: 0 0 8px var(--red);
+    animation: blink 1.5s ease-in-out infinite;
+  }
+  .status-label {
+    font-size: 10px; font-weight: 800; letter-spacing: 0.16em;
+    color: var(--text3); text-transform: uppercase; transition: color 0.3s;
+  }
+  .status-label.live { color: var(--red); }
+  .uptime { font-family: 'DM Mono', monospace; font-size: 12px; color: var(--text3); margin-left: auto; }
+
+  /* ── Now Playing card ── */
+  .now-playing {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 18px; padding: 16px;
+    display: flex; gap: 14px; align-items: center;
+    flex-shrink: 0;
+  }
+  .art {
+    width: 64px; height: 64px; border-radius: 12px;
+    background: var(--bg3); border: 1px solid var(--border);
+    overflow: hidden; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 28px;
+  }
+  .art img { width: 100%; height: 100%; object-fit: cover; }
+  .track-info { flex: 1; min-width: 0; }
+  .track-title {
+    font-size: 15px; font-weight: 800; letter-spacing: -0.02em;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    margin-bottom: 3px;
+  }
+  .track-artist { font-size: 12px; color: var(--text2); margin-bottom: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .progress-wrap { position: relative; height: 3px; background: rgba(255,255,255,0.1); border-radius: 2px; }
+  .progress-fill { height: 100%; border-radius: 2px; background: var(--cyan); transition: width 1s linear; }
+  .progress-times { display: flex; justify-content: space-between; font-family: 'DM Mono', monospace; font-size: 9px; color: var(--text3); margin-top: 3px; }
+
+  /* ── Queue / main grid ── */
+  .main-grid { display: grid; grid-template-columns: 1fr; gap: 10px; flex: 1; min-height: 0; overflow: hidden; }
+
+  .panel {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 14px; overflow: hidden; display: flex; flex-direction: column;
+  }
+  .panel-header {
+    padding: 8px 14px; border-bottom: 1px solid var(--border);
+    font-size: 9px; font-weight: 800; letter-spacing: 0.14em;
+    color: var(--text3); text-transform: uppercase; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .panel-body { flex: 1; overflow-y: auto; }
+
+  /* Queue items */
+  .queue-item {
+    display: flex; align-items: center; gap: 10;
+    padding: 9px 14px; border-bottom: 1px solid var(--border);
+    transition: background 0.1s;
+  }
+  .queue-item:active { background: rgba(255,255,255,0.04); }
+  .queue-num { font-family: 'DM Mono', monospace; font-size: 10px; color: var(--text3); width: 16px; flex-shrink: 0; }
+  .queue-info { flex: 1; min-width: 0; }
+  .queue-title { font-size: 12px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .queue-artist { font-size: 10px; color: var(--text2); }
+  .queue-dur { font-family: 'DM Mono', monospace; font-size: 10px; color: var(--text3); flex-shrink: 0; }
+
+  /* ── Control buttons ── */
+  .control-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr);
+    gap: 8px; flex-shrink: 0;
+  }
+  .ctrl {
+    padding: 14px 8px; border-radius: 14px; border: none;
+    background: var(--bg2); border: 1px solid var(--border);
+    color: var(--text); font-family: 'Syne', sans-serif;
+    font-size: 11px; font-weight: 800; letter-spacing: 0.02em;
+    cursor: pointer; display: flex; flex-direction: column;
+    align-items: center; gap: 6px; transition: all 0.12s;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .ctrl:active { transform: scale(0.95); background: rgba(255,255,255,0.06); }
+  .ctrl .icon { font-size: 22px; line-height: 1; }
+  .ctrl.primary { background: var(--cyan); border-color: var(--cyan); color: #000; }
+  .ctrl.primary:active { background: #7dd3fc; }
+  .ctrl.danger { background: rgba(248,113,113,0.12); border-color: rgba(248,113,113,0.3); color: var(--red); }
+  .ctrl.warning { background: rgba(251,191,36,0.1); border-color: rgba(251,191,36,0.25); color: var(--amber); }
+  .ctrl.success { background: rgba(52,211,153,0.1); border-color: rgba(52,211,153,0.25); color: var(--green); }
+  .ctrl.active-state { background: rgba(248,113,113,0.15); border-color: rgba(248,113,113,0.4); color: var(--red); }
+
+  /* ── Deck status pills ── */
+  .deck-row { display: flex; gap: 6px; flex-shrink: 0; }
+  .deck-pill {
+    flex: 1; padding: 8px 10px; border-radius: 10px;
+    background: var(--bg2); border: 1px solid var(--border);
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .deck-pill.playing { border-color: rgba(52,211,153,0.3); background: rgba(52,211,153,0.06); }
+  .deck-label { font-size: 8px; font-weight: 800; letter-spacing: 0.14em; color: var(--text3); }
+  .deck-label.playing { color: var(--green); }
+  .deck-track { font-size: 10px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .deck-remaining { font-family: 'DM Mono', monospace; font-size: 9px; color: var(--text3); }
+
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- Status bar -->
+  <div class="status-bar" id="statusBar">
+    <div class="live-dot" id="liveDot"></div>
+    <span class="status-label" id="statusLabel">OFF AIR</span>
+    <span class="uptime" id="uptime">—</span>
+    <span style="font-size:10px;color:var(--text3);margin-left:8px" id="queueCount">Queue: —</span>
+  </div>
+
+  <!-- Now Playing -->
+  <div class="now-playing">
+    <div class="art" id="artWrap">🎵</div>
+    <div class="track-info">
+      <div class="track-title" id="trackTitle">No track loaded</div>
+      <div class="track-artist" id="trackArtist">—</div>
+      <div class="progress-wrap">
+        <div class="progress-fill" id="progressFill" style="width:0%"></div>
+      </div>
+      <div class="progress-times">
+        <span id="elapsed">0:00</span>
+        <span id="remaining">—</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Deck status row -->
+  <div class="deck-row" id="deckRow">
+    <div class="deck-pill" id="deckA">
+      <div class="deck-label" id="deckALabel">DECK A</div>
+      <div class="deck-track" id="deckATrack">—</div>
+    </div>
+    <div class="deck-pill" id="deckB">
+      <div class="deck-label" id="deckBLabel">DECK B</div>
+      <div class="deck-track" id="deckBTrack">—</div>
+    </div>
+    <div class="deck-pill" id="deckC">
+      <div class="deck-label" id="deckCLabel">DECK C</div>
+      <div class="deck-track" id="deckCTrack">—</div>
+    </div>
+  </div>
+
+  <!-- Controls -->
+  <div class="control-grid">
+    <button class="ctrl warning" onclick="sendCmd('skip')">
+      <span class="icon">⏭</span>Skip
+    </button>
+    <button class="ctrl primary" id="playPauseBtn" onclick="togglePlayPause()">
+      <span class="icon" id="playPauseIcon">⏸</span>
+      <span id="playPauseLabel">Pause</span>
+    </button>
+    <button class="ctrl" id="shuffleBtn" onclick="toggleShuffle()">
+      <span class="icon">🔀</span>Shuffle
+    </button>
+    <button class="ctrl" id="autoBtn" onclick="toggleAuto()">
+      <span class="icon">🤖</span>Auto
+    </button>
+    <button class="ctrl danger" id="onAirBtn" onclick="toggleOnAir()">
+      <span class="icon">📡</span>
+      <span id="onAirLabel">ON AIR</span>
+    </button>
+    <button class="ctrl" onclick="sendCmd('mic')">
+      <span class="icon">🎙</span>Mic
+    </button>
+  </div>
+
+  <!-- Up Next queue -->
+  <div class="panel" style="flex:1;min-height:0">
+    <div class="panel-header">
+      Up Next
+      <span id="queueLen" style="font-family:'DM Mono',monospace;font-size:10px;color:var(--text3)"></span>
+    </div>
+    <div class="panel-body" id="queueList"></div>
+  </div>
+
+</div>
+
+<script>
+// ── Config — replace with your Railway URL ──────────────────
+const API_BASE = (()=>{
+  const params = new URLSearchParams(location.search);
+  return params.get('api') || 'http://localhost:4242';
+})();
+
+let state = {
+  isPlaying: false, isLive: false, shuffleOn: false, autoOn: true,
+  title: '', artist: '', positionSec: 0, durationSec: 0,
+  queue: [], uptimeSec: 0,
+  deckA: null, deckB: null, deckC: null,
+};
+
+// ── Polling ─────────────────────────────────────────────────
+let pollTimer = null;
+
+async function poll() {
+  try {
+    const [np, q] = await Promise.all([
+      fetch(`${API_BASE}/api/now-playing`).then(r=>r.json()).catch(()=>null),
+      fetch(`${API_BASE}/api/queue`).then(r=>r.json()).catch(()=>null),
+    ]);
+    if (np) updateNowPlaying(np);
+    if (q)  updateQueue(q);
+  } catch {}
+  pollTimer = setTimeout(poll, 2000);
+}
+
+// ── Update UI ────────────────────────────────────────────────
+function updateNowPlaying(d) {
+  state.isPlaying = d.isPlaying;
+  state.isLive    = d.isLive ?? false;
+  state.title     = d.title || '';
+  state.artist    = d.artist || '';
+  state.positionSec = d.positionSec || 0;
+  state.durationSec = d.durationSec || 0;
+
+  // Status bar
+  const bar   = document.getElementById('statusBar');
+  const dot   = document.getElementById('liveDot');
+  const label = document.getElementById('statusLabel');
+  if (state.isLive) {
+    bar.className = 'status-bar live';
+    dot.className = 'live-dot live';
+    label.className = 'status-label live';
+    label.textContent = 'ON AIR';
+    document.getElementById('onAirBtn').className = 'ctrl active-state';
+    document.getElementById('onAirLabel').textContent = 'GO OFF';
+  } else {
+    bar.className = 'status-bar';
+    dot.className = 'live-dot';
+    label.className = 'status-label';
+    label.textContent = 'OFF AIR';
+    document.getElementById('onAirBtn').className = 'ctrl danger';
+    document.getElementById('onAirLabel').textContent = 'ON AIR';
+  }
+
+  // Uptime
+  if (d.uptimeSec) {
+    const h=Math.floor(d.uptimeSec/3600), m=Math.floor((d.uptimeSec%3600)/60), s=d.uptimeSec%60;
+    document.getElementById('uptime').textContent = h>0 ? `${h}h ${m}m` : `${m}m ${s}s`;
+  }
+
+  // Queue count
+  if (d.queueLen !== undefined) {
+    document.getElementById('queueCount').textContent = `Queue: ${d.queueLen}`;
+    document.getElementById('queueLen').textContent = d.queueLen;
+  }
+
+  // Track info
+  document.getElementById('trackTitle').textContent = state.title || 'No track';
+  document.getElementById('trackArtist').textContent = state.artist || '—';
+
+  // Art
+  const artWrap = document.getElementById('artWrap');
+  if (d.artUrl) {
+    artWrap.innerHTML = `<img src="${d.artUrl}" alt="art">`;
+  } else {
+    artWrap.innerHTML = '🎵';
+  }
+
+  // Progress
+  const pct = state.durationSec > 0 ? (state.positionSec / state.durationSec) * 100 : 0;
+  document.getElementById('progressFill').style.width = pct + '%';
+  document.getElementById('elapsed').textContent = fmt(state.positionSec);
+  document.getElementById('remaining').textContent = state.durationSec > 0 ? '-' + fmt(state.durationSec - state.positionSec) : '—';
+
+  // Play/pause button
+  const playing = state.isPlaying;
+  document.getElementById('playPauseIcon').textContent = playing ? '⏸' : '▶';
+  document.getElementById('playPauseLabel').textContent = playing ? 'Pause' : 'Play';
+  document.getElementById('playPauseBtn').className = playing ? 'ctrl primary' : 'ctrl success';
+
+  // Decks
+  if (d.decks) {
+    ['A','B','C'].forEach(id => {
+      const deck = d.decks[id];
+      const pill  = document.getElementById(`deck${id}`);
+      const label = document.getElementById(`deck${id}Label`);
+      const track = document.getElementById(`deck${id}Track`);
+      if (deck?.title) {
+        track.textContent = deck.title;
+        if (deck.status === 'playing') {
+          pill.className = 'deck-pill playing';
+          label.className = 'deck-label playing';
+          label.textContent = `DECK ${id} ▶`;
+        } else {
+          pill.className = 'deck-pill';
+          label.className = 'deck-label';
+          label.textContent = `DECK ${id}`;
+        }
+      } else {
+        track.textContent = '—';
+        pill.className = 'deck-pill';
+        label.className = 'deck-label';
+        label.textContent = `DECK ${id}`;
+      }
+    });
+  }
+
+  // Shuffle / Auto state
+  if (d.shuffleOn !== undefined) {
+    document.getElementById('shuffleBtn').className = 'ctrl' + (d.shuffleOn ? ' success' : '');
+  }
+  if (d.autoOn !== undefined) {
+    document.getElementById('autoBtn').className = 'ctrl' + (d.autoOn ? ' success' : '');
+  }
+}
+
+function updateQueue(items) {
+  const list = document.getElementById('queueList');
+  if (!items.length) { list.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text3);font-size:12px">Queue empty</div>'; return; }
+  list.innerHTML = items.slice(0,20).map((t,i) => `
+    <div class="queue-item">
+      <div class="queue-num">${i+1}</div>
+      <div class="queue-info">
+        <div class="queue-title">${esc(t.title||'')}</div>
+        <div class="queue-artist">${esc(t.artist||'')}</div>
+      </div>
+      <div class="queue-dur">${fmtMs(t.durationMs||0)}</div>
+    </div>
+  `).join('');
+}
+
+// ── Commands ─────────────────────────────────────────────────
+async function sendCmd(cmd, data={}) {
+  // Visual feedback
+  try {
+    await fetch(`${API_BASE}/api/cmd`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({cmd, ...data}),
+    });
+  } catch {}
+  // Optimistic UI update
+  setTimeout(poll, 300);
+}
+
+function togglePlayPause() {
+  const cmd = state.isPlaying ? 'pause' : 'play';
+  state.isPlaying = !state.isPlaying;
+  document.getElementById('playPauseIcon').textContent = state.isPlaying ? '⏸' : '▶';
+  document.getElementById('playPauseLabel').textContent = state.isPlaying ? 'Pause' : 'Play';
+  sendCmd(cmd);
+}
+
+function toggleOnAir() {
+  sendCmd(state.isLive ? 'stream_stop' : 'stream_start');
+}
+
+function toggleShuffle() {
+  state.shuffleOn = !state.shuffleOn;
+  document.getElementById('shuffleBtn').className = 'ctrl' + (state.shuffleOn ? ' success' : '');
+  sendCmd('shuffle', {on: state.shuffleOn});
+}
+
+function toggleAuto() {
+  state.autoOn = !state.autoOn;
+  document.getElementById('autoBtn').className = 'ctrl' + (state.autoOn ? ' success' : '');
+  sendCmd('auto', {on: state.autoOn});
+}
+
+// ── Helpers ──────────────────────────────────────────────────
+function fmt(s) {
+  s = Math.max(0, Math.floor(s));
+  const m = Math.floor(s/60), sec = s%60;
+  return `${m}:${String(sec).padStart(2,'0')}`;
+}
+function fmtMs(ms) {
+  const s=Math.floor(ms/1000), m=Math.floor(s/60);
+  return `${m}:${String(s%60).padStart(2,'0')}`;
+}
+function esc(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── Start ────────────────────────────────────────────────────
+poll();
+
+// Local clock tick for progress bar smoothness
+setInterval(() => {
+  if (!state.isPlaying || !state.durationSec) return;
+  state.positionSec = Math.min(state.durationSec, state.positionSec + 1);
+  const pct = (state.positionSec / state.durationSec) * 100;
+  document.getElementById('progressFill').style.width = pct + '%';
+  document.getElementById('elapsed').textContent = fmt(state.positionSec);
+  document.getElementById('remaining').textContent = '-' + fmt(state.durationSec - state.positionSec);
+}, 1000);
+</script>
+</body>
+</html>

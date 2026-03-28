@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Ether — Join Session</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=Inter:wght@400;500;600;700&family=DM+Mono:wght@400&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  :root {
+    --bg: #08080f; --bg2: #0e0e1a; --bg3: #14141f;
+    --cyan: #38bdf8; --green: #34d399; --purple: #a78bfa;
+    --red: #f87171; --amber: #fbbf24;
+    --text: rgba(255,255,255,0.88); --text2: rgba(255,255,255,0.5); --text3: rgba(255,255,255,0.22);
+    --border: rgba(255,255,255,0.08);
+  }
+  html, body { height: 100%; background: var(--bg); color: var(--text); font-family: 'Inter', system-ui, sans-serif; -webkit-font-smoothing: antialiased; overflow: hidden; }
+
+  .screen { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; transition: opacity 0.3s; }
+  .screen.hidden { opacity: 0; pointer-events: none; }
+
+  /* ── Logo ── */
+  .logo { display: flex; align-items: center; gap: 10px; margin-bottom: 32px; }
+  .logo-icon { width: 36px; height: 36px; border-radius: 10px; background: linear-gradient(135deg, var(--cyan), var(--purple)); display: flex; align-items: center; justify-content: center; font-size: 18px; }
+  .logo-text { font-family: 'Syne', sans-serif; font-size: 20px; font-weight: 800; letter-spacing: -0.02em; }
+
+  /* ── Welcome screen ── */
+  .welcome-card {
+    width: 100%; max-width: 380px;
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 20px; padding: 28px 24px;
+    box-shadow: 0 32px 80px rgba(0,0,0,0.6);
+  }
+  .welcome-tag { font-size: 9px; font-weight: 800; letter-spacing: 0.16em; color: var(--cyan); text-transform: uppercase; margin-bottom: 8px; }
+  .welcome-title { font-family: 'Syne', sans-serif; font-size: 22px; font-weight: 800; letter-spacing: -0.03em; margin-bottom: 6px; }
+  .welcome-sub { font-size: 13px; color: var(--text2); line-height: 1.5; margin-bottom: 24px; }
+
+  .name-input {
+    width: 100%; padding: 13px 16px; border-radius: 12px;
+    background: var(--bg3); border: 1px solid var(--border);
+    color: var(--text); font-size: 15px; font-family: 'Inter', sans-serif;
+    outline: none; margin-bottom: 12px; transition: border-color 0.15s;
+  }
+  .name-input:focus { border-color: rgba(56,189,248,0.4); }
+  .name-input::placeholder { color: var(--text3); }
+
+  /* Video toggle */
+  .toggle-row { display: flex; align-items: center; justify-content: space-between; padding: 14px 0; border-top: 1px solid var(--border); margin-bottom: 16px; }
+  .toggle-label { display: flex; flex-direction: column; gap: 2px; }
+  .toggle-label span:first-child { font-size: 13px; font-weight: 600; }
+  .toggle-label span:last-child { font-size: 11px; color: var(--text3); }
+  .toggle { position: relative; width: 44px; height: 26px; }
+  .toggle input { opacity: 0; width: 0; height: 0; }
+  .toggle-slider { position: absolute; inset: 0; background: var(--bg3); border: 1px solid var(--border); border-radius: 13px; cursor: pointer; transition: all 0.2s; }
+  .toggle-slider::before { content: ''; position: absolute; width: 20px; height: 20px; left: 2px; top: 2px; background: var(--text3); border-radius: 50%; transition: all 0.2s; }
+  .toggle input:checked + .toggle-slider { background: rgba(56,189,248,0.2); border-color: rgba(56,189,248,0.4); }
+  .toggle input:checked + .toggle-slider::before { transform: translateX(18px); background: var(--cyan); }
+
+  .join-btn {
+    width: 100%; padding: 15px; border-radius: 12px; border: none;
+    background: var(--cyan); color: #000;
+    font-size: 14px; font-weight: 800; font-family: 'Syne', sans-serif;
+    letter-spacing: 0.02em; cursor: pointer;
+    transition: all 0.15s; box-shadow: 0 4px 20px rgba(56,189,248,0.3);
+  }
+  .join-btn:active { transform: scale(0.98); }
+  .join-btn:disabled { background: var(--bg3); color: var(--text3); box-shadow: none; cursor: default; }
+
+  /* ── Preview screen ── */
+  .preview-wrap { width: 100%; max-width: 380px; display: flex; flex-direction: column; gap: 16px; align-items: center; }
+  .video-preview {
+    width: 100%; aspect-ratio: 16/9; border-radius: 16px;
+    background: var(--bg2); border: 1px solid var(--border);
+    overflow: hidden; position: relative;
+  }
+  video { width: 100%; height: 100%; object-fit: cover; }
+  .video-off-overlay { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; }
+  .video-off-icon { width: 48px; height: 48px; border-radius: 16px; background: var(--bg3); display: flex; align-items: center; justify-content: center; font-size: 22px; }
+  .preview-controls { display: flex; gap: 12px; justify-content: center; }
+  .ctrl-btn { width: 52px; height: 52px; border-radius: 16px; border: 1px solid var(--border); background: var(--bg2); color: var(--text); font-size: 20px; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all 0.15s; }
+  .ctrl-btn.active { background: rgba(56,189,248,0.15); border-color: rgba(56,189,248,0.4); }
+  .ctrl-btn.muted { background: rgba(239,68,68,0.12); border-color: rgba(239,68,68,0.3); }
+
+  /* ── Live screen ── */
+  .live-wrap { width: 100%; max-width: 380px; display: flex; flex-direction: column; gap: 0; align-items: center; }
+  .live-header { width: 100%; text-align: center; margin-bottom: 20px; }
+  .live-badge { display: inline-flex; align-items: center; gap: 6px; padding: 5px 14px; border-radius: 20px; background: rgba(239,68,68,0.12); border: 1px solid rgba(239,68,68,0.25); color: var(--red); font-size: 10px; font-weight: 800; letter-spacing: 0.12em; margin-bottom: 10px; }
+  .live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--red); animation: blink 1.5s ease-in-out infinite; }
+  .live-show-title { font-family: 'Syne', sans-serif; font-size: 18px; font-weight: 800; margin-bottom: 4px; }
+  .live-host { font-size: 12px; color: var(--text2); }
+
+  .live-video { width: 100%; aspect-ratio: 16/9; border-radius: 16px; background: var(--bg2); border: 1px solid var(--border); overflow: hidden; position: relative; margin-bottom: 16px; }
+  .self-pip { position: absolute; bottom: 10px; right: 10px; width: 80px; aspect-ratio: 9/16; border-radius: 8px; background: var(--bg3); border: 1px solid var(--border); overflow: hidden; }
+  .self-pip video { width: 100%; height: 100%; object-fit: cover; }
+  .name-tag { position: absolute; bottom: 8px; left: 8px; background: rgba(0,0,0,0.6); backdrop-filter: blur(8px); padding: 3px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; }
+
+  .live-controls { display: flex; gap: 12px; justify-content: center; margin-bottom: 16px; }
+  .sig-meter { width: 100%; }
+  .sig-label { display: flex; justify-content: space-between; font-size: 10px; color: var(--text3); margin-bottom: 4px; }
+  .sig-bar { height: 4px; background: var(--bg3); border-radius: 2px; overflow: hidden; }
+  .sig-fill { height: 100%; border-radius: 2px; background: var(--green); transition: width 0.1s; }
+  .leave-btn { width: 100%; padding: 14px; border-radius: 12px; border: none; background: rgba(239,68,68,0.12); color: var(--red); font-size: 13px; font-weight: 700; cursor: pointer; border: 1px solid rgba(239,68,68,0.2); margin-top: 8px; }
+
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+  @keyframes pulse { 0%,100%{transform:scale(1)} 50%{transform:scale(1.05)} }
+</style>
+</head>
+<body>
+
+<!-- ── Screen 1: Welcome ── -->
+<div class="screen" id="screen-welcome">
+  <div class="logo">
+    <div class="logo-icon">🎙</div>
+    <div class="logo-text">Ether</div>
+  </div>
+  <div class="welcome-card">
+    <div class="welcome-tag">You're invited</div>
+    <div class="welcome-title" id="show-title">Live Podcast Session</div>
+    <div class="welcome-sub" id="show-host">Joining as a guest. Your audio and video will go directly to the host's mixer.</div>
+    <input class="name-input" id="guest-name" type="text" placeholder="Your name" maxlength="30" />
+    <div class="toggle-row">
+      <div class="toggle-label">
+        <span>Share video</span>
+        <span>Host will see your camera</span>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="video-toggle" checked>
+        <span class="toggle-slider"></span>
+      </label>
+    </div>
+    <button class="join-btn" id="join-btn" onclick="goToPreview()">Continue →</button>
+  </div>
+</div>
+
+<!-- ── Screen 2: Preview ── -->
+<div class="screen hidden" id="screen-preview">
+  <div class="preview-wrap">
+    <div class="logo">
+      <div class="logo-icon">🎙</div>
+      <div class="logo-text">Check your setup</div>
+    </div>
+    <div class="video-preview" id="preview-video-wrap">
+      <video id="preview-video" autoplay muted playsinline></video>
+      <div class="video-off-overlay hidden" id="video-off-overlay">
+        <div class="video-off-icon">📷</div>
+        <div style="font-size:12px;color:var(--text3)">Camera off</div>
+      </div>
+    </div>
+    <div class="preview-controls">
+      <button class="ctrl-btn active" id="mic-btn" onclick="toggleMic()" title="Mute mic">🎤</button>
+      <button class="ctrl-btn active" id="cam-btn" onclick="toggleCam()" title="Turn off camera">📷</button>
+    </div>
+    <div style="width:100%">
+      <div style="font-size:11px;color:var(--text3);text-align:center;margin-bottom:16px;">Make sure you can see yourself and your mic is working</div>
+      <button class="join-btn" onclick="joinLive()">Join Session</button>
+      <button onclick="goToWelcome()" style="width:100%;padding:12px;background:none;border:none;color:var(--text3);font-size:12px;cursor:pointer;margin-top:8px;">← Back</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Screen 3: Live ── -->
+<div class="screen hidden" id="screen-live">
+  <div class="live-wrap">
+    <div class="live-header">
+      <div class="live-badge"><div class="live-dot"></div>LIVE</div>
+      <div class="live-show-title" id="live-show-title">Live Podcast Session</div>
+      <div class="live-host" id="live-host-label"></div>
+    </div>
+
+    <!-- Video area: shows remote (host) or just self preview -->
+    <div class="live-video" id="live-video-wrap">
+      <video id="remote-video" autoplay playsinline style="width:100%;height:100%;object-fit:cover;"></video>
+      <div id="no-video-msg" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;">
+        <div style="font-size:32px">🎙</div>
+        <div style="font-size:13px;color:var(--text2);font-weight:600">Audio only</div>
+        <div style="font-size:11px;color:var(--text3)">You're connected to the show</div>
+      </div>
+      <!-- Self PiP -->
+      <div class="self-pip" id="self-pip">
+        <video id="self-video" autoplay muted playsinline></video>
+        <div class="name-tag" id="self-name-tag">You</div>
+      </div>
+    </div>
+
+    <div class="live-controls">
+      <button class="ctrl-btn active" id="live-mic-btn" onclick="toggleLiveMic()" title="Mute">🎤</button>
+      <button class="ctrl-btn active" id="live-cam-btn" onclick="toggleLiveCam()" title="Camera">📷</button>
+    </div>
+
+    <div class="sig-meter">
+      <div class="sig-label"><span>Your signal</span><span id="sig-db">—</span></div>
+      <div class="sig-bar"><div class="sig-fill" id="sig-fill" style="width:0%"></div></div>
+    </div>
+
+    <button class="leave-btn" onclick="leaveSession()">Leave Session</button>
+  </div>
+</div>
+
+<script>
+// ── State ─────────────────────────────────────────────────────
+const token = location.pathname.split('/').pop() || new URLSearchParams(location.search).get('token') || 'demo';
+const params = new URLSearchParams(location.search);
+let localStream = null;
+let peerConn = null;
+let audioCtx = null;
+let analyser = null;
+let sigRaf = null;
+let micEnabled = true;
+let camEnabled = true;
+let liveMicEnabled = true;
+let liveCamEnabled = true;
+
+// Read show info from URL params
+const showTitle = params.get('show') || 'Live Podcast Session';
+const hostName = params.get('host') || 'Host';
+document.getElementById('show-title').textContent = showTitle;
+document.getElementById('show-host').textContent = `Hosted by ${hostName} · Your audio and video go directly to the mixer.`;
+document.getElementById('live-show-title').textContent = showTitle;
+document.getElementById('live-host-label').textContent = `Hosted by ${hostName}`;
+
+// ── Navigation ────────────────────────────────────────────────
+function show(id) {
+  ['screen-welcome','screen-preview','screen-live'].forEach(s => {
+    document.getElementById(s).classList.toggle('hidden', s !== id);
+  });
+}
+
+function goToWelcome() { show('screen-welcome'); stopLocalStream(); }
+
+async function goToPreview() {
+  const name = document.getElementById('guest-name').value.trim();
+  if (!name) { document.getElementById('guest-name').focus(); document.getElementById('guest-name').style.borderColor = 'var(--red)'; return; }
+  document.getElementById('guest-name').style.borderColor = '';
+  show('screen-preview');
+  await startLocalStream();
+}
+
+async function joinLive() {
+  show('screen-live');
+  document.getElementById('self-name-tag').textContent = document.getElementById('guest-name').value.trim() || 'Guest';
+
+  // Mirror local stream to self-pip
+  const selfVid = document.getElementById('self-video');
+  if (localStream) selfVid.srcObject = localStream;
+
+  // Hide self pip if no video
+  if (!camEnabled) document.getElementById('self-pip').style.display = 'none';
+
+  // Connect to signaling — notify host
+  connectToHost();
+  startSignalMeter();
+}
+
+function goToWelcome() { show('screen-welcome'); stopLocalStream(); }
+
+// ── Media ─────────────────────────────────────────────────────
+async function startLocalStream() {
+  stopLocalStream();
+  const withVideo = document.getElementById('video-toggle').checked;
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 48000 },
+      video: withVideo ? { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' } : false,
+    });
+    camEnabled = withVideo;
+    const previewVid = document.getElementById('preview-video');
+    previewVid.srcObject = localStream;
+    document.getElementById('video-off-overlay').classList.toggle('hidden', withVideo);
+  } catch (e) {
+    // Try audio only
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      camEnabled = false;
+      document.getElementById('video-off-overlay').classList.remove('hidden');
+      document.getElementById('cam-btn').classList.remove('active');
+    } catch { console.error('No media access', e); }
+  }
+}
+
+function stopLocalStream() {
+  if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+}
+
+function toggleMic() {
+  micEnabled = !micEnabled;
+  if (localStream) localStream.getAudioTracks().forEach(t => t.enabled = micEnabled);
+  const btn = document.getElementById('mic-btn');
+  btn.textContent = micEnabled ? '🎤' : '🔇';
+  btn.className = 'ctrl-btn ' + (micEnabled ? 'active' : 'muted');
+}
+
+function toggleCam() {
+  camEnabled = !camEnabled;
+  if (localStream) localStream.getVideoTracks().forEach(t => t.enabled = camEnabled);
+  const btn = document.getElementById('cam-btn');
+  btn.textContent = camEnabled ? '📷' : '🚫';
+  btn.className = 'ctrl-btn ' + (camEnabled ? 'active' : '');
+  document.getElementById('video-off-overlay').classList.toggle('hidden', camEnabled);
+}
+
+function toggleLiveMic() {
+  liveMicEnabled = !liveMicEnabled;
+  if (localStream) localStream.getAudioTracks().forEach(t => t.enabled = liveMicEnabled);
+  const btn = document.getElementById('live-mic-btn');
+  btn.textContent = liveMicEnabled ? '🎤' : '🔇';
+  btn.className = 'ctrl-btn ' + (liveMicEnabled ? 'active' : 'muted');
+}
+
+function toggleLiveCam() {
+  liveCamEnabled = !liveCamEnabled;
+  if (localStream) localStream.getVideoTracks().forEach(t => t.enabled = liveCamEnabled);
+  const btn = document.getElementById('live-cam-btn');
+  btn.textContent = liveCamEnabled ? '📷' : '🚫';
+  btn.className = 'ctrl-btn ' + (liveCamEnabled ? 'active' : '');
+  document.getElementById('self-pip').style.display = liveCamEnabled ? 'block' : 'none';
+}
+
+// ── WebRTC / Signaling ────────────────────────────────────────
+// In production this connects to wss://signal.etherradio.app
+// For now, POST presence to backend so host app is notified via polling
+
+async function connectToHost() {
+  const name = document.getElementById('guest-name').value.trim();
+  const hasVideo = camEnabled;
+
+  // Notify host via Railway backend
+  try {
+    await fetch(`https://ether-backend.railway.app/guest/join`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token, name, hasVideo, ts: Date.now() }),
+    }).catch(() => {});
+  } catch {}
+
+  // Real WebRTC would go here — create RTCPeerConnection, add tracks, exchange SDP
+  // For now simulate connection quality
+  document.getElementById('no-video-msg').style.display = 'none';
+}
+
+function startSignalMeter() {
+  if (!localStream) return;
+  try {
+    audioCtx = new AudioContext();
+    const src = audioCtx.createMediaStreamSource(localStream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 256;
+    src.connect(analyser);
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    const tick = () => {
+      analyser.getByteFrequencyData(data);
+      const avg = data.reduce((s,v) => s+v, 0) / data.length / 255;
+      const pct = Math.min(100, avg * 300);
+      document.getElementById('sig-fill').style.width = pct + '%';
+      document.getElementById('sig-fill').style.background = pct > 80 ? 'var(--red)' : pct > 50 ? 'var(--amber)' : 'var(--green)';
+      const db = avg > 0.001 ? Math.round(20 * Math.log10(avg * 3)) : null;
+      document.getElementById('sig-db').textContent = db !== null ? db + ' dB' : '—';
+      sigRaf = requestAnimationFrame(tick);
+    };
+    sigRaf = requestAnimationFrame(tick);
+  } catch {}
+}
+
+async function leaveSession() {
+  if (sigRaf) cancelAnimationFrame(sigRaf);
+  if (audioCtx) audioCtx.close();
+  stopLocalStream();
+  try {
+    await fetch(`https://ether-backend.railway.app/guest/leave`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+    }).catch(() => {});
+  } catch {}
+  show('screen-welcome');
+}
+
+// Warn before leaving
+window.addEventListener('beforeunload', e => {
+  if (document.getElementById('screen-live') && !document.getElementById('screen-live').classList.contains('hidden')) {
+    e.preventDefault(); e.returnValue = '';
+  }
+});
+</script>
+</body>
+</html>

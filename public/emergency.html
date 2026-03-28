@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Ether Emergency">
+<title>Ether — Emergency Override</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=DM+Mono:wght@400;500&family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; user-select: none; }
+:root {
+  --bg:     #07070e;
+  --bg2:    #0d0d1a;
+  --bg3:    #13131f;
+  --border: rgba(255,255,255,0.07);
+  --text:   #f0f0f8;
+  --text2:  rgba(240,240,248,0.55);
+  --text3:  rgba(240,240,248,0.25);
+  --cyan:   #38bdf8;
+  --green:  #34d399;
+  --red:    #f87171;
+  --amber:  #fbbf24;
+  --purple: #a78bfa;
+}
+html, body {
+  height: 100%; background: var(--bg); color: var(--text);
+  font-family: 'Inter', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased; overflow-x: hidden;
+}
+.app {
+  min-height: 100vh; display: flex; flex-direction: column;
+  padding: env(safe-area-inset-top, 0) env(safe-area-inset-right, 0)
+           env(safe-area-inset-bottom, 16px) env(safe-area-inset-left, 0);
+  padding-top: max(env(safe-area-inset-top), 0px);
+}
+
+/* Header */
+header {
+  padding: 14px 20px 12px;
+  display: flex; align-items: center; justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+  background: rgba(7,7,14,0.95); backdrop-filter: blur(20px);
+  position: sticky; top: 0; z-index: 10;
+}
+.logo { display: flex; align-items: center; gap: 8px; font-family: 'Syne', sans-serif; font-size: 15px; font-weight: 800; }
+.logo-icon { width: 28px; height: 28px; border-radius: 8px; background: linear-gradient(135deg, #f87171, #ef4444); display: flex; align-items: center; justify-content: center; }
+.status-pill {
+  display: flex; align-items: center; gap: 5px; padding: 4px 10px;
+  border-radius: 20px; font-size: 9px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
+}
+.status-pill.connected { background: rgba(52,211,153,0.12); color: var(--green); border: 1px solid rgba(52,211,153,0.25); }
+.status-pill.disconnected { background: rgba(255,255,255,0.04); color: var(--text3); border: 1px solid var(--border); }
+.status-dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+.status-pill.connected .status-dot { animation: blink 1.5s ease-in-out infinite; }
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+/* Auth screen */
+.auth-screen {
+  flex: 1; display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  padding: 32px 24px; gap: 16px; text-align: center;
+}
+.auth-icon { width: 64px; height: 64px; border-radius: 18px; background: rgba(248,113,113,0.1); border: 1px solid rgba(248,113,113,0.2); display: flex; align-items: center; justify-content: center; margin-bottom: 4px; }
+.auth-title { font-family: 'Syne', sans-serif; font-size: 20px; font-weight: 800; }
+.auth-sub { font-size: 13px; color: var(--text2); line-height: 1.6; max-width: 280px; }
+.auth-input {
+  width: 100%; max-width: 320px; padding: 13px 16px;
+  border-radius: 12px; background: var(--bg2); border: 1px solid var(--border);
+  color: var(--text); font-size: 14px; outline: none; font-family: 'DM Mono', monospace;
+  text-align: center; letter-spacing: 2px;
+}
+.auth-input:focus { border-color: var(--red); }
+.auth-btn {
+  width: 100%; max-width: 320px; padding: 14px;
+  border-radius: 12px; background: var(--red); color: #fff;
+  font-size: 14px; font-weight: 800; border: none; cursor: pointer;
+  font-family: 'Syne', sans-serif; letter-spacing: 0.02em;
+  box-shadow: 0 4px 24px rgba(239,68,68,0.3);
+}
+.auth-error { font-size: 12px; color: var(--red); }
+
+/* Now playing bar */
+.now-playing-bar {
+  margin: 14px 16px 4px;
+  padding: 12px 14px;
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: 12px;
+  display: flex; align-items: center; gap: 12px;
+}
+.np-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); flex-shrink: 0; animation: blink 1.2s ease-in-out infinite; }
+.np-dot.off { background: var(--text3); animation: none; }
+.np-info { flex: 1; min-width: 0; }
+.np-title { font-size: 13px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.np-artist { font-size: 10px; color: var(--text3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.np-time { font-size: 10px; color: var(--text3); font-family: 'DM Mono', monospace; flex-shrink: 0; }
+
+/* Section label */
+.section-label {
+  font-size: 9px; font-weight: 700; letter-spacing: 0.18em;
+  color: var(--text3); text-transform: uppercase;
+  padding: 16px 20px 8px;
+}
+
+/* Emergency actions */
+.actions { padding: 0 16px; display: flex; flex-direction: column; gap: 10px; }
+
+.action-btn {
+  display: flex; align-items: center; gap: 14px;
+  padding: 16px 18px; border-radius: 14px;
+  border: none; cursor: pointer; text-align: left; width: 100%;
+  transition: all 0.15s; position: relative; overflow: hidden;
+}
+.action-btn:active { transform: scale(0.97); }
+.action-icon {
+  width: 42px; height: 42px; border-radius: 11px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 20px;
+}
+.action-info { flex: 1; min-width: 0; }
+.action-title { font-size: 14px; font-weight: 700; color: #fff; margin-bottom: 2px; }
+.action-sub { font-size: 11px; opacity: 0.65; color: #fff; }
+.action-arrow { font-size: 16px; color: rgba(255,255,255,0.3); flex-shrink: 0; }
+
+/* Button styles */
+.btn-red    { background: rgba(239,68,68,0.15); border: 1px solid rgba(248,113,113,0.3); }
+.btn-amber  { background: rgba(251,191,36,0.12); border: 1px solid rgba(251,191,36,0.25); }
+.btn-purple { background: rgba(167,139,250,0.12); border: 1px solid rgba(167,139,250,0.25); }
+.btn-cyan   { background: rgba(56,189,248,0.1);  border: 1px solid rgba(56,189,248,0.2); }
+.btn-green  { background: rgba(52,211,153,0.1);  border: 1px solid rgba(52,211,153,0.2); }
+.btn-dark   { background: rgba(255,255,255,0.04); border: 1px solid var(--border); }
+
+/* Confirm overlay */
+.confirm-overlay {
+  position: fixed; inset: 0; z-index: 100;
+  background: rgba(0,0,0,0.85); backdrop-filter: blur(8px);
+  display: flex; align-items: flex-end; justify-content: center;
+  padding: 0 0 env(safe-area-inset-bottom, 24px);
+  padding-bottom: max(env(safe-area-inset-bottom), 24px);
+}
+.confirm-sheet {
+  width: 100%; max-width: 420px;
+  background: var(--bg2); border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 24px 24px 16px 16px;
+  padding: 24px 24px 16px;
+  animation: slide-up 0.25s cubic-bezier(0.34,1.56,0.64,1);
+}
+@keyframes slide-up { from{transform:translateY(100%);opacity:0} to{transform:translateY(0);opacity:1} }
+.confirm-title { font-family: 'Syne', sans-serif; font-size: 18px; font-weight: 800; margin-bottom: 6px; }
+.confirm-sub { font-size: 13px; color: var(--text2); line-height: 1.5; margin-bottom: 24px; }
+.confirm-btns { display: flex; flex-direction: column; gap: 8px; }
+.confirm-yes {
+  padding: 14px; border-radius: 12px; border: none; cursor: pointer;
+  font-size: 14px; font-weight: 800; font-family: 'Syne', sans-serif;
+  letter-spacing: 0.02em;
+}
+.confirm-no {
+  padding: 13px; border-radius: 12px; border: 1px solid var(--border);
+  background: transparent; color: var(--text2); font-size: 13px; cursor: pointer;
+}
+
+/* Toast */
+.toast {
+  position: fixed; bottom: calc(env(safe-area-inset-bottom, 16px) + 16px); left: 50%; transform: translateX(-50%);
+  background: var(--bg2); border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 10px; padding: 10px 18px;
+  font-size: 12px; font-weight: 600; color: var(--text);
+  white-space: nowrap; z-index: 200;
+  animation: toast-in 0.2s ease;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+}
+@keyframes toast-in { from{opacity:0;transform:translateX(-50%) translateY(8px)} to{opacity:1;transform:translateX(-50%) translateY(0)} }
+
+.log-section { padding: 0 16px 20px; }
+.log-item {
+  display: flex; gap: 10px; padding: 7px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.04); font-size: 11px;
+}
+.log-time { color: var(--text3); font-family: 'DM Mono', monospace; flex-shrink: 0; width: 44px; }
+.log-msg { color: var(--text2); }
+.log-msg.success { color: var(--green); }
+.log-msg.error   { color: var(--red); }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <header>
+    <div class="logo">
+      <div class="logo-icon">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5" stroke-linecap="round">
+          <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+          <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+        </svg>
+      </div>
+      Emergency Override
+    </div>
+    <div class="status-pill disconnected" id="statusPill">
+      <div class="status-dot"></div>
+      <span id="statusLabel">Offline</span>
+    </div>
+  </header>
+
+  <!-- Auth screen -->
+  <div id="authScreen" class="auth-screen">
+    <div class="auth-icon">
+      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="var(--red)" stroke-width="1.5" stroke-linecap="round">
+        <rect x="3" y="11" width="18" height="11" rx="2"/>
+        <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+      </svg>
+    </div>
+    <div class="auth-title">Station Access</div>
+    <div class="auth-sub">Enter your admin PIN to access emergency controls</div>
+    <input class="auth-input" id="pinInput" type="password" inputmode="numeric" maxlength="8" placeholder="PIN" autocomplete="current-password">
+    <div class="auth-error" id="authError" style="display:none"></div>
+    <button class="auth-btn" onclick="submitPin()">Unlock Emergency Controls</button>
+    <div style="font-size:11px;color:var(--text3)">Same PIN used in Ether → User Login</div>
+  </div>
+
+  <!-- Main controls (shown after auth) -->
+  <div id="mainScreen" style="display:none; flex:1; overflow-y:auto">
+
+    <!-- Now Playing -->
+    <div class="now-playing-bar">
+      <div class="np-dot off" id="npDot"></div>
+      <div class="np-info">
+        <div class="np-title" id="npTitle">Not connected</div>
+        <div class="np-artist" id="npArtist">—</div>
+      </div>
+      <div class="np-time" id="npTime">—:——</div>
+    </div>
+
+    <!-- Emergency Actions -->
+    <div class="section-label">Emergency Controls</div>
+    <div class="actions">
+
+      <button class="action-btn btn-red" onclick="confirm_action('stop_all', 'Stop All Audio', 'This will immediately stop all decks and mute all audio. Use for technical emergencies.', '#ef4444')">
+        <div class="action-icon" style="background:rgba(239,68,68,0.15)">🛑</div>
+        <div class="action-info">
+          <div class="action-title">Stop All Audio</div>
+          <div class="action-sub">Immediately halt all decks</div>
+        </div>
+        <div class="action-arrow">›</div>
+      </button>
+
+      <button class="action-btn btn-amber" onclick="confirm_action('play_emergency_cart', 'Play Emergency Cart', 'Plays the emergency/EAS cart immediately on Deck A, interrupting current audio.', '#f59e0b')">
+        <div class="action-icon" style="background:rgba(245,158,11,0.12)">⚠️</div>
+        <div class="action-info">
+          <div class="action-title">Play Emergency Cart</div>
+          <div class="action-sub">Trigger EAS / emergency audio</div>
+        </div>
+        <div class="action-arrow">›</div>
+      </button>
+
+      <button class="action-btn btn-amber" onclick="confirm_action('mic_on', 'Open Mic', 'Opens the live mic immediately and ducks all music. Close the mic from the Ether app when done.', '#f59e0b')">
+        <div class="action-icon" style="background:rgba(245,158,11,0.12)">🎙️</div>
+        <div class="action-info">
+          <div class="action-title">Open Live Mic</div>
+          <div class="action-sub">Duck music, open mic channel</div>
+        </div>
+        <div class="action-arrow">›</div>
+      </button>
+
+    </div>
+
+    <!-- Playback Controls -->
+    <div class="section-label">Playback</div>
+    <div class="actions">
+
+      <button class="action-btn btn-green" onclick="send_cmd('play', {}, 'Sent: Resume playback')">
+        <div class="action-icon" style="background:rgba(52,211,153,0.1)">▶️</div>
+        <div class="action-info">
+          <div class="action-title">Resume Playback</div>
+          <div class="action-sub">Resume paused deck</div>
+        </div>
+        <div class="action-arrow">›</div>
+      </button>
+
+      <button class="action-btn btn-dark" onclick="send_cmd('pause', {}, 'Sent: Pause')">
+        <div class="action-icon" style="background:rgba(255,255,255,0.05)">⏸️</div>
+        <div class="action-info">
+          <div class="action-title">Pause</div>
+          <div class="action-sub">Pause active deck</div>
+        </div>
+        <div class="action-arrow">›</div>
+      </button>
+
+      <button class="action-btn btn-cyan" onclick="send_cmd('skip', {}, 'Sent: Skip to next track')">
+        <div class="action-icon" style="background:rgba(56,189,248,0.08)">⏭️</div>
+        <div class="action-info">
+          <div class="action-title">Skip Track</div>
+          <div class="action-sub">Jump to next in queue</div>
+        </div>
+        <div class="action-arrow">›</div>
+      </button>
+
+      <button class="action-btn btn-purple" onclick="confirm_action('automation_off', 'Disable Automation', 'Switch to Live Assist mode — automation will stop scheduling new tracks. You will need to manually start tracks.', '#a78bfa')">
+        <div class="action-icon" style="background:rgba(167,139,250,0.1)">🤖</div>
+        <div class="action-info">
+          <div class="action-title">Disable Automation</div>
+          <div class="action-sub">Switch to Live Assist mode</div>
+        </div>
+        <div class="action-arrow">›</div>
+      </button>
+
+      <button class="action-btn btn-green" onclick="send_cmd('automation_on', {}, 'Sent: Automation enabled')">
+        <div class="action-icon" style="background:rgba(52,211,153,0.08)">✅</div>
+        <div class="action-info">
+          <div class="action-title">Enable Automation</div>
+          <div class="action-sub">Return to auto mode</div>
+        </div>
+        <div class="action-arrow">›</div>
+      </button>
+
+    </div>
+
+    <!-- Volume -->
+    <div class="section-label">Master Volume</div>
+    <div style="padding: 0 16px 8px">
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:14px;padding:16px 18px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+          <span style="font-size:12px;font-weight:600;color:var(--text2)">Master Fader</span>
+          <span style="font-size:13px;font-weight:700;font-family:'DM Mono',monospace;color:var(--cyan)" id="volLabel">100%</span>
+        </div>
+        <input type="range" id="volSlider" min="0" max="100" value="100" oninput="onVolume(this.value)"
+          style="width:100%;-webkit-appearance:none;height:4px;border-radius:2px;background:linear-gradient(to right, var(--cyan) 100%, rgba(255,255,255,0.1) 100%);outline:none;cursor:pointer">
+        <div style="display:flex;justify-content:space-between;margin-top:6px;font-size:9px;color:var(--text3);font-family:'DM Mono',monospace">
+          <span>0%</span><span>50%</span><span>100%</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Action log -->
+    <div class="section-label">Action Log</div>
+    <div class="log-section">
+      <div id="actionLog"></div>
+      <div style="font-size:10px;color:var(--text3);text-align:center;padding:8px 0" id="logEmpty">No actions sent yet</div>
+    </div>
+
+  </div>
+</div>
+
+<!-- Confirm sheet -->
+<div class="confirm-overlay" id="confirmOverlay" style="display:none" onclick="closeConfirm(event)">
+  <div class="confirm-sheet" onclick="event.stopPropagation()">
+    <div class="confirm-title" id="confirmTitle">Confirm</div>
+    <div class="confirm-sub" id="confirmSub"></div>
+    <div class="confirm-btns">
+      <button class="confirm-yes" id="confirmYes" onclick="executeConfirmed()">Confirm</button>
+      <button class="confirm-no" onclick="closeConfirm()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = 'https://ether-backend-production.up.railway.app';
+const ADMIN_PIN = localStorage.getItem('ether_emergency_pin') || '';
+
+let authenticated = false;
+let pendingCmd    = null;
+let pollTimer     = null;
+let logEntries    = [];
+
+// ── Auth ──────────────────────────────────────────────────────
+
+// Auto-auth if PIN saved
+if (ADMIN_PIN) {
+  document.getElementById('pinInput').value = ADMIN_PIN;
+  document.getElementById('authScreen').style.display = 'none';
+  document.getElementById('mainScreen').style.display = 'block';
+  authenticated = true;
+  startPolling();
+}
+
+function submitPin() {
+  const pin = document.getElementById('pinInput').value.trim();
+  if (!pin) return;
+  // We store it locally — PIN is validated by the desktop when it executes commands
+  localStorage.setItem('ether_emergency_pin', pin);
+  document.getElementById('authScreen').style.display = 'none';
+  document.getElementById('mainScreen').style.display = 'block';
+  authenticated = true;
+  startPolling();
+}
+
+// ── Polling ───────────────────────────────────────────────────
+
+function startPolling() {
+  pollNowPlaying();
+  pollTimer = setInterval(pollNowPlaying, 3000);
+}
+
+async function pollNowPlaying() {
+  try {
+    const res  = await fetch(`${API}/api/now-playing`, { signal: AbortSignal.timeout(4000) });
+    const data = await res.json();
+
+    const pill  = document.getElementById('statusPill');
+    const label = document.getElementById('statusLabel');
+    const dot   = document.getElementById('npDot');
+
+    if (data.playing) {
+      pill.className = 'status-pill connected';
+      label.textContent = 'Live';
+      dot.className = 'np-dot';
+    } else {
+      pill.className = 'status-pill connected';
+      label.textContent = 'Connected';
+      dot.className = 'np-dot off';
+    }
+
+    document.getElementById('npTitle').textContent  = data.title  || (data.playing ? 'Unknown' : 'Nothing playing');
+    document.getElementById('npArtist').textContent = data.artist || '—';
+
+    const pos = data.position || 0;
+    const dur = data.duration || 0;
+    document.getElementById('npTime').textContent = dur > 0
+      ? `${fmt(pos)} / ${fmt(dur)}`
+      : data.playing ? fmt(pos) : '—:——';
+
+  } catch {
+    document.getElementById('statusPill').className  = 'status-pill disconnected';
+    document.getElementById('statusLabel').textContent = 'Offline';
+  }
+}
+
+// ── Commands ──────────────────────────────────────────────────
+
+async function send_cmd(cmd, data = {}, toastMsg = null) {
+  try {
+    const pin = localStorage.getItem('ether_emergency_pin') || '';
+    await fetch(`${API}/api/cmd`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cmd, pin, ...data }),
+    });
+    addLog(toastMsg || `Sent: ${cmd}`, 'success');
+    showToast(toastMsg || `✓ ${cmd}`);
+  } catch (e) {
+    addLog(`Failed: ${cmd} — ${e.message}`, 'error');
+    showToast(`⚠ Failed to send command`);
+  }
+}
+
+// Commands that need confirmation
+let pendingAction = null;
+
+function confirm_action(cmd, title, description, color = '#ef4444') {
+  pendingAction = { cmd, title };
+  document.getElementById('confirmTitle').textContent = title;
+  document.getElementById('confirmSub').textContent   = description;
+  const btn = document.getElementById('confirmYes');
+  btn.style.background = color;
+  btn.style.color = color === '#f59e0b' ? '#000' : '#fff';
+  btn.textContent = `Confirm — ${title}`;
+  document.getElementById('confirmOverlay').style.display = 'flex';
+}
+
+function closeConfirm(e) {
+  if (e && e.target !== document.getElementById('confirmOverlay')) return;
+  document.getElementById('confirmOverlay').style.display = 'none';
+  pendingAction = null;
+}
+
+function executeConfirmed() {
+  if (!pendingAction) return;
+  document.getElementById('confirmOverlay').style.display = 'none';
+  send_cmd(pendingAction.cmd, {}, `Sent: ${pendingAction.title}`);
+  pendingAction = null;
+}
+
+// Volume
+let volDebounce = null;
+function onVolume(val) {
+  document.getElementById('volLabel').textContent = val + '%';
+  const slider = document.getElementById('volSlider');
+  slider.style.background = `linear-gradient(to right, var(--cyan) ${val}%, rgba(255,255,255,0.1) ${val}%)`;
+  clearTimeout(volDebounce);
+  volDebounce = setTimeout(() => {
+    send_cmd('set_volume', { volume: parseInt(val) / 100 }, `Volume → ${val}%`);
+  }, 300);
+}
+
+// ── Log ───────────────────────────────────────────────────────
+
+function addLog(msg, type = '') {
+  const now = new Date();
+  const t   = now.getHours().toString().padStart(2,'0') + ':' + now.getMinutes().toString().padStart(2,'0') + ':' + now.getSeconds().toString().padStart(2,'0');
+  logEntries.unshift({ t, msg, type });
+  if (logEntries.length > 20) logEntries.pop();
+
+  const el = document.getElementById('actionLog');
+  const empty = document.getElementById('logEmpty');
+  empty.style.display = 'none';
+  el.innerHTML = logEntries.map(e => `
+    <div class="log-item">
+      <div class="log-time">${e.t}</div>
+      <div class="log-msg ${e.type}">${e.msg}</div>
+    </div>`).join('');
+}
+
+// ── Toast ─────────────────────────────────────────────────────
+
+let toastTimer = null;
+function showToast(msg) {
+  const existing = document.querySelector('.toast');
+  if (existing) existing.remove();
+  clearTimeout(toastTimer);
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.textContent = msg;
+  document.body.appendChild(el);
+  toastTimer = setTimeout(() => el.remove(), 2500);
+}
+
+// ── Helpers ───────────────────────────────────────────────────
+
+function fmt(s) {
+  if (!s || s <= 0) return '0:00';
+  return Math.floor(s/60) + ':' + String(Math.floor(s%60)).padStart(2,'0');
+}
+</script>
+</body>
+</html>
