@@ -74,6 +74,11 @@ const upload = multer
 
 // ── DB init ───────────────────────────────────────────────────
 
+// Per-plan machine activation limits.
+// A single license can be active on this many machines simultaneously.
+// Users can deactivate machines to free up slots.
+const PLAN_MACHINE_LIMITS = { free: 1, pro: 2, station: 5 };
+
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS licenses (
@@ -85,6 +90,19 @@ async function initDB() {
       active          BOOLEAN DEFAULT true,
       created_at      TIMESTAMPTZ DEFAULT NOW(),
       last_validated  TIMESTAMPTZ
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS license_activations (
+      id              SERIAL PRIMARY KEY,
+      license_key     TEXT NOT NULL,
+      machine_id      TEXT NOT NULL,
+      machine_name    TEXT,
+      os              TEXT,
+      ip_address      TEXT,
+      activated_at    TIMESTAMPTZ DEFAULT NOW(),
+      last_seen       TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(license_key, machine_id)
     )
   `);
   await pool.query(`
@@ -108,9 +126,10 @@ async function initDB() {
       joined_at  TIMESTAMPTZ DEFAULT NOW()
     )
   `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_licenses_key    ON licenses(license_key)`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_licenses_email  ON licenses(email)`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_backups_station ON backups(station_id)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_licenses_key      ON licenses(license_key)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_licenses_email    ON licenses(email)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_activations_key   ON license_activations(license_key)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_backups_station   ON backups(station_id)`);
   await pool.query(`DELETE FROM guest_presence WHERE joined_at < NOW() - INTERVAL '24 hours'`).catch(() => {});
   console.log("[DB] Schema ready");
 }
@@ -191,6 +210,7 @@ app.get("/companion",   (req, res) => res.sendFile(path.join(PUBLIC, "companion.
 app.get("/join/:token", (req, res) => res.sendFile(path.join(PUBLIC, "guest-join.html")));
 app.get("/dashboard",   (req, res) => res.sendFile(path.join(PUBLIC, "dashboard.html")));
 app.get("/emergency",   (req, res) => res.sendFile(path.join(PUBLIC, "emergency.html")));
+app.get("/console",     (req, res) => res.sendFile(path.join(PUBLIC, "console.html")));
 
 // ── Health ────────────────────────────────────────────────────
 
@@ -202,10 +222,13 @@ app.get("/health", (req, res) =>
 
 app.post("/validate", async (req, res) => {
   try {
-    const { license_key, email } = req.body;
+    const { license_key, email, machine_id, machine_name, os } = req.body;
     if (!license_key?.trim() || !email?.trim())
       return res.status(400).json({ valid: false, error: "Missing license_key or email" });
+    if (!machine_id?.trim())
+      return res.status(400).json({ valid: false, error: "Missing machine_id — please update to the latest Ether version." });
 
+    // 1. Verify license exists and is active for this email
     const { rows } = await pool.query(
       "SELECT * FROM licenses WHERE license_key=$1 AND email=$2 AND active=true",
       [license_key.trim(), email.trim().toLowerCase()]
@@ -213,11 +236,113 @@ app.post("/validate", async (req, res) => {
     if (!rows.length)
       return res.json({ valid: false, error: "License key not found or does not match this email." });
 
-    await pool.query("UPDATE licenses SET last_validated=NOW() WHERE id=$1", [rows[0].id]);
-    res.json({ valid: true, plan: rows[0].plan, email: rows[0].email });
+    const license = rows[0];
+    const limit = PLAN_MACHINE_LIMITS[license.plan] ?? 1;
+    const ip = (req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress || "").trim();
+
+    // 2. Check if this machine is already activated for this license
+    const { rows: existingActivations } = await pool.query(
+      "SELECT * FROM license_activations WHERE license_key=$1 AND machine_id=$2",
+      [license.license_key, machine_id.trim()]
+    );
+
+    if (existingActivations.length) {
+      // Already activated on this machine → just update last_seen
+      await pool.query(
+        "UPDATE license_activations SET last_seen=NOW(), ip_address=$1 WHERE id=$2",
+        [ip, existingActivations[0].id]
+      );
+    } else {
+      // 3. Not activated here — check if we have room
+      const { rows: activeList } = await pool.query(
+        "SELECT machine_id, machine_name, os, activated_at, last_seen FROM license_activations WHERE license_key=$1 ORDER BY last_seen DESC",
+        [license.license_key]
+      );
+
+      if (activeList.length >= limit) {
+        return res.status(403).json({
+          valid: false,
+          error: "activation_limit_reached",
+          message: `This license is already active on ${activeList.length} of ${limit} allowed machines. Deactivate one to install here.`,
+          limit,
+          plan: license.plan,
+          activations: activeList,
+        });
+      }
+
+      // 4. Register this machine as a new activation
+      await pool.query(
+        "INSERT INTO license_activations (license_key, machine_id, machine_name, os, ip_address) VALUES ($1,$2,$3,$4,$5)",
+        [license.license_key, machine_id.trim(), machine_name || null, os || null, ip]
+      );
+      console.log(`[Activation] ${license.license_key} → ${machine_name || machine_id.slice(0, 8)} (${activeList.length + 1}/${limit})`);
+    }
+
+    await pool.query("UPDATE licenses SET last_validated=NOW() WHERE id=$1", [license.id]);
+    res.json({
+      valid: true,
+      plan: license.plan,
+      email: license.email,
+      machine_limit: limit,
+    });
   } catch (e) {
     console.error("[/validate]", e.message);
     res.status(500).json({ valid: false, error: "Server error — please try again." });
+  }
+});
+
+// ── License activations ───────────────────────────────────────
+//
+// GET /licenses/:key/activations  → list of machines this license is active on
+// POST /licenses/:key/deactivate  → remove a machine from this license
+//     body: { email, machine_id }  (email acts as a lightweight owner check)
+
+app.get("/licenses/:key/activations", async (req, res) => {
+  try {
+    const key = req.params.key.trim();
+    const email = (req.query.email || "").toString().trim().toLowerCase();
+    if (!email) return res.status(400).json({ error: "Missing email query param" });
+
+    const { rows: lic } = await pool.query(
+      "SELECT * FROM licenses WHERE license_key=$1 AND email=$2 AND active=true",
+      [key, email]
+    );
+    if (!lic.length) return res.status(404).json({ error: "License not found" });
+
+    const { rows: activations } = await pool.query(
+      "SELECT machine_id, machine_name, os, ip_address, activated_at, last_seen FROM license_activations WHERE license_key=$1 ORDER BY last_seen DESC",
+      [key]
+    );
+    const limit = PLAN_MACHINE_LIMITS[lic[0].plan] ?? 1;
+    res.json({ plan: lic[0].plan, limit, activations });
+  } catch (e) {
+    console.error("[/licenses/:key/activations]", e.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post("/licenses/:key/deactivate", async (req, res) => {
+  try {
+    const key = req.params.key.trim();
+    const { email, machine_id } = req.body;
+    if (!email?.trim() || !machine_id?.trim())
+      return res.status(400).json({ error: "Missing email or machine_id" });
+
+    const { rows: lic } = await pool.query(
+      "SELECT * FROM licenses WHERE license_key=$1 AND email=$2 AND active=true",
+      [key, email.trim().toLowerCase()]
+    );
+    if (!lic.length) return res.status(404).json({ error: "License not found" });
+
+    const { rowCount } = await pool.query(
+      "DELETE FROM license_activations WHERE license_key=$1 AND machine_id=$2",
+      [key, machine_id.trim()]
+    );
+    console.log(`[Deactivation] ${key} → ${machine_id.slice(0, 8)} (removed ${rowCount})`);
+    res.json({ ok: true, removed: rowCount });
+  } catch (e) {
+    console.error("[/licenses/:key/deactivate]", e.message);
+    res.status(500).json({ error: "Server error" });
   }
 });
 
