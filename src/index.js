@@ -566,16 +566,26 @@ app.post("/invite/send", async (req, res) => {
     if (!inviteLink || !inviteLink.startsWith("https://guests.ether-technologies.com/"))
       return res.status(400).json({ error: "inviteLink must start with https://guests.ether-technologies.com/" });
 
-    const from    = process.env.FROM_EMAIL || "Ether <invites@ether-technologies.com>";
-    const safeLink = escapeHtml(inviteLink);
+    const from = process.env.FROM_EMAIL || "Ether <invites@ether-technologies.com>";
 
-    const subject = hostName
-      ? `${hostName} is inviting you to join a live broadcast`
-      : "You're invited to join a live broadcast";
+    const subject = showName
+      ? `${showName} is inviting you to join live`
+      : hostName
+      ? `${hostName} is inviting you to join live`
+      : "You're invited to join live";
 
-    const greeting  = guestName ? `Hi ${escapeHtml(guestName)},` : "Hi there,";
-    const introLine = hostName
-      ? `${escapeHtml(hostName)} is inviting you to join a live broadcast.`
+    const headerLabel = showName
+      ? showName.toUpperCase()
+      : hostName
+      ? hostName.toUpperCase()
+      : "LIVE INVITE";
+
+    const greeting = guestName ? `Hi ${escapeHtml(guestName)},` : "Hi there,";
+
+    const introLine = showName
+      ? `<strong>${escapeHtml(showName)}</strong> is inviting you to join a live broadcast.`
+      : hostName
+      ? `<strong>${escapeHtml(hostName)}</strong> is inviting you to join a live broadcast.`
       : "You're invited to join a live broadcast.";
 
     const personalBlock = personalMessage
@@ -595,7 +605,7 @@ app.post("/invite/send", async (req, res) => {
 <body style="margin:0; padding:0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background:#f5f5f5;">
   <div style="max-width: 560px; margin: 40px auto; background: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.08);">
     <div style="background: linear-gradient(180deg, #4a2370 0%, #2d1747 100%); padding: 32px; text-align: center;">
-      <div style="color: #ffffff; font-size: 13px; font-weight: 700; letter-spacing: 0.2em; text-transform: uppercase; opacity: 0.7; margin-bottom: 6px;">Ether</div>
+      <div style="color: #ffffff; font-size: 13px; font-weight: 700; letter-spacing: 0.2em; opacity: 0.7; margin-bottom: 6px;">${escapeHtml(headerLabel)}</div>
       <h1 style="margin: 0; color: #ffffff; font-weight: 300; font-size: 26px; letter-spacing: -0.5px;">You're invited to join live</h1>
     </div>
     <div style="padding: 32px;">
@@ -603,11 +613,11 @@ app.post("/invite/send", async (req, res) => {
       <p style="margin: 0 0 16px 0; color: #2d1747; font-size: 16px;">${introLine}</p>
       ${personalBlock}
       <div style="text-align: center; margin: 32px 0 0 0;">
-        <a href="${safeLink}" style="display: inline-block; background: #6841a0; color: #ffffff; padding: 14px 40px; text-decoration: none; border-radius: 4px; font-weight: 700; font-size: 16px; letter-spacing: 0.02em;">Join Live</a>
+        <a href="${inviteLink}" style="display: inline-block; background: #6841a0; color: #ffffff; padding: 14px 40px; text-decoration: none; border-radius: 4px; font-weight: 700; font-size: 16px;">Join Live</a>
       </div>
       ${roomCodeBlock}
-      <p style="margin: 24px 0 0 0; color: #6b7280; font-size: 13px;">Or paste this link into your browser:<br><a href="${safeLink}" style="color: #6841a0; word-break: break-all;">${safeLink}</a></p>
-      <p style="margin: 28px 0 0 0; color: #9ca3af; font-size: 12px; border-top: 1px solid #e5e7eb; padding-top: 18px; line-height: 1.5;">When you click "Join Live," your browser will ask permission for your camera and microphone. The link is unique to this broadcast.</p>
+      <p style="margin: 24px 0 0 0; color: #6b7280; font-size: 13px;">Or paste this link into your browser:<br><a href="${inviteLink}" style="color: #6841a0; word-break: break-all;">${inviteLink}</a></p>
+      <p style="margin: 28px 0 0 0; color: #9ca3af; font-size: 12px; border-top: 1px solid #e5e7eb; padding-top: 18px; line-height: 1.5;">When you click "Join Live," your browser will ask permission for your camera and microphone.</p>
     </div>
   </div>
 </body>
