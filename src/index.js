@@ -142,6 +142,14 @@ function generateLicenseKey(plan) {
   return `${prefix}-${rand.slice(0,4)}-${rand.slice(4,8)}-${rand.slice(8,12)}`;
 }
 
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
 async function sendLicenseEmail(email, licenseKey, plan) {
   const label = plan === "station" ? "Station" : "Pro";
   const price = plan === "station" ? "$79/mo" : "$19/mo";
@@ -541,6 +549,71 @@ app.delete("/backup/:id", requireLicense, async (req, res) => {
   } catch (e) {
     console.error("[backup/delete]", e.message);
     res.status(500).json({ error: "Delete failed" });
+  }
+});
+
+// ── Invite email ─────────────────────────────────────────────
+
+app.post("/invite/send", requireLicense, async (req, res) => {
+  try {
+    const { to, inviteLink, hostName, stationName } = req.body;
+
+    // Validate recipient address
+    if (!to || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to))
+      return res.status(400).json({ error: "Invalid or missing 'to' email address" });
+
+    // Only allow links pointing at our signaling domain
+    if (!inviteLink || !inviteLink.startsWith("https://guests.ether-technologies.com/"))
+      return res.status(400).json({ error: "inviteLink must start with https://guests.ether-technologies.com/" });
+
+    const from       = process.env.FROM_EMAIL || "noreply@etherradio.app";
+    const safeHost   = escapeHtml(hostName   || "Your host");
+    const safeStation = escapeHtml(stationName || "Ether Radio");
+    const safeLink   = escapeHtml(inviteLink);
+
+    const { data, error } = await resend.emails.send({
+      from,
+      to,
+      subject: `${safeStation} — You're invited to join live`,
+      html: `
+<div style="font-family:system-ui,sans-serif;max-width:560px;margin:0 auto;padding:0;background:#0d0d18;color:#f0f0f8;border-radius:12px;overflow:hidden">
+  <div style="background:linear-gradient(135deg,#0f172a 0%,#1e1b4b 100%);padding:32px 28px 24px">
+    <div style="font-size:22px;font-weight:900;color:#22d3ee;letter-spacing:-0.5px;margin-bottom:2px">Ether Radio</div>
+    <div style="font-size:10px;letter-spacing:2.5px;text-transform:uppercase;color:#475569">Live Guest Invite</div>
+  </div>
+  <div style="padding:28px 28px 24px">
+    <p style="font-size:17px;font-weight:700;margin:0 0 12px">${safeHost} is inviting you to join live</p>
+    <p style="color:#94a3b8;font-size:13px;line-height:1.7;margin:0 0 24px">
+      You've been invited to appear as a live guest on <strong style="color:#f0f0f8">${safeStation}</strong>.
+      Click the button below to join — no account or download required.
+    </p>
+    <div style="text-align:center;margin-bottom:28px">
+      <a href="${safeLink}" style="display:inline-block;background:#22d3ee;color:#0d0d18;font-weight:800;font-size:14px;padding:14px 32px;border-radius:8px;text-decoration:none;letter-spacing:0.3px">
+        Join Live
+      </a>
+    </div>
+    <div style="background:#0f172a;border:1px solid #1e293b;border-radius:8px;padding:14px 16px;word-break:break-all">
+      <div style="font-size:10px;color:#475569;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px">Or paste this link</div>
+      <a href="${safeLink}" style="font-family:'Courier New',monospace;font-size:12px;color:#22d3ee;text-decoration:none">${safeLink}</a>
+    </div>
+  </div>
+  <div style="padding:16px 28px 20px;border-top:1px solid #1e293b;font-size:11px;color:#334155;line-height:1.6">
+    Sent via <a href="https://etherradio.app" style="color:#22d3ee;text-decoration:none">Ether Radio</a> ·
+    If you weren't expecting this, you can safely ignore it.
+  </div>
+</div>`,
+    });
+
+    if (error) {
+      console.error(`[invite/send] Resend error (${req.license.license_key.slice(0, 8)}…):`, error);
+      return res.status(502).json({ error: "Email delivery failed", detail: error.message });
+    }
+
+    console.log(`[invite/send] ${req.license.license_key.slice(0, 8)}… → ${to} (id=${data?.id})`);
+    res.json({ ok: true, id: data?.id });
+  } catch (e) {
+    console.error("[invite/send]", e.message);
+    res.status(500).json({ error: "Server error" });
   }
 });
 
