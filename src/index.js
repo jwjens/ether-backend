@@ -556,7 +556,7 @@ app.delete("/backup/:id", requireLicense, async (req, res) => {
 
 app.post("/invite/send", async (req, res) => {
   try {
-    const { to, inviteLink, hostName, stationName } = req.body;
+    const { to, inviteLink, hostName, showName, guestName, personalMessage, roomCode } = req.body || {};
 
     // Validate recipient address
     if (!to || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to))
@@ -566,43 +566,54 @@ app.post("/invite/send", async (req, res) => {
     if (!inviteLink || !inviteLink.startsWith("https://guests.ether-technologies.com/"))
       return res.status(400).json({ error: "inviteLink must start with https://guests.ether-technologies.com/" });
 
-    const from       = process.env.FROM_EMAIL || "noreply@etherradio.app";
-    const safeHost   = escapeHtml(hostName   || "Your host");
-    const safeStation = escapeHtml(stationName || "Ether Radio");
-    const safeLink   = escapeHtml(inviteLink);
+    const from    = process.env.FROM_EMAIL || "Ether <invites@ether-technologies.com>";
+    const safeLink = escapeHtml(inviteLink);
 
-    const { data, error } = await resend.emails.send({
-      from,
-      to,
-      subject: `${safeStation} — You're invited to join live`,
-      html: `
-<div style="font-family:system-ui,sans-serif;max-width:560px;margin:0 auto;padding:0;background:#0d0d18;color:#f0f0f8;border-radius:12px;overflow:hidden">
-  <div style="background:linear-gradient(135deg,#0f172a 0%,#1e1b4b 100%);padding:32px 28px 24px">
-    <div style="font-size:22px;font-weight:900;color:#22d3ee;letter-spacing:-0.5px;margin-bottom:2px">Ether Radio</div>
-    <div style="font-size:10px;letter-spacing:2.5px;text-transform:uppercase;color:#475569">Live Guest Invite</div>
-  </div>
-  <div style="padding:28px 28px 24px">
-    <p style="font-size:17px;font-weight:700;margin:0 0 12px">${safeHost} is inviting you to join live</p>
-    <p style="color:#94a3b8;font-size:13px;line-height:1.7;margin:0 0 24px">
-      You've been invited to appear as a live guest on <strong style="color:#f0f0f8">${safeStation}</strong>.
-      Click the button below to join — no account or download required.
-    </p>
-    <div style="text-align:center;margin-bottom:28px">
-      <a href="${safeLink}" style="display:inline-block;background:#22d3ee;color:#0d0d18;font-weight:800;font-size:14px;padding:14px 32px;border-radius:8px;text-decoration:none;letter-spacing:0.3px">
-        Join Live
-      </a>
+    const subject = hostName
+      ? `${hostName} is inviting you to join a live broadcast`
+      : "You're invited to join a live broadcast";
+
+    const greeting  = guestName ? `Hi ${escapeHtml(guestName)},` : "Hi there,";
+    const introLine = hostName
+      ? `${escapeHtml(hostName)} is inviting you to join a live broadcast.`
+      : "You're invited to join a live broadcast.";
+
+    const personalBlock = personalMessage
+      ? `<div style="margin: 20px 0; padding: 14px 18px; background: #f5f3ff; border-left: 3px solid #6841a0; color: #2d1747; font-size: 15px; line-height: 1.5;">${escapeHtml(personalMessage)}</div>`
+      : "";
+
+    const roomCodeBlock = roomCode
+      ? `<div style="margin: 28px 0; text-align: center;">
+           <div style="font-size: 11px; font-weight: 700; color: #6841a0; letter-spacing: 0.16em; margin-bottom: 8px;">ROOM CODE</div>
+           <div style="display: inline-block; padding: 14px 28px; background: #f5f3ff; border: 2px solid #6841a0; color: #2d1747; font-size: 36px; font-weight: 700; letter-spacing: 0.4em; font-family: 'Courier New', monospace;">${escapeHtml(String(roomCode))}</div>
+           <div style="font-size: 13px; color: #6b7280; margin-top: 10px;">Enter this code on the join page</div>
+         </div>`
+      : "";
+
+    const html = `<!DOCTYPE html>
+<html>
+<body style="margin:0; padding:0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background:#f5f5f5;">
+  <div style="max-width: 560px; margin: 40px auto; background: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.08);">
+    <div style="background: linear-gradient(180deg, #4a2370 0%, #2d1747 100%); padding: 32px; text-align: center;">
+      <div style="color: #ffffff; font-size: 13px; font-weight: 700; letter-spacing: 0.2em; text-transform: uppercase; opacity: 0.7; margin-bottom: 6px;">Ether</div>
+      <h1 style="margin: 0; color: #ffffff; font-weight: 300; font-size: 26px; letter-spacing: -0.5px;">You're invited to join live</h1>
     </div>
-    <div style="background:#0f172a;border:1px solid #1e293b;border-radius:8px;padding:14px 16px;word-break:break-all">
-      <div style="font-size:10px;color:#475569;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px">Or paste this link</div>
-      <a href="${safeLink}" style="font-family:'Courier New',monospace;font-size:12px;color:#22d3ee;text-decoration:none">${safeLink}</a>
+    <div style="padding: 32px;">
+      <p style="margin: 0 0 16px 0; color: #2d1747; font-size: 16px;">${greeting}</p>
+      <p style="margin: 0 0 16px 0; color: #2d1747; font-size: 16px;">${introLine}</p>
+      ${personalBlock}
+      <div style="text-align: center; margin: 32px 0 0 0;">
+        <a href="${safeLink}" style="display: inline-block; background: #6841a0; color: #ffffff; padding: 14px 40px; text-decoration: none; border-radius: 4px; font-weight: 700; font-size: 16px; letter-spacing: 0.02em;">Join Live</a>
+      </div>
+      ${roomCodeBlock}
+      <p style="margin: 24px 0 0 0; color: #6b7280; font-size: 13px;">Or paste this link into your browser:<br><a href="${safeLink}" style="color: #6841a0; word-break: break-all;">${safeLink}</a></p>
+      <p style="margin: 28px 0 0 0; color: #9ca3af; font-size: 12px; border-top: 1px solid #e5e7eb; padding-top: 18px; line-height: 1.5;">When you click "Join Live," your browser will ask permission for your camera and microphone. The link is unique to this broadcast.</p>
     </div>
   </div>
-  <div style="padding:16px 28px 20px;border-top:1px solid #1e293b;font-size:11px;color:#334155;line-height:1.6">
-    Sent via <a href="https://etherradio.app" style="color:#22d3ee;text-decoration:none">Ether Radio</a> ·
-    If you weren't expecting this, you can safely ignore it.
-  </div>
-</div>`,
-    });
+</body>
+</html>`;
+
+    const { data, error } = await resend.emails.send({ from, to, subject, html });
 
     if (error) {
       console.error(`[invite/send] Resend error:`, error);
