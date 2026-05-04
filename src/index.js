@@ -554,7 +554,7 @@ app.delete("/backup/:id", requireLicense, async (req, res) => {
 
 // ── Invite email ─────────────────────────────────────────────
 
-app.post("/invite/send", requireLicense, async (req, res) => {
+app.post("/invite/send", async (req, res) => {
   try {
     const { to, inviteLink, hostName, stationName } = req.body;
 
@@ -605,11 +605,11 @@ app.post("/invite/send", requireLicense, async (req, res) => {
     });
 
     if (error) {
-      console.error(`[invite/send] Resend error (${req.license.license_key.slice(0, 8)}…):`, error);
+      console.error(`[invite/send] Resend error:`, error);
       return res.status(502).json({ error: "Email delivery failed", detail: error.message });
     }
 
-    console.log(`[invite/send] ${req.license.license_key.slice(0, 8)}… → ${to} (id=${data?.id})`);
+    console.log(`[invite/send] Sent to ${to} (id=${data?.id})`);
     res.json({ ok: true, id: data?.id });
   } catch (e) {
     console.error("[invite/send]", e.message);
