@@ -239,6 +239,11 @@
     </button>
   </div>
 
+  <!-- License key warning -->
+  <div id="keyWarning" style="display:none;background:rgba(248,113,113,0.12);border:1px solid rgba(248,113,113,0.3);border-radius:10px;padding:10px 14px;font-size:11px;color:#f87171;text-align:center;flex-shrink:0">
+    &#x26A0; No license key — add <code style="background:rgba(248,113,113,0.1);padding:1px 4px;border-radius:3px;font-family:'DM Mono',monospace">?key=YOUR-KEY</code> to the URL
+  </div>
+
   <!-- Up Next queue -->
   <div class="panel" style="flex:1;min-height:0">
     <div class="panel-header">
@@ -252,10 +257,9 @@
 
 <script>
 // ── Config — replace with your Railway URL ──────────────────
-const API_BASE = (()=>{
-  const params = new URLSearchParams(location.search);
-  return params.get('api') || 'http://localhost:4242';
-})();
+const params = new URLSearchParams(location.search);
+const API_BASE   = params.get('api') || 'http://localhost:4242';
+const licenseKey = params.get('key') || '';
 
 let state = {
   isPlaying: false, isLive: false, shuffleOn: false, autoOn: true,
@@ -397,14 +401,14 @@ function updateQueue(items) {
 
 // ── Commands ─────────────────────────────────────────────────
 async function sendCmd(cmd, data={}) {
-  // Visual feedback
   try {
+    const headers = {'Content-Type':'application/json'};
+    if (licenseKey) headers['x-license-key'] = licenseKey;
     await fetch(`${API_BASE}/api/cmd`, {
-      method: 'POST', headers: {'Content-Type':'application/json'},
+      method: 'POST', headers,
       body: JSON.stringify({cmd, ...data}),
     });
   } catch {}
-  // Optimistic UI update
   setTimeout(poll, 300);
 }
 
@@ -448,6 +452,7 @@ function esc(s) {
 
 // ── Start ────────────────────────────────────────────────────
 poll();
+if (!licenseKey) document.getElementById('keyWarning').style.display = '';
 
 // Local clock tick for progress bar smoothness
 setInterval(() => {
