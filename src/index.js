@@ -292,6 +292,7 @@ app.post("/validate", async (req, res) => {
       plan: license.plan,
       email: license.email,
       machine_limit: limit,
+      license_key: license.license_key,
     });
   } catch (e) {
     console.error("[/validate]", e.message);
@@ -422,7 +423,7 @@ app.post("/webhook/stripe", async (req, res) => {
 
 // ── Now Playing ───────────────────────────────────────────────
 
-app.post("/api/now-playing", (req, res) => {
+app.post("/api/now-playing", requireLicense, (req, res) => {
   nowPlaying.data = { ...req.body, updated_at: Date.now() };
   res.json({ ok: true });
 });
@@ -433,7 +434,7 @@ app.get("/api/now-playing", (req, res) => {
 
 // ── Companion command bus ─────────────────────────────────────
 
-app.post("/api/cmd", (req, res) => {
+app.post("/api/cmd", requireLicense, (req, res) => {
   const { cmd } = req.body;
   if (!cmd) return res.status(400).json({ error: "Missing cmd" });
   pendingCmds.push({ cmd, data: req.body, ts: Math.floor(Date.now() / 1000) });
@@ -441,7 +442,7 @@ app.post("/api/cmd", (req, res) => {
   res.json({ ok: true });
 });
 
-app.get("/api/pending-cmds", (req, res) => {
+app.get("/api/pending-cmds", requireLicense, (req, res) => {
   const out = [...pendingCmds];
   pendingCmds.length = 0;
   res.json(out);
