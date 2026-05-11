@@ -132,6 +132,11 @@ async function initDB() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_backups_station   ON backups(station_id)`);
   await pool.query(`DELETE FROM guest_presence WHERE joined_at < NOW() - INTERVAL '24 hours'`).catch(() => {});
 
+  // Schema migrations: original DB used status TEXT and lacked active/last_validated.
+  // ADD COLUMN IF NOT EXISTS backfills existing rows with the declared DEFAULT.
+  await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT true`);
+  await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS last_validated TIMESTAMPTZ`);
+
   // ── Sync mutations table — Ether sync protocol §17–§18 ─────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS mutations (
