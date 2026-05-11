@@ -455,7 +455,7 @@ app.post("/webhook/stripe", async (req, res) => {
 
 // ── Now Playing ───────────────────────────────────────────────
 
-app.post("/api/now-playing", requireLicense, (req, res) => {
+app.post("/api/now-playing", (req, res) => {
   nowPlaying.data = { ...req.body, updated_at: Date.now() };
   res.json({ ok: true });
 });
