@@ -55,7 +55,8 @@ const pool   = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rej
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 // ── In-memory state ───────────────────────────────────────────
-const pendingCmds = [];          // companion → desktop command queue
+const pendingCmds = [];          // fallback queue when no SSE client is connected
+const sseClients  = new Map();   // license_key → Set<res> for cmd-stream subscribers
 const nowPlaying  = { data: null };  // desktop pushes, mobile polls
 
 // ── Middleware ────────────────────────────────────────────────
@@ -468,9 +469,71 @@ app.get("/api/now-playing", (req, res) => {
 app.post("/api/cmd", requireLicense, (req, res) => {
   const { cmd } = req.body;
   if (!cmd) return res.status(400).json({ error: "Missing cmd" });
-  pendingCmds.push({ cmd, data: req.body, ts: Math.floor(Date.now() / 1000) });
-  if (pendingCmds.length > 20) pendingCmds.splice(0, pendingCmds.length - 20);
+
+  const key     = req.license.license_key;
+  const payload = JSON.stringify({ cmd, data: req.body, ts: Math.floor(Date.now() / 1000) });
+  const clients = sseClients.get(key);
+
+  if (clients && clients.size > 0) {
+    // Instant fan-out to all connected SSE streams for this license key
+    for (const client of clients) {
+      if (!client.writableEnded) client.write(`event: cmd\ndata: ${payload}\n\n`);
+    }
+    console.log(`[cmd] ${cmd} → SSE fan-out to ${clients.size} client(s) for key=${key.slice(0,8)}`);
+  } else {
+    // No SSE client connected — fall back to in-memory queue
+    pendingCmds.push({ cmd, data: req.body, ts: Math.floor(Date.now() / 1000) });
+    if (pendingCmds.length > 20) pendingCmds.splice(0, pendingCmds.length - 20);
+  }
+
   res.json({ ok: true });
+});
+
+// SSE: Ether desktop subscribes here for instant command delivery.
+// EventSource API cannot set custom headers, so license key comes from ?key= query param.
+app.get("/api/cmd-stream", async (req, res) => {
+  const key = req.headers["x-license-key"] || req.query.key || "";
+  if (!key) return res.status(401).json({ error: "Missing x-license-key header or ?key= param" });
+
+  const { rows } = await pool.query(
+    "SELECT * FROM licenses WHERE license_key=$1 AND active=true", [key]
+  ).catch(() => ({ rows: [] }));
+  if (!rows.length) return res.status(403).json({ error: "Invalid or inactive license" });
+  if (!["pro","station"].includes(rows[0].plan))
+    return res.status(403).json({ error: "Pro or Station plan required" });
+
+  res.set({
+    "Content-Type":      "text/event-stream",
+    "Cache-Control":     "no-cache",
+    "X-Accel-Buffering": "no",   // disable Railway/Nginx proxy buffering
+    "Connection":        "keep-alive",
+  });
+  res.flushHeaders();
+
+  if (!sseClients.has(key)) sseClients.set(key, new Set());
+  const clients = sseClients.get(key);
+  clients.add(res);
+  console.log(`[cmd-stream] connected — key=${key.slice(0,8)} streams=${clients.size}`);
+
+  // Drain any commands queued before this connection arrived
+  if (pendingCmds.length > 0) {
+    const buffered = pendingCmds.splice(0);
+    for (const c of buffered) {
+      res.write(`event: cmd\ndata: ${JSON.stringify(c)}\n\n`);
+    }
+  }
+
+  // Keepalive comment every 15 s — prevents Railway's 60 s idle timeout
+  const keepalive = setInterval(() => {
+    if (!res.writableEnded) res.write(": keepalive\n\n");
+  }, 15_000);
+
+  res.on("close", () => {
+    clearInterval(keepalive);
+    clients.delete(res);
+    if (clients.size === 0) sseClients.delete(key);
+    console.log(`[cmd-stream] disconnected — key=${key.slice(0,8)} streams=${clients.size}`);
+  });
 });
 
 app.get("/api/pending-cmds", requireLicense, (req, res) => {
