@@ -131,6 +131,32 @@ async function initDB() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_activations_key   ON license_activations(license_key)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_backups_station   ON backups(station_id)`);
   await pool.query(`DELETE FROM guest_presence WHERE joined_at < NOW() - INTERVAL '24 hours'`).catch(() => {});
+
+  // ── Sync mutations table — Ether sync protocol §17–§18 ─────────────────────
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS mutations (
+      server_seq          BIGSERIAL NOT NULL,
+      id                  TEXT PRIMARY KEY,
+      client_id           TEXT NOT NULL,
+      station_id          TEXT,
+      actor_id            TEXT,
+      table_name          TEXT NOT NULL,
+      row_id              TEXT NOT NULL,
+      op                  TEXT NOT NULL,
+      payload_before      JSONB,
+      payload_after       JSONB,
+      created_at          TIMESTAMPTZ NOT NULL,
+      hlc                 TEXT NOT NULL,
+      parent_mutation_id  TEXT,
+      schema_version      INTEGER NOT NULL,
+      conflict_resolution JSONB,
+      received_at         TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_mutations_seq     ON mutations(server_seq)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_mutations_sta_seq ON mutations(station_id, server_seq)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_mutations_client  ON mutations(client_id)`);
+
   console.log("[DB] Schema ready");
 }
 
@@ -638,6 +664,11 @@ app.post("/invite/send", async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
+
+// ── Sync ──────────────────────────────────────────────────────
+
+const syncRouter = require('./routes/sync')(pool);
+app.use('/sync', requireLicense, syncRouter);
 
 // ── Start ─────────────────────────────────────────────────────
 
