@@ -45,6 +45,7 @@ const path       = require("path");
 const zlib       = require("zlib");
 const { Pool }   = require("pg");
 const { Resend } = require("resend");
+const bcrypt     = require('bcrypt');
 
 // multer is optional — install with: npm install multer
 let multer;
@@ -137,6 +138,9 @@ async function initDB() {
   // ADD COLUMN IF NOT EXISTS backfills existing rows with the declared DEFAULT.
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT true`);
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS last_validated TIMESTAMPTZ`);
+  // Allow NULL license_key for new bcrypt-format rows (key stored as key_hash + key_prefix only).
+  // Idempotent: no-op if column is already nullable.
+  await pool.query(`ALTER TABLE licenses ALTER COLUMN license_key DROP NOT NULL`);
 
   // ── Sync mutations table — Ether sync protocol §17–§18 ─────────────────────
   await pool.query(`
@@ -227,13 +231,33 @@ async function sendLicenseEmail(email, licenseKey, plan) {
 async function requireLicense(req, res, next) {
   const key = req.headers["x-license-key"];
   if (!key) return res.status(401).json({ error: "Missing x-license-key header" });
+
+  // Two-path lookup per B-12:
+  //   New keys (bcrypt): matched by key_prefix (first 12 chars = ETH-PRO-XXXX / ETH-STN-XXXX,
+  //     ~65k unique values), authenticated via bcrypt.compare against key_hash. license_key is NULL.
+  //   Old keys (plaintext): matched by license_key column, authenticated by direct string equality.
+  // Single OR query returns candidates for both paths; loop authenticates each.
+  const prefix = key.slice(0, 12);
   const { rows } = await pool.query(
-    "SELECT * FROM licenses WHERE license_key=$1 AND active=true", [key]
+    `SELECT * FROM licenses
+     WHERE (key_prefix = $1 OR license_key = $2) AND active = true`,
+    [prefix, key]
   ).catch(() => ({ rows: [] }));
-  if (!rows.length) return res.status(403).json({ error: "Invalid or inactive license" });
-  if (!["pro","station"].includes(rows[0].plan))
+
+  let license = null;
+  for (const row of rows) {
+    if (row.key_hash != null) {
+      if (await bcrypt.compare(key, row.key_hash)) { license = row; break; }
+    } else if (key === row.license_key) {
+      license = row;
+      break;
+    }
+  }
+
+  if (!license) return res.status(401).json({ error: "invalid_license_key" });
+  if (!["pro", "station"].includes(license.plan))
     return res.status(403).json({ error: "Pro or Station plan required" });
-  req.license = rows[0];
+  req.license = license;
   next();
 }
 
@@ -400,7 +424,12 @@ app.post("/admin/issue", requireAdmin, async (req, res) => {
   const { email, plan = "pro" } = req.body;
   if (!email) return res.status(400).json({ error: "Missing email" });
   const key = generateLicenseKey(plan);
-  await pool.query("INSERT INTO licenses (email,license_key,plan) VALUES ($1,$2,$3)", [email.toLowerCase(), key, plan]);
+  const keyPrefix = key.slice(0, 12);
+  const keyHash   = await bcrypt.hash(key, 12);
+  await pool.query(
+    "INSERT INTO licenses (email,plan,key_prefix,key_hash) VALUES ($1,$2,$3,$4)",
+    [email.toLowerCase(), plan, keyPrefix, keyHash]
+  );
   try { await sendLicenseEmail(email, key, plan); } catch (e) { console.error("[Email]", e.message); }
   res.json({ ok: true, license_key: key, plan, email });
 });
@@ -437,8 +466,13 @@ app.post("/webhook/stripe", async (req, res) => {
       console.log(`[License] Reactivated: ${licenseKey} → ${email}`);
     } else {
       licenseKey = generateLicenseKey(plan);
-      await pool.query("INSERT INTO licenses (email,license_key,plan,stripe_sub_id) VALUES ($1,$2,$3,$4)", [email, licenseKey, plan, subId]);
-      console.log(`[License] Issued: ${licenseKey} → ${email} (${plan})`);
+      const keyPrefix = licenseKey.slice(0, 12);
+      const keyHash   = await bcrypt.hash(licenseKey, 12);
+      await pool.query(
+        "INSERT INTO licenses (email,plan,stripe_sub_id,key_prefix,key_hash) VALUES ($1,$2,$3,$4,$5)",
+        [email, plan, subId, keyPrefix, keyHash]
+      );
+      console.log(`[License] Issued: ${keyPrefix}... → ${email} (${plan})`);
       try { await sendLicenseEmail(email, licenseKey, plan); }
       catch (e) { console.error("[Email]", e.message); }
     }
