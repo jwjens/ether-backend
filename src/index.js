@@ -167,6 +167,16 @@ async function initDB() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_mutations_sta_seq ON mutations(station_id, server_seq)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_mutations_client  ON mutations(client_id)`);
 
+  // Sync schema migrations — add columns that sync.js INSERT requires but
+  // were absent from the original CREATE TABLE above (table already exists
+  // on Railway, so CREATE TABLE IF NOT EXISTS is a no-op there).
+  await pool.query(`ALTER TABLE mutations ADD COLUMN IF NOT EXISTS operator_id    TEXT`);
+  await pool.query(`ALTER TABLE mutations ADD COLUMN IF NOT EXISTS license_key_id INTEGER REFERENCES licenses(id)`);
+  // Backing index for ON CONFLICT (license_key_id, id) DO NOTHING in sync.js.
+  // CREATE UNIQUE INDEX IF NOT EXISTS is the idempotent form; no equivalent
+  // "ADD CONSTRAINT IF NOT EXISTS" exists in Postgres for unique constraints.
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_mutations_lkid_id ON mutations(license_key_id, id)`);
+
   console.log("[DB] Schema ready");
 }
 
