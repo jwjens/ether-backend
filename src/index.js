@@ -228,32 +228,33 @@ async function sendLicenseEmail(email, licenseKey, plan) {
 
 // ── Auth middleware ───────────────────────────────────────────
 
-async function requireLicense(req, res, next) {
-  const key = req.headers["x-license-key"];
-  if (!key) return res.status(401).json({ error: "Missing x-license-key header" });
-
-  // Two-path lookup per B-12:
-  //   New keys (bcrypt): matched by key_prefix (first 12 chars = ETH-PRO-XXXX / ETH-STN-XXXX,
-  //     ~65k unique values), authenticated via bcrypt.compare against key_hash. license_key is NULL.
-  //   Old keys (plaintext): matched by license_key column, authenticated by direct string equality.
-  // Single OR query returns candidates for both paths; loop authenticates each.
-  const prefix = key.slice(0, 12);
+// Two-path license lookup per B-12 — shared by requireLicense and cmd-stream.
+// Returns the matching license row or null; never throws (errors become null).
+//   New keys (bcrypt):     key_prefix match + bcrypt.compare(rawKey, key_hash)
+//   Old keys (plaintext):  license_key direct string match
+// Any future endpoint needing license validation should call this rather than
+// duplicating the query logic.
+async function lookupLicense(rawKey) {
+  const prefix = rawKey.slice(0, 12);
   const { rows } = await pool.query(
     `SELECT * FROM licenses
      WHERE (key_prefix = $1 OR license_key = $2) AND active = true`,
-    [prefix, key]
+    [prefix, rawKey]
   ).catch(() => ({ rows: [] }));
-
-  let license = null;
   for (const row of rows) {
     if (row.key_hash != null) {
-      if (await bcrypt.compare(key, row.key_hash)) { license = row; break; }
-    } else if (key === row.license_key) {
-      license = row;
-      break;
+      if (await bcrypt.compare(rawKey, row.key_hash)) return row;
+    } else if (rawKey === row.license_key) {
+      return row;
     }
   }
+  return null;
+}
 
+async function requireLicense(req, res, next) {
+  const key = req.headers["x-license-key"];
+  if (!key) return res.status(401).json({ error: "Missing x-license-key header" });
+  const license = await lookupLicense(key).catch(() => null);
   if (!license) return res.status(401).json({ error: "invalid_license_key" });
   if (!["pro", "station"].includes(license.plan))
     return res.status(403).json({ error: "Pro or Station plan required" });
@@ -467,14 +468,26 @@ app.post("/webhook/stripe", async (req, res) => {
     } else {
       licenseKey = generateLicenseKey(plan);
       const keyPrefix = licenseKey.slice(0, 12);
-      const keyHash   = await bcrypt.hash(licenseKey, 12);
-      await pool.query(
-        "INSERT INTO licenses (email,plan,stripe_sub_id,key_prefix,key_hash) VALUES ($1,$2,$3,$4,$5)",
-        [email, plan, subId, keyPrefix, keyHash]
-      );
-      console.log(`[License] Issued: ${keyPrefix}... → ${email} (${plan})`);
-      try { await sendLicenseEmail(email, licenseKey, plan); }
-      catch (e) { console.error("[Email]", e.message); }
+      const keyHash   = await bcrypt.hash(licenseKey, 12); // computed before BEGIN — keeps tx window short
+      // Transaction: if email throws, INSERT is rolled back so Stripe retries a clean slate.
+      // On retry: no existing row → fresh key generated → new email attempt.
+      const txClient = await pool.connect();
+      try {
+        await txClient.query('BEGIN');
+        await txClient.query(
+          "INSERT INTO licenses (email,plan,stripe_sub_id,key_prefix,key_hash) VALUES ($1,$2,$3,$4,$5)",
+          [email, plan, subId, keyPrefix, keyHash]
+        );
+        await sendLicenseEmail(email, licenseKey, plan);
+        await txClient.query('COMMIT');
+        console.log(`[License] Issued: ${keyPrefix}... → ${email} (${plan})`);
+      } catch (e) {
+        await txClient.query('ROLLBACK').catch(() => {});
+        console.error('[License] Issue+email failed, rolled back:', e.message);
+        throw e;  // non-2xx → Stripe retries with exponential backoff
+      } finally {
+        txClient.release();
+      }
     }
   }
 
@@ -504,16 +517,16 @@ app.post("/api/cmd", requireLicense, (req, res) => {
   const { cmd } = req.body;
   if (!cmd) return res.status(400).json({ error: "Missing cmd" });
 
-  const key     = req.license.license_key;
+  const key     = String(req.license.id);  // license_key is NULL for bcrypt rows; use stable integer PK
   const payload = JSON.stringify({ cmd, data: req.body, ts: Math.floor(Date.now() / 1000) });
   const clients = sseClients.get(key);
 
   if (clients && clients.size > 0) {
-    // Instant fan-out to all connected SSE streams for this license key
+    // Instant fan-out to all connected SSE streams for this license
     for (const client of clients) {
       if (!client.writableEnded) client.write(`event: cmd\ndata: ${payload}\n\n`);
     }
-    console.log(`[cmd] ${cmd} → SSE fan-out to ${clients.size} client(s) for key=${key.slice(0,8)}`);
+    console.log(`[cmd] ${cmd} → SSE fan-out to ${clients.size} client(s) for license=${key}`);
   } else {
     // No SSE client connected — fall back to in-memory queue
     pendingCmds.push({ cmd, data: req.body, ts: Math.floor(Date.now() / 1000) });
@@ -526,14 +539,11 @@ app.post("/api/cmd", requireLicense, (req, res) => {
 // SSE: Ether desktop subscribes here for instant command delivery.
 // EventSource API cannot set custom headers, so license key comes from ?key= query param.
 app.get("/api/cmd-stream", async (req, res) => {
-  const key = req.headers["x-license-key"] || req.query.key || "";
-  if (!key) return res.status(401).json({ error: "Missing x-license-key header or ?key= param" });
-
-  const { rows } = await pool.query(
-    "SELECT * FROM licenses WHERE license_key=$1 AND active=true", [key]
-  ).catch(() => ({ rows: [] }));
-  if (!rows.length) return res.status(403).json({ error: "Invalid or inactive license" });
-  if (!["pro","station"].includes(rows[0].plan))
+  const rawKey = req.headers["x-license-key"] || req.query.key || "";
+  if (!rawKey) return res.status(401).json({ error: "Missing x-license-key header or ?key= param" });
+  const license = await lookupLicense(rawKey).catch(() => null);
+  if (!license) return res.status(401).json({ error: "invalid_license_key" });
+  if (!["pro","station"].includes(license.plan))
     return res.status(403).json({ error: "Pro or Station plan required" });
 
   res.set({
@@ -544,10 +554,11 @@ app.get("/api/cmd-stream", async (req, res) => {
   });
   res.flushHeaders();
 
-  if (!sseClients.has(key)) sseClients.set(key, new Set());
-  const clients = sseClients.get(key);
+  const licenseId = String(license.id);  // stable integer PK; license_key is NULL for bcrypt rows
+  if (!sseClients.has(licenseId)) sseClients.set(licenseId, new Set());
+  const clients = sseClients.get(licenseId);
   clients.add(res);
-  console.log(`[cmd-stream] connected — key=${key.slice(0,8)} streams=${clients.size}`);
+  console.log(`[cmd-stream] connected — license=${licenseId} streams=${clients.size}`);
 
   // Drain any commands queued before this connection arrived
   if (pendingCmds.length > 0) {
@@ -565,8 +576,8 @@ app.get("/api/cmd-stream", async (req, res) => {
   res.on("close", () => {
     clearInterval(keepalive);
     clients.delete(res);
-    if (clients.size === 0) sseClients.delete(key);
-    console.log(`[cmd-stream] disconnected — key=${key.slice(0,8)} streams=${clients.size}`);
+    if (clients.size === 0) sseClients.delete(licenseId);
+    console.log(`[cmd-stream] disconnected — license=${licenseId} streams=${clients.size}`);
   });
 });
 
