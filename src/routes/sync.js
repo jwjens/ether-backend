@@ -8,10 +8,41 @@
 // GET  /sync/mutations   — deliver mutations to client [§18]
 //
 // Backend retention policy: mutations are kept forever [§22 N-119].
-// Idempotency: UUID primary key; ON CONFLICT DO NOTHING [N-100].
+// Idempotency: ON CONFLICT (license_key_id, id) DO NOTHING [N-100].
 // Defense-in-depth: excluded tables rejected even if client sends them [N-101].
 
 const express = require('express');
+
+// ── Server HLC identity ────────────────────────────────────────────────────────
+//
+// server_hlc in pull responses uses HLC format: <wall_ms>:<logical>:<client_id>
+// per N-38. The server emits logical=0 per response; clients only log server_hlc
+// and take no action on it [N-98], so monotonicity across responses is not required.
+//
+// Identity rules:
+//   - This UUID must be stable and unique per backend instance.
+//   - If horizontal scaling is ever introduced, each instance MUST have its own
+//     SYNC_SERVER_ID — shared IDs would make server_hlc values non-unique across
+//     instances, violating the HLC client_id uniqueness assumption.
+//   - For v1, consider maintaining real server-side HLC state so the logical
+//     counter advances monotonically within a process lifetime rather than
+//     resetting to 0 on every response.
+let SERVER_CLIENT_ID;
+if (process.env.SYNC_SERVER_ID) {
+  SERVER_CLIENT_ID = process.env.SYNC_SERVER_ID;
+} else if (process.env.NODE_ENV === 'production') {
+  throw new Error(
+    '[sync] SYNC_SERVER_ID required in production — ' +
+    'set this env var to a stable UUID for this backend instance'
+  );
+} else {
+  SERVER_CLIENT_ID = require('crypto').randomUUID();
+  console.warn(
+    '[sync] SYNC_SERVER_ID not set — using auto-generated server ID:',
+    SERVER_CLIENT_ID,
+    '(set SYNC_SERVER_ID to suppress this warning)'
+  );
+}
 
 const MAX_BATCH = 500;
 const VALID_OPS = new Set(['insert', 'update', 'delete', 'checkpoint']);
@@ -65,18 +96,19 @@ function makeSyncRouter(pool) {
         try {
           await pool.query(`
             INSERT INTO mutations (
-              id, client_id, station_id, actor_id,
+              id, client_id, station_id, operator_id, license_key_id,
               table_name, row_id, op,
               payload_before, payload_after,
               created_at, hlc, parent_mutation_id,
               schema_version, conflict_resolution
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-            ON CONFLICT (id) DO NOTHING
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+            ON CONFLICT (license_key_id, id) DO NOTHING
           `, [
             m.id,
             m.client_id ?? client_id,
             m.station_id ?? station_id,
-            m.actor_id   ?? null,
+            m.operator_id ?? null,
+            req.license.id,
             m.table_name,
             m.row_id,
             m.op,
@@ -118,8 +150,9 @@ function makeSyncRouter(pool) {
       const sinceSeq = parseInt(since_seq, 10) || 0;
       const sid      = station_id || null;
 
-      // Return up to 1000 mutations this client hasn't seen yet.
-      // Excludes the requesting client's own mutations (they're already local).
+      // Return up to 500 mutations the client has not yet seen, scoped to this
+      // license [tenant isolation]. Own-client mutations are included — the
+      // client deduplicates by id locally (idempotency check, Step 1 of §19).
       // Scope filter:
       //   - if station_id provided: return station-scoped + install-scoped (station_id IS NULL)
       //   - if station_id absent:   return install-scoped only
@@ -127,34 +160,34 @@ function makeSyncRouter(pool) {
       if (sid) {
         const result = await pool.query(`
           SELECT
-            server_seq, id, client_id, station_id, actor_id,
+            server_seq, id, client_id, station_id, operator_id,
             table_name, row_id, op,
             payload_before, payload_after,
             created_at, hlc, parent_mutation_id,
             schema_version, conflict_resolution
           FROM mutations
           WHERE server_seq > $1
-            AND client_id != $2
+            AND license_key_id = $2
             AND (station_id = $3 OR station_id IS NULL)
           ORDER BY server_seq ASC
-          LIMIT 1000
-        `, [sinceSeq, client_id, sid]);
+          LIMIT 500
+        `, [sinceSeq, req.license.id, sid]);
         rows = result.rows;
       } else {
         const result = await pool.query(`
           SELECT
-            server_seq, id, client_id, station_id, actor_id,
+            server_seq, id, client_id, station_id, operator_id,
             table_name, row_id, op,
             payload_before, payload_after,
             created_at, hlc, parent_mutation_id,
             schema_version, conflict_resolution
           FROM mutations
           WHERE server_seq > $1
-            AND client_id != $2
+            AND license_key_id = $2
             AND station_id IS NULL
           ORDER BY server_seq ASC
-          LIMIT 1000
-        `, [sinceSeq, client_id]);
+          LIMIT 500
+        `, [sinceSeq, req.license.id]);
         rows = result.rows;
       }
 
@@ -162,7 +195,7 @@ function makeSyncRouter(pool) {
         id:                  r.id,
         client_id:           r.client_id,
         station_id:          r.station_id,
-        actor_id:            r.actor_id,
+        operator_id:         r.operator_id,
         table_name:          r.table_name,
         row_id:              r.row_id,
         op:                  r.op,
@@ -179,11 +212,13 @@ function makeSyncRouter(pool) {
         ? Number(rows[rows.length - 1].server_seq)
         : sinceSeq;
 
+      const serverHlc = `${Date.now()}:0:${SERVER_CLIENT_ID}`;
+
       console.log(
         `[sync/pull] client=${client_id.slice(0, 8)} ` +
         `since_seq=${sinceSeq} returned=${mutations.length}`
       );
-      res.json({ mutations, server_seq: maxSeq });
+      res.json({ mutations, server_seq: maxSeq, server_hlc: serverHlc });
     } catch (e) {
       console.error('[sync/pull]', e.message);
       res.status(500).json({ error: 'Server error' });
