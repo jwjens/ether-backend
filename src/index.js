@@ -177,6 +177,33 @@ async function initDB() {
   // "ADD CONSTRAINT IF NOT EXISTS" exists in Postgres for unique constraints.
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_mutations_lkid_id ON mutations(license_key_id, id)`);
 
+  // ── Onboarding schema (onboarding-spec-v1.md) ──────────────────────────────
+  // Flatter than the spec's accounts/stations/seats split: account info collapses
+  // into licenses, seat info collapses into license_activations, stations stays.
+  await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS account_name TEXT`);
+  await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS onboarded_at TIMESTAMPTZ`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS stations (
+      id              SERIAL PRIMARY KEY,
+      uuid            TEXT NOT NULL UNIQUE,
+      license_key_id  INTEGER NOT NULL REFERENCES licenses(id),
+      name            TEXT NOT NULL,
+      nickname        TEXT,
+      frequency       TEXT,
+      call_letters    TEXT,
+      created_at      TIMESTAMPTZ DEFAULT NOW(),
+      updated_at      TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_stations_license ON stations(license_key_id)`);
+
+  await pool.query(`ALTER TABLE license_activations ADD COLUMN IF NOT EXISTS station_uuid    TEXT REFERENCES stations(uuid) ON DELETE SET NULL`);
+  await pool.query(`ALTER TABLE license_activations ADD COLUMN IF NOT EXISTS deauthorized_at TIMESTAMPTZ`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_activations_station ON license_activations(station_uuid)`);
+  // Partial index — supports "count active seats" in /account/connect (deauthorized_at IS NULL).
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_activations_active ON license_activations(license_key) WHERE deauthorized_at IS NULL`);
+
   console.log("[DB] Schema ready");
 }
 
@@ -315,9 +342,11 @@ app.post("/validate", async (req, res) => {
     const limit = PLAN_MACHINE_LIMITS[license.plan] ?? 1;
     const ip = (req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress || "").trim();
 
-    // 2. Check if this machine is already activated for this license
+    // 2. Check if this machine is already activated for this license.
+    //    A deauthorized row (deauthorized_at IS NOT NULL) doesn't count — a customer
+    //    who deauthorizes a machine then re-installs on it should reactivate cleanly.
     const { rows: existingActivations } = await pool.query(
-      "SELECT * FROM license_activations WHERE license_key=$1 AND machine_id=$2",
+      "SELECT * FROM license_activations WHERE license_key=$1 AND machine_id=$2 AND deauthorized_at IS NULL",
       [license.license_key, machine_id.trim()]
     );
 
@@ -328,9 +357,9 @@ app.post("/validate", async (req, res) => {
         [ip, existingActivations[0].id]
       );
     } else {
-      // 3. Not activated here — check if we have room
+      // 3. Not activated here — check if we have room. Only active (non-deauthorized) seats count.
       const { rows: activeList } = await pool.query(
-        "SELECT machine_id, machine_name, os, activated_at, last_seen FROM license_activations WHERE license_key=$1 ORDER BY last_seen DESC",
+        "SELECT machine_id, machine_name, os, activated_at, last_seen FROM license_activations WHERE license_key=$1 AND deauthorized_at IS NULL ORDER BY last_seen DESC",
         [license.license_key]
       );
 
@@ -345,9 +374,20 @@ app.post("/validate", async (req, res) => {
         });
       }
 
-      // 4. Register this machine as a new activation
+      // 4. Register this machine as a new activation. UPSERT because a prior
+      //    deauthorized row for the same (license_key, machine_id) pair may
+      //    exist — UNIQUE(license_key, machine_id) on the table means a plain
+      //    INSERT would collide. Reactivating clears deauthorized_at and refreshes
+      //    last_seen/ip_address so the row reads as a fresh seat.
       await pool.query(
-        "INSERT INTO license_activations (license_key, machine_id, machine_name, os, ip_address) VALUES ($1,$2,$3,$4,$5)",
+        `INSERT INTO license_activations (license_key, machine_id, machine_name, os, ip_address)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (license_key, machine_id) DO UPDATE SET
+           machine_name    = EXCLUDED.machine_name,
+           os              = EXCLUDED.os,
+           ip_address      = EXCLUDED.ip_address,
+           last_seen       = NOW(),
+           deauthorized_at = NULL`,
         [license.license_key, machine_id.trim(), machine_name || null, os || null, ip]
       );
       console.log(`[Activation] ${license.license_key} → ${machine_name || machine_id.slice(0, 8)} (${activeList.length + 1}/${limit})`);
@@ -386,7 +426,7 @@ app.get("/licenses/:key/activations", async (req, res) => {
     if (!lic.length) return res.status(404).json({ error: "License not found" });
 
     const { rows: activations } = await pool.query(
-      "SELECT machine_id, machine_name, os, ip_address, activated_at, last_seen FROM license_activations WHERE license_key=$1 ORDER BY last_seen DESC",
+      "SELECT machine_id, machine_name, os, ip_address, activated_at, last_seen FROM license_activations WHERE license_key=$1 AND deauthorized_at IS NULL ORDER BY last_seen DESC",
       [key]
     );
     const limit = PLAN_MACHINE_LIMITS[lic[0].plan] ?? 1;
@@ -410,11 +450,14 @@ app.post("/licenses/:key/deactivate", async (req, res) => {
     );
     if (!lic.length) return res.status(404).json({ error: "License not found" });
 
+    // Soft delete: set deauthorized_at instead of DELETE, so the row is preserved
+    // for audit/history. Only flips currently-active rows; re-deauthorizing a
+    // deauthorized seat is a no-op.
     const { rowCount } = await pool.query(
-      "DELETE FROM license_activations WHERE license_key=$1 AND machine_id=$2",
+      "UPDATE license_activations SET deauthorized_at=NOW() WHERE license_key=$1 AND machine_id=$2 AND deauthorized_at IS NULL",
       [key, machine_id.trim()]
     );
-    console.log(`[Deactivation] ${key} → ${machine_id.slice(0, 8)} (removed ${rowCount})`);
+    console.log(`[Deactivation] ${key} → ${machine_id.slice(0, 8)} (deauthorized ${rowCount})`);
     res.json({ ok: true, removed: rowCount });
   } catch (e) {
     console.error("[/licenses/:key/deactivate]", e.message);
