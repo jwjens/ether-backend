@@ -126,6 +126,34 @@ async function signR2GetUrl(key, expiresInSeconds = 900) {
   );
 }
 
+// List every R2 object key under a given prefix. Loops via ContinuationToken
+// until exhausted (ListObjectsV2 returns up to 1000 keys per page). Caller
+// must null-check getR2Client() first; throws on SDK failure. Returns array
+// of FULL keys including the prefix — caller strips if needed.
+//
+// Practical ceiling: ~10k keys before this gets expensive (10 round-trips,
+// ~300KB JSON response). Real broadcast libraries are typically 5–6k songs.
+// If a real customer crosses 10k, switch to client-side pagination with a
+// cursor parameter. Tracked as a future concern, not blocking today.
+async function listR2ObjectsForPrefix(prefix) {
+  const { ListObjectsV2Command } = require("@aws-sdk/client-s3");
+  const client = getR2Client();
+  const keys = [];
+  let continuationToken;
+  do {
+    const resp = await client.send(new ListObjectsV2Command({
+      Bucket:            R2_BUCKET,
+      Prefix:            prefix,
+      ContinuationToken: continuationToken,
+    }));
+    for (const obj of resp.Contents || []) {
+      if (obj.Key) keys.push(obj.Key);
+    }
+    continuationToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
+  } while (continuationToken);
+  return keys;
+}
+
 // ── In-memory state ───────────────────────────────────────────
 const pendingCmds = [];          // fallback queue when no SSE client is connected
 const sseClients  = new Map();   // license_key → Set<res> for cmd-stream subscribers
@@ -1132,6 +1160,64 @@ app.post("/audio/download-url", async (req, res) => {
     res.json({ signed_url: signedUrl, expires_at: expiresAt });
   } catch (e) {
     console.error("[/audio/download-url]", e.message);
+    res.status(500).json({ error: "internal", detail: e.message });
+  }
+});
+
+// GET /audio/list — every R2 key under the customer's license prefix.
+// Auth: x-license-key header (matches /account/seats pattern — GET endpoints
+// take credentials in the header rather than the body).
+// Customer flow (Onboarding "From the cloud" path, Phase 3.4):
+//   1. GET /audio/list (header) → { keys: [...] }
+//   2. For each key, POST /audio/download-url → signed URL
+//   3. Fetch + cache
+//
+// Keys are returned WITHOUT the ${license.id}/ prefix so the customer never
+// sees their internal license_key_id. Server-side pagination loops through
+// ContinuationToken until exhausted; see the ~10k-key practical ceiling
+// caveat on listR2ObjectsForPrefix.
+
+app.get("/audio/list", async (req, res) => {
+  try {
+    const rawKey = (req.headers["x-license-key"] || "").toString().trim();
+    if (!rawKey) {
+      return res.status(401).json({
+        error:  "missing_license_key",
+        detail: "x-license-key header is required",
+      });
+    }
+
+    const license = await lookupLicense(rawKey);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+
+    if (!getR2Client()) {
+      return res.status(503).json({
+        error:  "r2_not_configured",
+        detail: "Backend R2 credentials not set",
+      });
+    }
+
+    const prefix = `${license.id}/`;
+    let allKeys;
+    try {
+      allKeys = await listR2ObjectsForPrefix(prefix);
+    } catch (e) {
+      console.error("[/audio/list] listing failed:", e.message);
+      return res.status(500).json({ error: "listing_failed", detail: e.message });
+    }
+
+    // Strip the license prefix so customers never see their internal
+    // license_key_id. R2 enforces Prefix on ListObjectsV2, so every key
+    // returned should already start with `${license.id}/` — the defensive
+    // startsWith check costs nothing and surfaces a clear bug if it doesn't.
+    const keys = allKeys
+      .filter(k => k.startsWith(prefix))
+      .map(k => k.slice(prefix.length));
+
+    console.log(`[Audio/List] license:${license.id} keys:${keys.length}`);
+    res.json({ keys });
+  } catch (e) {
+    console.error("[/audio/list]", e.message);
     res.status(500).json({ error: "internal", detail: e.message });
   }
 });
