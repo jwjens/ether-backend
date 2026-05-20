@@ -76,10 +76,17 @@ const upload = multer
 
 // ── DB init ───────────────────────────────────────────────────
 
-// Per-plan machine activation limits.
+// Per-plan machine activation limits — used by legacy /validate.
 // A single license can be active on this many machines simultaneously.
 // Users can deactivate machines to free up slots.
 const PLAN_MACHINE_LIMITS = { free: 1, pro: 2, station: 5 };
+
+// Seat limit for the onboarding flow (onboarding-spec-v1.md "Core concepts").
+// Uniform across tiers — Stripe is the gate for whether a license exists at
+// all; the seat cap is independent of plan. The /account/* endpoints use this
+// constant rather than PLAN_MACHINE_LIMITS so the onboarding contract is
+// stable even if plan-tier seat math changes later.
+const SEATS_MAX = 5;
 
 async function initDB() {
   await pool.query(`
@@ -565,6 +572,175 @@ app.post("/account/create", async (req, res) => {
     res.json({ account_name: account_name?.trim() || null, station_uuid: stationUuid });
   } catch (e) {
     console.error("[/account/create]", e.message);
+    res.status(500).json({ error: "internal", detail: e.message });
+  }
+});
+
+// POST /account/connect — "Connect to existing account" path (Screen 2b).
+// Read-only: validates the license, counts active seats, and returns the
+// account label + station list so the client can render Screen 3. Does NOT
+// touch license_activations — the actual seat binding happens in
+// /account/bind-seat once the customer picks a station.
+
+app.post("/account/connect", async (req, res) => {
+  try {
+    const { license_key, machine_id, machine_name } = req.body || {};
+    const rawKey = license_key?.trim();
+
+    if (!rawKey || !machine_id?.trim()) {
+      return res.status(400).json({
+        error: "missing_fields",
+        detail: "license_key and machine_id are required",
+      });
+    }
+
+    const license = await lookupLicense(rawKey);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+
+    // license_activations.license_key fallback — see EB1 in close-out-tracker.
+    const activationKey = license.license_key ?? rawKey;
+
+    // Is this machine already an active seat? If so, it doesn't consume a slot
+    // even when the license is at its seat cap.
+    const { rows: alreadySeated } = await pool.query(
+      "SELECT 1 FROM license_activations WHERE license_key=$1 AND machine_id=$2 AND deauthorized_at IS NULL",
+      [activationKey, machine_id.trim()]
+    );
+
+    // Count active seats and pull the full list in one shot — the list is
+    // returned either way (in seat_limit_reached responses for Manage Devices,
+    // or implicitly available if the client wants it via /account/seats).
+    const { rows: activeSeats } = await pool.query(
+      "SELECT machine_id, machine_name, os, ip_address, activated_at, last_seen, station_uuid FROM license_activations WHERE license_key=$1 AND deauthorized_at IS NULL ORDER BY last_seen DESC",
+      [activationKey]
+    );
+    const seatsUsed = activeSeats.length;
+
+    if (seatsUsed >= SEATS_MAX && alreadySeated.length === 0) {
+      console.log(`[Account/Connect] license:${license.id} machine:${machine_id.slice(0, 8)} ${machine_name ? `(${machine_name}) ` : ""}seat_limit_reached (${seatsUsed}/${SEATS_MAX})`);
+      return res.status(403).json({
+        error: "seat_limit_reached",
+        seats: activeSeats,
+        seats_used: seatsUsed,
+        seats_max: SEATS_MAX,
+      });
+    }
+
+    const { rows: stations } = await pool.query(
+      "SELECT uuid, name, nickname, frequency, call_letters FROM stations WHERE license_key_id=$1 ORDER BY created_at ASC",
+      [license.id]
+    );
+
+    console.log(`[Account/Connect] license:${license.id} machine:${machine_id.slice(0, 8)} ${machine_name ? `(${machine_name}) ` : ""}stations:${stations.length} seats:${seatsUsed}/${SEATS_MAX}`);
+    res.json({
+      account_name: license.account_name ?? null,
+      stations,
+      seats_used: seatsUsed,
+      seats_max: SEATS_MAX,
+    });
+  } catch (e) {
+    console.error("[/account/connect]", e.message);
+    res.status(500).json({ error: "internal", detail: e.message });
+  }
+});
+
+// POST /account/bind-seat — bind the calling machine to a station (Screen 3).
+// Transactional: locks the licenses row to serialize concurrent seat changes,
+// verifies the station belongs to this license, defensively re-checks the
+// seat limit if this would consume a new slot, then upserts the activation
+// row. The limit check is defense-in-depth — /account/connect is the primary
+// gate but a misbehaving client could call bind-seat directly.
+
+app.post("/account/bind-seat", async (req, res) => {
+  try {
+    const { license_key, machine_id, machine_name, station_uuid } = req.body || {};
+    const rawKey = license_key?.trim();
+
+    if (!rawKey || !machine_id?.trim() || !station_uuid?.trim()) {
+      return res.status(400).json({
+        error: "missing_fields",
+        detail: "license_key, machine_id, and station_uuid are required",
+      });
+    }
+
+    const license = await lookupLicense(rawKey);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+
+    const activationKey = license.license_key ?? rawKey;
+    const ip = (req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress || "").trim();
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      // Lock the licenses row so two concurrent bind-seat / create calls for
+      // the same license serialize on the seat-count check below.
+      await client.query("SELECT 1 FROM licenses WHERE id=$1 FOR UPDATE", [license.id]);
+
+      // Station must exist AND belong to this license. A bare FK violation
+      // (station_uuid not in stations.uuid at all) would surface as 500, so
+      // pre-check it cleanly here.
+      const { rows: station } = await client.query(
+        "SELECT 1 FROM stations WHERE uuid=$1 AND license_key_id=$2",
+        [station_uuid.trim(), license.id]
+      );
+      if (!station.length) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({
+          error: "station_not_found",
+          detail: "station_uuid does not exist under this license",
+        });
+      }
+
+      // Defensive seat-limit check: only matters if this call would create a
+      // new active seat (no row yet, or row exists but is deauthorized). An
+      // already-active seat just rebinding to a different station does not
+      // consume a slot.
+      const { rows: existing } = await client.query(
+        "SELECT deauthorized_at FROM license_activations WHERE license_key=$1 AND machine_id=$2",
+        [activationKey, machine_id.trim()]
+      );
+      const willConsumeSlot = existing.length === 0 || existing[0].deauthorized_at != null;
+      if (willConsumeSlot) {
+        const { rows: countRow } = await client.query(
+          "SELECT COUNT(*)::int AS n FROM license_activations WHERE license_key=$1 AND deauthorized_at IS NULL",
+          [activationKey]
+        );
+        if (countRow[0].n >= SEATS_MAX) {
+          await client.query("ROLLBACK");
+          return res.status(403).json({
+            error: "seat_limit_reached",
+            seats_used: countRow[0].n,
+            seats_max: SEATS_MAX,
+          });
+        }
+      }
+
+      await client.query(
+        `INSERT INTO license_activations
+           (license_key, machine_id, machine_name, ip_address, station_uuid)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (license_key, machine_id) DO UPDATE SET
+           machine_name    = EXCLUDED.machine_name,
+           ip_address      = EXCLUDED.ip_address,
+           station_uuid    = EXCLUDED.station_uuid,
+           last_seen       = NOW(),
+           deauthorized_at = NULL`,
+        [activationKey, machine_id.trim(), machine_name || null, ip, station_uuid.trim()]
+      );
+
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
+
+    console.log(`[Account/BindSeat] license:${license.id} machine:${machine_id.slice(0, 8)} station:${station_uuid.trim().slice(0, 8)}`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("[/account/bind-seat]", e.message);
     res.status(500).json({ error: "internal", detail: e.message });
   }
 });
