@@ -98,6 +98,22 @@ function sanitizeFileKey(raw) {
   return { value: k };
 }
 
+// Sanitize a client-supplied backup timestamp. Matches the filename-safe ISO
+// shape used by cloud-backup.js (after Phase 1.3f): YYYY-MM-DDTHH-MM-SS[Z].
+// Hyphens (not colons) in the time portion so the key is legal as a Windows
+// filename when the customer downloads a backup. The regex implicitly blocks
+// path separators, traversal, and null bytes — no character outside the
+// digit/hyphen/T/Z set is permitted.
+function sanitizeBackupTimestamp(raw) {
+  if (typeof raw !== "string") return { error: "timestamp must be a string" };
+  const t = raw.trim();
+  if (!t) return { error: "timestamp is empty" };
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z?$/.test(t)) {
+    return { error: "timestamp must match YYYY-MM-DDTHH-MM-SS[Z]" };
+  }
+  return { value: t };
+}
+
 // Sign a short-lived PutObject URL scoped to the given R2 key. Caller must
 // have already verified getR2Client() is non-null; this helper does not
 // re-check (keeps the 503 vs 500 split cleanly at the route layer).
@@ -1218,6 +1234,68 @@ app.get("/audio/list", async (req, res) => {
     res.json({ keys });
   } catch (e) {
     console.error("[/audio/list]", e.message);
+    res.status(500).json({ error: "internal", detail: e.message });
+  }
+});
+
+// ── DB backups (R2 signed URLs) ───────────────────────────────
+// POST /backup/upload-url — signed PutObject URL for gzipped openair.db.
+// Customer flow (after Phase 1.3f rewrites cloud-backup.js):
+//   1. cloud-backup.js wakes on its 6h timer
+//   2. Gzip openair.db to a temp file
+//   3. Generate timestamp via toISOString().replace(/[:.]/g, '-').slice(0,19)
+//      or similar — filename-safe form, no colons
+//   4. POST { license_key, timestamp } → { signed_url, expires_at }
+//   5. PUT the gzipped bytes directly to signed_url
+//   6. Delete temp file
+//
+// Key construction: ${license.id}/backups/${timestamp}.db.gz
+// timestamp is client-supplied (no arbitrary file_key here — backup naming
+// is server-controlled to keep the listing structure predictable). Validated
+// against /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z?$/.
+
+app.post("/backup/upload-url", async (req, res) => {
+  try {
+    const { license_key, timestamp } = req.body || {};
+    const rawKey = license_key?.trim();
+    if (!rawKey || !timestamp) {
+      return res.status(400).json({
+        error:  "missing_fields",
+        detail: "license_key and timestamp are required",
+      });
+    }
+
+    const sanitized = sanitizeBackupTimestamp(timestamp);
+    if (sanitized.error) {
+      return res.status(400).json({ error: "invalid_timestamp", detail: sanitized.error });
+    }
+
+    const license = await lookupLicense(rawKey);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+
+    if (!getR2Client()) {
+      return res.status(503).json({
+        error:  "r2_not_configured",
+        detail: "Backend R2 credentials not set",
+      });
+    }
+
+    const r2Key            = `${license.id}/backups/${sanitized.value}.db.gz`;
+    const expiresInSeconds = 15 * 60;
+
+    let signedUrl;
+    try {
+      signedUrl = await signR2PutUrl(r2Key, expiresInSeconds);
+    } catch (e) {
+      console.error("[/backup/upload-url] signing failed:", e.message);
+      return res.status(500).json({ error: "signing_failed", detail: e.message });
+    }
+
+    const expiresAt = new Date(Date.now() + expiresInSeconds * 1000).toISOString();
+    console.log(`[Backup/UploadURL] license:${license.id} ts:${sanitized.value} (15m)`);
+    res.json({ signed_url: signedUrl, expires_at: expiresAt });
+  } catch (e) {
+    console.error("[/backup/upload-url]", e.message);
     res.status(500).json({ error: "internal", detail: e.message });
   }
 });
