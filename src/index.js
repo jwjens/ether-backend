@@ -569,7 +569,14 @@ app.post("/account/create", async (req, res) => {
     }
 
     console.log(`[Account/Create] license:${license.id} station:${stationUuid.slice(0, 8)} (${station.name.trim()})`);
-    res.json({ account_name: account_name?.trim() || null, station_uuid: stationUuid });
+    // plan included so OnboardingFlow can write plan_tier to local KV during onboarding;
+    // fixes the gap where freshly-onboarded customers defaulted to free until they later
+    // ran the SubscriptionPanel /validate flow.
+    res.json({
+      account_name: account_name?.trim() || null,
+      station_uuid: stationUuid,
+      plan:         license.plan ?? "free",
+    });
   } catch (e) {
     console.error("[/account/create]", e.message);
     res.status(500).json({ error: "internal", detail: e.message });
@@ -632,11 +639,15 @@ app.post("/account/connect", async (req, res) => {
     );
 
     console.log(`[Account/Connect] license:${license.id} machine:${machine_id.slice(0, 8)} ${machine_name ? `(${machine_name}) ` : ""}stations:${stations.length} seats:${seatsUsed}/${SEATS_MAX}`);
+    // plan included so OnboardingFlow can write plan_tier to local KV during onboarding;
+    // fixes the gap where freshly-onboarded customers defaulted to free until they later
+    // ran the SubscriptionPanel /validate flow.
     res.json({
       account_name: license.account_name ?? null,
       stations,
       seats_used: seatsUsed,
-      seats_max: SEATS_MAX,
+      seats_max:  SEATS_MAX,
+      plan:       license.plan ?? "free",
     });
   } catch (e) {
     console.error("[/account/connect]", e.message);
