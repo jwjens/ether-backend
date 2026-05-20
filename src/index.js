@@ -83,6 +83,35 @@ function getR2Client() {
 }
 const R2_BUCKET = process.env.R2_BUCKET || "ether-audio";
 
+// Sanitize a customer-provided file_key. Rejects path traversal, separators,
+// null bytes, empty/oversized input. Returns { value } on success, { error }
+// on rejection. Centralized so /audio/upload-url and /audio/download-url
+// can't drift on validation rules.
+function sanitizeFileKey(raw) {
+  if (typeof raw !== "string") return { error: "file_key must be a string" };
+  const k = raw.trim();
+  if (!k)                                  return { error: "file_key is empty" };
+  if (k.length > 255)                      return { error: "file_key too long (max 255 chars)" };
+  if (k.includes("/") || k.includes("\\")) return { error: "file_key must be a basename (no path separators)" };
+  if (k.includes(".."))                    return { error: 'file_key must not contain ".."' };
+  if (k.includes("\0"))                    return { error: "file_key contains null byte" };
+  return { value: k };
+}
+
+// Sign a short-lived PutObject URL scoped to the given R2 key. Caller must
+// have already verified getR2Client() is non-null; this helper does not
+// re-check (keeps the 503 vs 500 split cleanly at the route layer).
+// Throws on SDK signing failure — caller wraps in try/catch.
+async function signR2PutUrl(key, expiresInSeconds = 900) {
+  const { PutObjectCommand } = require("@aws-sdk/client-s3");
+  const { getSignedUrl }     = require("@aws-sdk/s3-request-presigner");
+  return getSignedUrl(
+    getR2Client(),
+    new PutObjectCommand({ Bucket: R2_BUCKET, Key: key }),
+    { expiresIn: expiresInSeconds }
+  );
+}
+
 // ── In-memory state ───────────────────────────────────────────
 const pendingCmds = [];          // fallback queue when no SSE client is connected
 const sseClients  = new Map();   // license_key → Set<res> for cmd-stream subscribers
@@ -971,6 +1000,64 @@ app.get("/account/seats", async (req, res) => {
     });
   } catch (e) {
     console.error("[/account/seats]", e.message);
+    res.status(500).json({ error: "internal", detail: e.message });
+  }
+});
+
+// ── Audio sync (R2 signed URLs) ───────────────────────────────
+// Customers never hold R2 credentials. They POST { license_key, file_key }
+// and receive a short-lived signed PUT URL scoped to ${license.id}/${file_key}.
+// Customer-side flow (after Phase 1.3g lands in C:\openair):
+//   1. POST /audio/upload-url → { signed_url, expires_at }
+//   2. PUT the audio bytes directly to signed_url
+//   3. On success, mark local songs.r2_uploaded_at + file_key
+// Failure modes: 400 missing_fields / invalid_file_key,
+//                401 invalid_license_key,
+//                503 r2_not_configured,
+//                500 signing_failed.
+
+app.post("/audio/upload-url", async (req, res) => {
+  try {
+    const { license_key, file_key } = req.body || {};
+    const rawKey = license_key?.trim();
+    if (!rawKey) {
+      return res.status(400).json({
+        error:  "missing_fields",
+        detail: "license_key is required",
+      });
+    }
+
+    const sanitized = sanitizeFileKey(file_key);
+    if (sanitized.error) {
+      return res.status(400).json({ error: "invalid_file_key", detail: sanitized.error });
+    }
+
+    const license = await lookupLicense(rawKey);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+
+    if (!getR2Client()) {
+      return res.status(503).json({
+        error:  "r2_not_configured",
+        detail: "Backend R2 credentials not set",
+      });
+    }
+
+    const r2Key            = `${license.id}/${sanitized.value}`;
+    const expiresInSeconds = 15 * 60;
+
+    let signedUrl;
+    try {
+      signedUrl = await signR2PutUrl(r2Key, expiresInSeconds);
+    } catch (e) {
+      console.error("[/audio/upload-url] signing failed:", e.message);
+      return res.status(500).json({ error: "signing_failed", detail: e.message });
+    }
+
+    const expiresAt = new Date(Date.now() + expiresInSeconds * 1000).toISOString();
+    console.log(`[Audio/UploadURL] license:${license.id} key:${sanitized.value} (15m)`);
+    res.json({ signed_url: signedUrl, expires_at: expiresAt });
+  } catch (e) {
+    console.error("[/audio/upload-url]", e.message);
     res.status(500).json({ error: "internal", detail: e.message });
   }
 });
