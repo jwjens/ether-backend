@@ -465,6 +465,110 @@ app.post("/licenses/:key/deactivate", async (req, res) => {
   }
 });
 
+// ── Onboarding (onboarding-spec-v1.md) ────────────────────────
+//
+// POST /account/create   First-launch "Create new account" path. Sets the
+//                        license's account_name + onboarded_at, creates the
+//                        first station, and binds this machine's seat to it,
+//                        all in one transaction.
+
+app.post("/account/create", async (req, res) => {
+  try {
+    const { license_key, account_name, station, machine_id, machine_name } = req.body || {};
+    const rawKey = license_key?.trim();
+
+    // Required-field check. account_name is optional per spec; station fields
+    // beyond name are also optional.
+    if (!rawKey || !machine_id?.trim() || !station?.name?.trim()) {
+      return res.status(400).json({
+        error: "missing_fields",
+        detail: "license_key, machine_id, and station.name are required",
+      });
+    }
+
+    // Reuse lookupLicense (B-12) so both bcrypt and legacy plaintext keys work.
+    const license = await lookupLicense(rawKey);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+
+    const stationUuid = crypto.randomUUID();
+    const ip = (req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress || "").trim();
+
+    // license_activations.license_key is NOT NULL. For legacy plaintext rows
+    // license.license_key matches the rawKey; for new bcrypt-only rows the
+    // column on licenses is NULL, so fall back to the rawKey from the request.
+    // Either way the value matches what /validate would write for the same key.
+    const activationKey = license.license_key ?? rawKey;
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      // Re-read onboarded_at under row lock so two concurrent /account/create
+      // calls for the same license cannot both pass the "not yet onboarded"
+      // gate. SELECT FOR UPDATE blocks the second caller until the first
+      // commits, then the second sees onboarded_at set and 409s out.
+      const { rows: gate } = await client.query(
+        "SELECT onboarded_at FROM licenses WHERE id = $1 FOR UPDATE",
+        [license.id]
+      );
+      if (gate[0]?.onboarded_at != null) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          error: "account_already_exists",
+          detail: "This license has already created an account. Use /account/connect instead.",
+        });
+      }
+
+      await client.query(
+        "UPDATE licenses SET account_name = $1, onboarded_at = NOW() WHERE id = $2",
+        [account_name?.trim() || null, license.id]
+      );
+
+      await client.query(
+        `INSERT INTO stations (uuid, license_key_id, name, nickname, frequency, call_letters)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          stationUuid,
+          license.id,
+          station.name.trim(),
+          station.nickname?.trim() || null,
+          station.frequency?.trim() || null,
+          station.call_letters?.trim() || null,
+        ]
+      );
+
+      // Seat upsert — same ON CONFLICT shape as the /validate path, plus
+      // station_uuid binding. Re-onboarding a previously deauthorized seat
+      // (deauthorized_at IS NOT NULL) clears that marker and rebinds it.
+      await client.query(
+        `INSERT INTO license_activations
+           (license_key, machine_id, machine_name, ip_address, station_uuid)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (license_key, machine_id) DO UPDATE SET
+           machine_name    = EXCLUDED.machine_name,
+           ip_address      = EXCLUDED.ip_address,
+           station_uuid    = EXCLUDED.station_uuid,
+           last_seen       = NOW(),
+           deauthorized_at = NULL`,
+        [activationKey, machine_id.trim(), machine_name || null, ip, stationUuid]
+      );
+
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
+
+    console.log(`[Account/Create] license:${license.id} station:${stationUuid.slice(0, 8)} (${station.name.trim()})`);
+    res.json({ account_name: account_name?.trim() || null, station_uuid: stationUuid });
+  } catch (e) {
+    console.error("[/account/create]", e.message);
+    res.status(500).json({ error: "internal", detail: e.message });
+  }
+});
+
 // ── Admin endpoints ───────────────────────────────────────────
 
 app.get("/admin/licenses", requireAdmin, async (req, res) => {
