@@ -745,6 +745,119 @@ app.post("/account/bind-seat", async (req, res) => {
   }
 });
 
+// POST /account/add-station — Screen 3b "Add a new station" action.
+// Called after /account/connect when the customer picks "Add a new station"
+// instead of an existing one. Creates the stations row and binds this
+// machine's seat to it in one transaction.
+//
+// Same transaction + seat-limit pattern as /account/bind-seat: the limit
+// check is belt-and-suspenders here because /account/connect already gated
+// on it, but a buggy/misordered client could call this directly.
+
+app.post("/account/add-station", async (req, res) => {
+  try {
+    const { license_key, machine_id, machine_name, station } = req.body || {};
+    const rawKey = license_key?.trim();
+
+    if (!rawKey || !machine_id?.trim() || !station?.name?.trim()) {
+      return res.status(400).json({
+        error: "missing_fields",
+        detail: "license_key, machine_id, and station.name are required",
+      });
+    }
+
+    const license = await lookupLicense(rawKey);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+
+    const stationUuid = crypto.randomUUID();
+    const activationKey = license.license_key ?? rawKey;
+    const ip = (req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress || "").trim();
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      // Serialize concurrent seat-mutating ops for this license (same lock
+      // pattern as /account/create and /account/bind-seat).
+      await client.query("SELECT 1 FROM licenses WHERE id=$1 FOR UPDATE", [license.id]);
+
+      // Defensive seat-limit check — only fires when this call would consume
+      // a new slot. /account/connect already gated the customer here in the
+      // normal flow; this catches direct/misordered clients.
+      const { rows: existing } = await client.query(
+        "SELECT deauthorized_at FROM license_activations WHERE license_key=$1 AND machine_id=$2",
+        [activationKey, machine_id.trim()]
+      );
+      const willConsumeSlot = existing.length === 0 || existing[0].deauthorized_at != null;
+      if (willConsumeSlot) {
+        const { rows: countRow } = await client.query(
+          "SELECT COUNT(*)::int AS n FROM license_activations WHERE license_key=$1 AND deauthorized_at IS NULL",
+          [activationKey]
+        );
+        if (countRow[0].n >= SEATS_MAX) {
+          await client.query("ROLLBACK");
+          return res.status(403).json({
+            error: "seat_limit_reached",
+            seats_used: countRow[0].n,
+            seats_max: SEATS_MAX,
+          });
+        }
+      }
+
+      await client.query(
+        `INSERT INTO stations (uuid, license_key_id, name, nickname, frequency, call_letters)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          stationUuid,
+          license.id,
+          station.name.trim(),
+          station.nickname?.trim() || null,
+          station.frequency?.trim() || null,
+          station.call_letters?.trim() || null,
+        ]
+      );
+
+      // Belt-and-suspenders: if a buggy client somehow reaches add-station
+      // without going through /account/create first, mark the license
+      // onboarded anyway so a later /account/create call hits its 409 gate
+      // rather than silently creating a second station. No-op in the normal
+      // flow where /account/create already set onboarded_at.
+      await client.query(
+        "UPDATE licenses SET onboarded_at = NOW() WHERE id = $1 AND onboarded_at IS NULL",
+        [license.id]
+      );
+
+      // Seat upsert binds this machine to the brand-new station. Same
+      // ON CONFLICT shape as /account/create and /account/bind-seat.
+      await client.query(
+        `INSERT INTO license_activations
+           (license_key, machine_id, machine_name, ip_address, station_uuid)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (license_key, machine_id) DO UPDATE SET
+           machine_name    = EXCLUDED.machine_name,
+           ip_address      = EXCLUDED.ip_address,
+           station_uuid    = EXCLUDED.station_uuid,
+           last_seen       = NOW(),
+           deauthorized_at = NULL`,
+        [activationKey, machine_id.trim(), machine_name || null, ip, stationUuid]
+      );
+
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
+
+    console.log(`[Account/AddStation] license:${license.id} machine:${machine_id.slice(0, 8)} station:${stationUuid.slice(0, 8)} (${station.name.trim()})`);
+    res.json({ station_uuid: stationUuid });
+  } catch (e) {
+    console.error("[/account/add-station]", e.message);
+    res.status(500).json({ error: "internal", detail: e.message });
+  }
+});
+
 // ── Admin endpoints ───────────────────────────────────────────
 
 app.get("/admin/licenses", requireAdmin, async (req, res) => {
