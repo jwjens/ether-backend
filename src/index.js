@@ -55,6 +55,34 @@ const app    = express();
 const pool   = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 const resend = new Resend(process.env.RESEND_API_KEY);
 
+// ── R2 client (lazy singleton) ────────────────────────────────
+// Backend-signed URL model: customers never hold R2 credentials. Endpoints
+// that need R2 (audio sync, DB backups) call getR2Client() and get either
+// a configured client or null. Null → respond 503 r2_not_configured so the
+// rest of the API keeps working even if R2 env vars are absent (lets the
+// backend boot in environments where R2 hasn't been provisioned yet).
+let _r2Client = null;
+function getR2Client() {
+  if (_r2Client) return _r2Client;
+  if (!process.env.R2_ACCESS_KEY_ID ||
+      !process.env.R2_SECRET_ACCESS_KEY ||
+      !process.env.R2_ACCOUNT_ID) {
+    return null;
+  }
+  const { S3Client } = require("@aws-sdk/client-s3");
+  _r2Client = new S3Client({
+    region: "auto",
+    endpoint: process.env.R2_ENDPOINT ||
+              `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+    credentials: {
+      accessKeyId:     process.env.R2_ACCESS_KEY_ID,
+      secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
+    },
+  });
+  return _r2Client;
+}
+const R2_BUCKET = process.env.R2_BUCKET || "ether-audio";
+
 // ── In-memory state ───────────────────────────────────────────
 const pendingCmds = [];          // fallback queue when no SSE client is connected
 const sseClients  = new Map();   // license_key → Set<res> for cmd-stream subscribers
