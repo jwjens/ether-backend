@@ -858,6 +858,84 @@ app.post("/account/add-station", async (req, res) => {
   }
 });
 
+// POST /account/deauthorize-seat — soft-delete a seat (Manage Devices).
+// Sets deauthorized_at = NOW() on the matching license_activations row.
+// Idempotent: deauthorizing an already-deauthorized seat or a nonexistent
+// row returns ok=true with removed=0. The UI is the gate against
+// self-deauthorization ("Deauthorize" button absent on the current device).
+
+app.post("/account/deauthorize-seat", async (req, res) => {
+  try {
+    const { license_key, machine_id } = req.body || {};
+    const rawKey = license_key?.trim();
+
+    if (!rawKey || !machine_id?.trim()) {
+      return res.status(400).json({
+        error: "missing_fields",
+        detail: "license_key and machine_id are required",
+      });
+    }
+
+    const license = await lookupLicense(rawKey);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+
+    const activationKey = license.license_key ?? rawKey;
+
+    const { rowCount } = await pool.query(
+      "UPDATE license_activations SET deauthorized_at = NOW() WHERE license_key = $1 AND machine_id = $2 AND deauthorized_at IS NULL",
+      [activationKey, machine_id.trim()]
+    );
+
+    console.log(`[Account/Deauthorize] license:${license.id} machine:${machine_id.trim().slice(0, 8)} (deauthorized ${rowCount})`);
+    res.json({ ok: true, removed: rowCount });
+  } catch (e) {
+    console.error("[/account/deauthorize-seat]", e.message);
+    res.status(500).json({ error: "internal", detail: e.message });
+  }
+});
+
+// GET /account/seats — list active seats for Manage Devices.
+// Returns the same row shape as /licenses/:key/activations but under the
+// /account namespace, license-key-only auth (no email match), and includes
+// station_uuid + seat-cap counts so the panel can render "Devices: N/5".
+// Auth via x-license-key header (not query param) so the key doesn't land
+// in access logs, proxy logs, or browser history. Matches /api/cmd.
+
+app.get("/account/seats", async (req, res) => {
+  try {
+    const rawKey = (req.headers["x-license-key"] || "").toString().trim();
+    if (!rawKey) {
+      return res.status(401).json({
+        error: "missing_license_key",
+        detail: "x-license-key header is required",
+      });
+    }
+
+    const license = await lookupLicense(rawKey);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+
+    const activationKey = license.license_key ?? rawKey;
+
+    const { rows: seats } = await pool.query(
+      `SELECT machine_id, machine_name, os, ip_address, station_uuid,
+              activated_at, last_seen
+       FROM license_activations
+       WHERE license_key = $1 AND deauthorized_at IS NULL
+       ORDER BY last_seen DESC`,
+      [activationKey]
+    );
+
+    res.json({
+      seats,
+      seats_used: seats.length,
+      seats_max: SEATS_MAX,
+    });
+  } catch (e) {
+    console.error("[/account/seats]", e.message);
+    res.status(500).json({ error: "internal", detail: e.message });
+  }
+});
+
 // ── Admin endpoints ───────────────────────────────────────────
 
 app.get("/admin/licenses", requireAdmin, async (req, res) => {
