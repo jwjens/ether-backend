@@ -1239,17 +1239,27 @@ app.get("/audio/list", async (req, res) => {
 });
 
 // ── DB backups (R2 signed URLs) ───────────────────────────────
-// POST /backup/upload-url — signed PutObject URL for gzipped openair.db.
-// Customer flow (after Phase 1.3f rewrites cloud-backup.js):
-//   1. cloud-backup.js wakes on its 6h timer
-//   2. Gzip openair.db to a temp file
-//   3. Generate timestamp via toISOString().replace(/[:.]/g, '-').slice(0,19)
-//      or similar — filename-safe form, no colons
-//   4. POST { license_key, timestamp } → { signed_url, expires_at }
-//   5. PUT the gzipped bytes directly to signed_url
-//   6. Delete temp file
+// POST /backup/upload-url — signs BOTH the gzipped-DB key and the metadata
+// sidecar key in one shot. Atomic at the signing layer: either both URLs
+// come back valid or the endpoint 500s and the customer retries the pair.
+// Future sidecar additions (e.g. .checksum) slot in as another signed URL
+// in the same response — no client coordination required.
 //
-// Key construction: ${license.id}/backups/${timestamp}.db.gz
+// Customer flow (Phase 1.3f rewrite of cloud-backup.js):
+//   1. cloud-backup.js wakes on its 6h timer
+//   2. Gzip openair.db; build metadata JSON (station_name, table counts, etc.)
+//   3. Generate timestamp via toISOString().replace(/[:.]/g, '-').slice(0,19)
+//      — filename-safe form, no colons
+//   4. POST { license_key, timestamp } → { db_signed_url, meta_signed_url, expires_at }
+//   5. PUT gzipped DB to db_signed_url   (Content-Type: application/gzip)
+//   6. PUT meta JSON to meta_signed_url  (Content-Type: application/json)
+//   7. History row counts as success only if BOTH PUTs succeed; partial
+//      success is recorded as "incomplete_backup" with the failed half
+//
+// Key construction:
+//   ${license.id}/backups/${timestamp}.db.gz
+//   ${license.id}/backups/${timestamp}.meta.json
+//
 // timestamp is client-supplied (no arbitrary file_key here — backup naming
 // is server-controlled to keep the listing structure predictable). Validated
 // against /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z?$/.
@@ -1280,20 +1290,31 @@ app.post("/backup/upload-url", async (req, res) => {
       });
     }
 
-    const r2Key            = `${license.id}/backups/${sanitized.value}.db.gz`;
+    const dbKey            = `${license.id}/backups/${sanitized.value}.db.gz`;
+    const metaKey          = `${license.id}/backups/${sanitized.value}.meta.json`;
     const expiresInSeconds = 15 * 60;
 
-    let signedUrl;
+    let dbSignedUrl, metaSignedUrl;
     try {
-      signedUrl = await signR2PutUrl(r2Key, expiresInSeconds);
+      // Sign both in parallel. Either both succeed and the customer gets a
+      // matched pair, or one throws and the endpoint 500s — the customer
+      // never sees half-state.
+      [dbSignedUrl, metaSignedUrl] = await Promise.all([
+        signR2PutUrl(dbKey,   expiresInSeconds),
+        signR2PutUrl(metaKey, expiresInSeconds),
+      ]);
     } catch (e) {
       console.error("[/backup/upload-url] signing failed:", e.message);
       return res.status(500).json({ error: "signing_failed", detail: e.message });
     }
 
     const expiresAt = new Date(Date.now() + expiresInSeconds * 1000).toISOString();
-    console.log(`[Backup/UploadURL] license:${license.id} ts:${sanitized.value} (15m)`);
-    res.json({ signed_url: signedUrl, expires_at: expiresAt });
+    console.log(`[Backup/UploadURL] license:${license.id} ts:${sanitized.value} (db+meta, 15m)`);
+    res.json({
+      db_signed_url:   dbSignedUrl,
+      meta_signed_url: metaSignedUrl,
+      expires_at:      expiresAt,
+    });
   } catch (e) {
     console.error("[/backup/upload-url]", e.message);
     res.status(500).json({ error: "internal", detail: e.message });
