@@ -112,6 +112,20 @@ async function signR2PutUrl(key, expiresInSeconds = 900) {
   );
 }
 
+// Sign a short-lived GetObject URL. Same caller contract as signR2PutUrl —
+// caller null-checks getR2Client() first; this helper throws on SDK failure.
+// No HeadObject check here: if the key doesn't exist, the signed URL is
+// returned successfully and the customer gets R2's own 404 on the GET.
+async function signR2GetUrl(key, expiresInSeconds = 900) {
+  const { GetObjectCommand } = require("@aws-sdk/client-s3");
+  const { getSignedUrl }     = require("@aws-sdk/s3-request-presigner");
+  return getSignedUrl(
+    getR2Client(),
+    new GetObjectCommand({ Bucket: R2_BUCKET, Key: key }),
+    { expiresIn: expiresInSeconds }
+  );
+}
+
 // ── In-memory state ───────────────────────────────────────────
 const pendingCmds = [];          // fallback queue when no SSE client is connected
 const sseClients  = new Map();   // license_key → Set<res> for cmd-stream subscribers
@@ -1058,6 +1072,66 @@ app.post("/audio/upload-url", async (req, res) => {
     res.json({ signed_url: signedUrl, expires_at: expiresAt });
   } catch (e) {
     console.error("[/audio/upload-url]", e.message);
+    res.status(500).json({ error: "internal", detail: e.message });
+  }
+});
+
+// POST /audio/download-url — license-validated signed GET URL.
+// Same body / response / error shapes as /audio/upload-url. Customer flow
+// (after Phase 1.3i lands in C:\openair):
+//   1. POST { license_key, file_key } → { signed_url, expires_at }
+//   2. fetch GET signed_url → audio bytes
+//   3. Save to local audio cache (userData/audio-cache/<file_key>)
+//
+// NB: object-not-found is NOT checked here. If file_key doesn't exist in R2
+// for this license's prefix, this endpoint still returns 200 with a valid
+// signed URL — the customer's subsequent GET on that URL hits R2's own 404.
+// Saves an extra HeadObject roundtrip per signing call. Customer-side caller
+// must distinguish backend errors (4xx/5xx JSON from this endpoint) from R2
+// errors (XML body from the signed URL GET).
+
+app.post("/audio/download-url", async (req, res) => {
+  try {
+    const { license_key, file_key } = req.body || {};
+    const rawKey = license_key?.trim();
+    if (!rawKey) {
+      return res.status(400).json({
+        error:  "missing_fields",
+        detail: "license_key is required",
+      });
+    }
+
+    const sanitized = sanitizeFileKey(file_key);
+    if (sanitized.error) {
+      return res.status(400).json({ error: "invalid_file_key", detail: sanitized.error });
+    }
+
+    const license = await lookupLicense(rawKey);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+
+    if (!getR2Client()) {
+      return res.status(503).json({
+        error:  "r2_not_configured",
+        detail: "Backend R2 credentials not set",
+      });
+    }
+
+    const r2Key            = `${license.id}/${sanitized.value}`;
+    const expiresInSeconds = 15 * 60;
+
+    let signedUrl;
+    try {
+      signedUrl = await signR2GetUrl(r2Key, expiresInSeconds);
+    } catch (e) {
+      console.error("[/audio/download-url] signing failed:", e.message);
+      return res.status(500).json({ error: "signing_failed", detail: e.message });
+    }
+
+    const expiresAt = new Date(Date.now() + expiresInSeconds * 1000).toISOString();
+    console.log(`[Audio/DownloadURL] license:${license.id} key:${sanitized.value} (15m)`);
+    res.json({ signed_url: signedUrl, expires_at: expiresAt });
+  } catch (e) {
+    console.error("[/audio/download-url]", e.message);
     res.status(500).json({ error: "internal", detail: e.message });
   }
 });
