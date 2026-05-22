@@ -331,6 +331,15 @@ async function initDB() {
 
 // ── Helpers ───────────────────────────────────────────────────
 
+// Canonical PlanTier values — must match src/hooks/usePlan.tsx in openair.
+// Used by /admin/issue to reject typos/invalid plans (EB4). Without this gate
+// an admin could write any string to licenses.plan; the renderer's TIER_RANK
+// lookup returns undefined for unknown values, so requirePlan() fails every
+// check — customer ends up worse than free with a fully-issued license.
+const VALID_PLANS = new Set([
+  "free", "pro", "pro_lifetime", "station", "station_lifetime", "operator",
+]);
+
 function generateLicenseKey(plan) {
   const prefix = plan === "station" ? "ETH-STN" : "ETH-PRO";
   const rand   = crypto.randomBytes(12).toString("hex").toUpperCase();
@@ -1333,6 +1342,12 @@ app.get("/admin/licenses", requireAdmin, async (req, res) => {
 app.post("/admin/issue", requireAdmin, async (req, res) => {
   const { email, plan = "pro" } = req.body;
   if (!email) return res.status(400).json({ error: "Missing email" });
+  if (!VALID_PLANS.has(plan)) {
+    return res.status(400).json({
+      error: "invalid_plan",
+      detail: `plan must be one of: ${[...VALID_PLANS].join(", ")}`,
+    });
+  }
   const key = generateLicenseKey(plan);
   const keyPrefix = key.slice(0, 12);
   const keyHash   = await bcrypt.hash(key, 12);
