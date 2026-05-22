@@ -225,6 +225,76 @@ function makeSyncRouter(pool) {
     }
   });
 
+  // ── GET /sync/pending-count — backlog count for OnboardingFlow Screen 4 ─
+  //
+  // Returns the number of mutations the client has not yet pulled, grouped
+  // by table_name. WHERE clauses mirror /sync/mutations (GET) exactly so the
+  // count never diverges from what pull will deliver — including own-client
+  // mutations (the client deduplicates by id locally; the count must include
+  // them or "X of Y" progress will have X exceed Y).
+  //
+  // Single GROUP BY query; total_remaining is summed in JS. No new index
+  // needed — the existing idx_mutations_sta_seq (and idx_mutations_seq for
+  // the install-only branch) cover the WHERE. If a real customer ever hits
+  // 50k+ queued mutations and this gets slow, a partial composite index
+  // (license_key_id, server_seq) INCLUDE (table_name) is the optimization.
+  //
+  // Error contract:
+  //   400 Missing client_id          — query param missing (mirrors /sync/pull)
+  //   401 missing_license_key / invalid_license_key — handled by requireLicense
+  //   500 Server error               — query failure
+
+  router.get('/pending-count', async (req, res) => {
+    try {
+      const { client_id, station_id = null, since_seq = '0' } = req.query;
+
+      if (!client_id || typeof client_id !== 'string')
+        return res.status(400).json({ error: 'Missing client_id' });
+
+      const sinceSeq = parseInt(since_seq, 10) || 0;
+      const sid      = station_id || null;
+
+      let rows;
+      if (sid) {
+        const result = await pool.query(`
+          SELECT table_name, COUNT(*)::int AS n
+          FROM mutations
+          WHERE server_seq > $1
+            AND license_key_id = $2
+            AND (station_id = $3 OR station_id IS NULL)
+          GROUP BY table_name
+        `, [sinceSeq, req.license.id, sid]);
+        rows = result.rows;
+      } else {
+        const result = await pool.query(`
+          SELECT table_name, COUNT(*)::int AS n
+          FROM mutations
+          WHERE server_seq > $1
+            AND license_key_id = $2
+            AND station_id IS NULL
+          GROUP BY table_name
+        `, [sinceSeq, req.license.id]);
+        rows = result.rows;
+      }
+
+      const per_table = {};
+      let total_remaining = 0;
+      for (const r of rows) {
+        per_table[r.table_name] = r.n;
+        total_remaining += r.n;
+      }
+
+      console.log(
+        `[sync/pending-count] client=${client_id.slice(0, 8)} ` +
+        `since_seq=${sinceSeq} total=${total_remaining} tables=${Object.keys(per_table).length}`
+      );
+      res.json({ total_remaining, per_table });
+    } catch (e) {
+      console.error('[sync/pending-count]', e.message);
+      res.status(500).json({ error: 'Server error' });
+    }
+  });
+
   return router;
 }
 
