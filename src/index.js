@@ -340,6 +340,27 @@ const VALID_PLANS = new Set([
   "free", "pro", "pro_lifetime", "station", "station_lifetime", "operator",
 ]);
 
+// Stripe priceId → PlanTier lookup. Used by /webhook/stripe to determine
+// which plan a new license should be issued at (EB3). Replaces the prior
+// silent fallback (`priceId === PRICE_STATION ? "station" : "pro"`) which
+// would map ANY unknown priceId — including a new Stripe product added
+// without updating the webhook — to "pro" tier. Now unknown priceIds are
+// logged loudly and the webhook acks without issuing a license; operator
+// must intervene via /admin/issue.
+//
+// .filter drops unset env vars so two unconfigured products don't collide
+// on a shared "" key (Object.fromEntries would otherwise produce {"": "..."}).
+//
+// Extending: add a row when a new Stripe product is created. pro_lifetime,
+// station_lifetime, operator have no Stripe products today — they're
+// admin-issued only.
+const PLAN_BY_PRICE_ID = Object.fromEntries(
+  [
+    [process.env.PRICE_PRO,     "pro"],
+    [process.env.PRICE_STATION, "station"],
+  ].filter(([id]) => !!id)
+);
+
 function generateLicenseKey(plan) {
   const prefix = plan === "station" ? "ETH-STN" : "ETH-PRO";
   const rand   = crypto.randomBytes(12).toString("hex").toUpperCase();
@@ -1381,7 +1402,20 @@ app.post("/webhook/stripe", async (req, res) => {
 
     const items   = obj.lines?.data || [];
     const priceId = items[0]?.price?.id || "";
-    const plan    = priceId === process.env.PRICE_STATION ? "station" : "pro";
+    const plan    = PLAN_BY_PRICE_ID[priceId];
+    if (!plan) {
+      // EB3: was a silent fallback to "pro". Now unknown priceIds — empty
+      // string from a malformed event, a new Stripe product without a
+      // matching env var, or anything else — fail loudly. Ack to Stripe so
+      // it doesn't retry indefinitely, but issue no license. Operator must
+      // notice the log and issue manually via /admin/issue. See also EB12.
+      console.error(
+        `[Stripe] UNKNOWN priceId "${priceId}" for ${email} ` +
+        `(event: ${event.type}, subId: ${subId}) — no license issued. ` +
+        `Acknowledging webhook to prevent retry. Operator must issue manually.`
+      );
+      return res.json({ received: true });
+    }
 
     const { rows: existing } = await pool.query("SELECT * FROM licenses WHERE stripe_sub_id=$1", [subId]);
     let licenseKey;
