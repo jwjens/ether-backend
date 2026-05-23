@@ -361,6 +361,23 @@ const PLAN_BY_PRICE_ID = Object.fromEntries(
   ].filter(([id]) => !!id)
 );
 
+// Per-plan station limits enforced server-side in /account/add-station (EB2).
+// Network tier's differentiator is audio-sync features, not station count —
+// hence the uniform 5 across pro/pro_lifetime/station/station_lifetime.
+// operator → -1 sentinel for unlimited; the handler short-circuits before
+// the COUNT query when it sees -1. free → 1 is defense-in-depth alongside
+// /account/create's onboarded_at gate (which already structurally limits
+// free licenses to 1 station, but if that gate is ever bypassed this
+// catches it on the add-station path).
+const PLAN_STATION_LIMITS = {
+  free:             1,
+  pro:              5,
+  pro_lifetime:     5,
+  station:          5,
+  station_lifetime: 5,
+  operator:        -1,
+};
+
 function generateLicenseKey(plan) {
   const prefix = plan === "station" ? "ETH-STN" : "ETH-PRO";
   const rand   = crypto.randomBytes(12).toString("hex").toUpperCase();
@@ -936,6 +953,31 @@ app.post("/account/add-station", async (req, res) => {
       // Serialize concurrent seat-mutating ops for this license (same lock
       // pattern as /account/create and /account/bind-seat).
       await client.query("SELECT 1 FROM licenses WHERE id=$1 FOR UPDATE", [license.id]);
+
+      // Station-count cap (EB2). Per-plan limits enforced AFTER the row lock
+      // so two concurrent /account/add-station calls for the same license
+      // can't both pass a stale count check. operator → -1 short-circuits
+      // before the COUNT query. Unknown plan values fall through to the
+      // strictest (free) cap — defense in depth against any licenses.plan
+      // row that escaped EB4's /admin/issue validation. Listed BEFORE the
+      // seat-limit check so the more informative station_limit_reached
+      // fires first if a customer would hit both.
+      const stationCap = PLAN_STATION_LIMITS[license.plan] ?? PLAN_STATION_LIMITS.free;
+      if (stationCap !== -1) {
+        const { rows: scRow } = await client.query(
+          "SELECT COUNT(*)::int AS n FROM stations WHERE license_key_id=$1",
+          [license.id]
+        );
+        if (scRow[0].n >= stationCap) {
+          await client.query("ROLLBACK");
+          return res.status(403).json({
+            error: "station_limit_reached",
+            stations_used: scRow[0].n,
+            stations_max: stationCap,
+            plan: license.plan,
+          });
+        }
+      }
 
       // Defensive seat-limit check — only fires when this call would consume
       // a new slot. /account/connect already gated the customer here in the
