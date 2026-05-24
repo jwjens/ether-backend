@@ -318,8 +318,6 @@ function toggleLiveCam() {
 }
 
 // ── WebRTC / Signaling ────────────────────────────────────────
-// In production this connects to wss://signal.etherradio.app
-// For now, POST presence to backend so host app is notified via polling
 
 async function connectToHost() {
   const name = document.getElementById('guest-name').value.trim();

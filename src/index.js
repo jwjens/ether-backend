@@ -33,7 +33,7 @@
  *
  * Add these two:
  *   BACKUP_MAX_MB = 50
- *   FROM_EMAIL    = noreply@etherradio.app
+ *   FROM_EMAIL    = noreply@ether-technologies.com
  */
 
 require("dotenv").config();
@@ -395,7 +395,7 @@ function escapeHtml(s) {
 async function sendLicenseEmail(email, licenseKey, plan) {
   const label = plan === "station" ? "Station" : "Pro";
   const price = plan === "station" ? "$79/mo" : "$19/mo";
-  const from  = process.env.FROM_EMAIL || "noreply@etherradio.app";
+  const from  = process.env.FROM_EMAIL || "noreply@ether-technologies.com";
 
   const { error } = await resend.emails.send({
     from, to: email,
@@ -422,10 +422,10 @@ async function sendLicenseEmail(email, licenseKey, plan) {
     </ol>
   </div>
   <p style="color:#475569;font-size:11px">
-    Questions? <a href="mailto:support@etherradio.app" style="color:#22d3ee;text-decoration:none">support@etherradio.app</a>
+    Questions? <a href="mailto:support@ether-technologies.com" style="color:#22d3ee;text-decoration:none">support@ether-technologies.com</a>
   </p>
   <div style="margin-top:28px;padding-top:14px;border-top:1px solid #1e293b;font-size:10px;color:#334155">
-    Ether Technologies · etherradio.app · ${new Date().getFullYear()}
+    Ether Technologies · ether-technologies.com · ${new Date().getFullYear()}
   </div>
 </div>`,
   });
