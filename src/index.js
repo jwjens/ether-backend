@@ -393,7 +393,7 @@ function escapeHtml(s) {
 }
 
 async function sendLicenseEmail(email, licenseKey, plan) {
-  const label = plan === "station" ? "Station" : "Pro";
+  const label = plan === "station" ? "Network" : "Studio";
   const price = plan === "station" ? "$79/mo" : "$19/mo";
   const from  = process.env.FROM_EMAIL || "noreply@ether-technologies.com";
 
@@ -416,7 +416,7 @@ async function sendLicenseEmail(email, licenseKey, plan) {
     <div style="font-size:12px;font-weight:700;color:#e2e8f0;margin-bottom:10px">How to activate</div>
     <ol style="color:#94a3b8;font-size:12px;line-height:2.2;padding-left:18px;margin:0">
       <li>Open <strong style="color:#f0f0f8">Ether</strong> on your computer</li>
-      <li>Click the <strong style="color:#f0f0f8">Pro</strong> button in the top toolbar</li>
+      <li>Click the <strong style="color:#f0f0f8">Studio</strong> button in the top toolbar</li>
       <li>Click <strong style="color:#f0f0f8">Enter License Key</strong></li>
       <li>Enter your email and the key above</li>
     </ol>
@@ -463,7 +463,7 @@ async function requireLicense(req, res, next) {
   const license = await lookupLicense(key).catch(() => null);
   if (!license) return res.status(401).json({ error: "invalid_license_key" });
   if (!["pro", "station"].includes(license.plan))
-    return res.status(403).json({ error: "Pro or Station plan required" });
+    return res.status(403).json({ error: "Studio or Network plan required" });
   req.license = license;
   next();
 }
@@ -1544,7 +1544,7 @@ app.get("/api/cmd-stream", async (req, res) => {
   const license = await lookupLicense(rawKey).catch(() => null);
   if (!license) return res.status(401).json({ error: "invalid_license_key" });
   if (!["pro","station"].includes(license.plan))
-    return res.status(403).json({ error: "Pro or Station plan required" });
+    return res.status(403).json({ error: "Studio or Network plan required" });
 
   res.set({
     "Content-Type":      "text/event-stream",
