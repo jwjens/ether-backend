@@ -326,6 +326,48 @@ async function initDB() {
   // Partial index — supports "count active seats" in /account/connect (deauthorized_at IS NULL).
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_activations_active ON license_activations(license_key) WHERE deauthorized_at IS NULL`);
 
+  // ── Listener Platform / Station Metadata service (Phase 1) ─────────────────
+  // All additive. station_now_playing is a live cache (upsert per report);
+  // station_metadata is the opt-in public-page branding (lazy — no row until a
+  // customer configures a page); station_slug_history backs slug-rename redirects.
+  // `slug TEXT UNIQUE` permits many NULLs (unconfigured) + one owner per non-null.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS station_now_playing (
+      station_uuid   TEXT PRIMARY KEY REFERENCES stations(uuid) ON DELETE CASCADE,
+      playing        BOOLEAN NOT NULL DEFAULT false,
+      title          TEXT,
+      artist         TEXT,
+      deck           TEXT,
+      started_at     TIMESTAMPTZ,
+      position_sec   INTEGER,
+      duration_sec   INTEGER,
+      queue          JSONB,
+      updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS station_metadata (
+      station_uuid    TEXT PRIMARY KEY REFERENCES stations(uuid) ON DELETE CASCADE,
+      slug            TEXT UNIQUE,
+      display_name    TEXT,
+      logo_url        TEXT,
+      color_primary   TEXT,
+      color_secondary TEXT,
+      description     TEXT,
+      socials         JSONB,
+      public_enabled  BOOLEAN NOT NULL DEFAULT false,
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS station_slug_history (
+      old_slug      TEXT PRIMARY KEY,
+      station_uuid  TEXT NOT NULL REFERENCES stations(uuid) ON DELETE CASCADE,
+      changed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
   console.log("[DB] Schema ready");
 }
 
@@ -1502,9 +1544,55 @@ app.post("/webhook/stripe", async (req, res) => {
 
 // ── Now Playing ───────────────────────────────────────────────
 
-app.post("/api/now-playing", (req, res) => {
+// Resolve the license + station_uuid the desktop app sends and upsert the live
+// per-station now-playing row (Listener Platform / Control Center foundation).
+// Keyed on (license_key_id, station_uuid): if the uuid isn't a backend-known
+// station for this license (e.g. a local-only, never-onboarded station), skip
+// silently — the global slot has already been served. Best-effort by design.
+async function upsertStationNowPlaying(rawKey, body) {
+  if (!rawKey || !body || !body.station_uuid) return;
+  const license = await lookupLicense(rawKey);
+  if (!license) return;
+  const { rows } = await pool.query(
+    `SELECT uuid FROM stations WHERE uuid = $1 AND license_key_id = $2`,
+    [body.station_uuid, license.id]
+  );
+  if (rows.length === 0) return; // not a known station for this license — skip
+
+  const playing  = !!body.playing;
+  const position = Number(body.position) || 0;
+  const duration = Number(body.duration) || 0;
+  // started_at lets listeners compute elapsed locally without per-second updates.
+  const startedAt = playing ? new Date(Date.now() - position * 1000) : null;
+
+  await pool.query(
+    `INSERT INTO station_now_playing
+       (station_uuid, playing, title, artist, deck, started_at, position_sec, duration_sec, queue, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, NOW())
+     ON CONFLICT (station_uuid) DO UPDATE SET
+       playing=$2, title=$3, artist=$4, deck=$5, started_at=$6,
+       position_sec=$7, duration_sec=$8, queue=$9, updated_at=NOW()`,
+    [
+      body.station_uuid, playing, body.title ?? null, body.artist ?? null,
+      body.deck ?? null, startedAt, position, duration,
+      JSON.stringify(Array.isArray(body.queue) ? body.queue : []),
+    ]
+  );
+}
+
+app.post("/api/now-playing", async (req, res) => {
+  // Global slot — unchanged, unconditional, FIRST. OV's /mobile, /dashboard and
+  // /console read this; it must never regress. Respond immediately.
   nowPlaying.data = { ...req.body, updated_at: Date.now() };
   res.json({ ok: true });
+
+  // Per-station upsert runs AFTER the response, fully wrapped — a failure here
+  // can never affect the response above or the global slot OV depends on.
+  try {
+    await upsertStationNowPlaying(req.headers["x-license-key"], req.body);
+  } catch (e) {
+    console.warn("[now-playing] per-station upsert skipped:", e.message);
+  }
 });
 
 app.get("/api/now-playing", (req, res) => {
