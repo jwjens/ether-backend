@@ -388,6 +388,10 @@ async function initDB() {
       changed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  // Phase 4: per-station Icecast stream URL for the listener PWA. ALTER (not a
+  // CREATE edit) because station_metadata already exists on Railway — CREATE
+  // TABLE IF NOT EXISTS is a no-op there and would never add the column.
+  await pool.query(`ALTER TABLE station_metadata ADD COLUMN IF NOT EXISTS stream_url TEXT`);
 
   console.log("[DB] Schema ready");
 }
@@ -1660,7 +1664,7 @@ app.get("/public/station/:slug", async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT m.slug, m.display_name, m.logo_url, m.color_primary, m.color_secondary,
-              m.description, m.socials, m.public_enabled,
+              m.description, m.socials, m.public_enabled, m.stream_url,
               n.playing, n.title, n.artist, n.started_at, n.duration_sec, n.queue, n.updated_at
        FROM station_metadata m
        LEFT JOIN station_now_playing n ON n.station_uuid = m.station_uuid
@@ -1677,6 +1681,7 @@ app.get("/public/station/:slug", async (req, res) => {
         color_secondary: r.color_secondary,
         description: r.description,
         socials: r.socials || {},
+        stream_url: r.stream_url || null,
         now_playing: r.updated_at ? {
           playing: r.playing, title: r.title, artist: r.artist,
           started_at: r.started_at, duration_sec: r.duration_sec,
@@ -1768,7 +1773,8 @@ app.get("/api/station/:uuid/metadata", async (req, res) => {
     if (rows.length === 0) {
       return res.json({
         station_uuid: owned.stationUuid, slug: null, display_name: null, logo_url: null,
-        color_primary: null, color_secondary: null, description: null, socials: {}, public_enabled: false,
+        color_primary: null, color_secondary: null, description: null, socials: {},
+        stream_url: null, public_enabled: false,
       });
     }
     res.json(rows[0]);
@@ -1815,14 +1821,15 @@ app.post("/api/station/:uuid/metadata", async (req, res) => {
     const socials = (b.socials && typeof b.socials === "object" && !Array.isArray(b.socials)) ? b.socials : {};
     const { rows } = await pool.query(
       `INSERT INTO station_metadata
-         (station_uuid, slug, display_name, logo_url, color_primary, color_secondary, description, socials, public_enabled, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, NOW())
+         (station_uuid, slug, display_name, logo_url, color_primary, color_secondary, description, socials, public_enabled, stream_url, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, NOW())
        ON CONFLICT (station_uuid) DO UPDATE SET
          slug=$2, display_name=$3, logo_url=$4, color_primary=$5, color_secondary=$6,
-         description=$7, socials=$8, public_enabled=$9, updated_at=NOW()
+         description=$7, socials=$8, public_enabled=$9, stream_url=$10, updated_at=NOW()
        RETURNING *`,
       [uuid, slug, b.display_name ?? null, b.logo_url ?? null, b.color_primary ?? null,
-       b.color_secondary ?? null, b.description ?? null, JSON.stringify(socials), !!b.public_enabled]
+       b.color_secondary ?? null, b.description ?? null, JSON.stringify(socials), !!b.public_enabled,
+       b.stream_url ?? null]
     );
     res.json(rows[0]);
   } catch (e) {
