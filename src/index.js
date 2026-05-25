@@ -193,6 +193,7 @@ async function listR2ObjectsForPrefix(prefix) {
 // ── In-memory state ───────────────────────────────────────────
 const pendingCmds = [];          // fallback queue when no SSE client is connected
 const sseClients  = new Map();   // license_key → Set<res> for cmd-stream subscribers
+const streamClients = new Map(); // slug → Set<res> for public listener-page SSE (Phase 3)
 const nowPlaying  = { data: null };  // desktop pushes, mobile polls
 
 // ── Middleware ────────────────────────────────────────────────
@@ -1598,6 +1599,25 @@ async function upsertStationNowPlaying(rawKey, body) {
       JSON.stringify(Array.isArray(body.queue) ? body.queue : []),
     ]
   );
+
+  // Broadcast to public listeners (Phase 3) — only if this station has a
+  // published public slug. now-playing-only per the Phase 3 decision. Wrapped
+  // so a broadcast failure never propagates (the upsert above already succeeded).
+  try {
+    const { rows: meta } = await pool.query(
+      `SELECT slug FROM station_metadata WHERE station_uuid = $1 AND public_enabled = true AND slug IS NOT NULL`,
+      [body.station_uuid]
+    );
+    if (meta.length) {
+      broadcastNowPlaying(meta[0].slug, {
+        playing, title: body.title ?? null, artist: body.artist ?? null,
+        started_at: startedAt, duration_sec: duration,
+        queue: Array.isArray(body.queue) ? body.queue : [], updated_at: Date.now(),
+      });
+    }
+  } catch (e) {
+    console.warn("[now-playing] broadcast skipped:", e.message);
+  }
 }
 
 app.post("/api/now-playing", async (req, res) => {
@@ -1617,6 +1637,109 @@ app.post("/api/now-playing", async (req, res) => {
 
 app.get("/api/now-playing", (req, res) => {
   res.json(nowPlaying.data || { playing: false, title: null, artist: null, position: 0, duration: 0, queue: [], history: [] });
+});
+
+// ── Public listener endpoints (Phase 3) ───────────────────────────────────
+// Unauthenticated; global cors({origin:"*"}) (index.js top) covers CORS. These
+// power the listener PWA: a combined metadata + now-playing read, and an SSE
+// stream that pushes now-playing on each song change.
+
+// Write a now-playing event to every listener subscribed to a slug's stream.
+function broadcastNowPlaying(slug, payload) {
+  const clients = streamClients.get(slug);
+  if (!clients || clients.size === 0) return;
+  const frame = `event: now-playing\ndata: ${JSON.stringify(payload)}\n\n`;
+  for (const res of clients) { if (!res.writableEnded) res.write(frame); }
+}
+
+// Combined metadata + now-playing for a public station. 404 if the slug is
+// unknown or the page isn't published; 301 to the current slug if it's an old
+// (renamed) slug that now points at a published station.
+app.get("/public/station/:slug", async (req, res) => {
+  const slug = String(req.params.slug || "").toLowerCase();
+  try {
+    const { rows } = await pool.query(
+      `SELECT m.slug, m.display_name, m.logo_url, m.color_primary, m.color_secondary,
+              m.description, m.socials, m.public_enabled,
+              n.playing, n.title, n.artist, n.started_at, n.duration_sec, n.queue, n.updated_at
+       FROM station_metadata m
+       LEFT JOIN station_now_playing n ON n.station_uuid = m.station_uuid
+       WHERE m.slug = $1`,
+      [slug]
+    );
+    if (rows.length && rows[0].public_enabled) {
+      const r = rows[0];
+      return res.json({
+        slug: r.slug,
+        display_name: r.display_name,
+        logo_url: r.logo_url,
+        color_primary: r.color_primary,
+        color_secondary: r.color_secondary,
+        description: r.description,
+        socials: r.socials || {},
+        now_playing: r.updated_at ? {
+          playing: r.playing, title: r.title, artist: r.artist,
+          started_at: r.started_at, duration_sec: r.duration_sec,
+          queue: r.queue || [], updated_at: r.updated_at,
+        } : null,
+      });
+    }
+    // Not a current public slug — if it's a renamed-away slug, 301 to the new one.
+    const { rows: hist } = await pool.query(
+      `SELECT m.slug FROM station_slug_history h
+       JOIN station_metadata m ON m.station_uuid = h.station_uuid
+       WHERE h.old_slug = $1 AND m.public_enabled = true AND m.slug IS NOT NULL`,
+      [slug]
+    );
+    if (hist.length && hist[0].slug && hist[0].slug !== slug) {
+      return res.redirect(301, `/public/station/${hist[0].slug}`);
+    }
+    return res.status(404).json({ error: "not_found" });
+  } catch (e) {
+    console.error("[public/station]", e.message);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
+// SSE stream of now-playing for a public station. Mirrors /api/cmd-stream:
+// 15s keepalive, X-Accel-Buffering:no for Railway/nginx. Only current published
+// slugs get a stream; old/renamed slugs 404 (the client re-GETs to rediscover).
+app.get("/public/station/:slug/stream", async (req, res) => {
+  const slug = String(req.params.slug || "").toLowerCase();
+  try {
+    const { rows } = await pool.query(
+      `SELECT 1 FROM station_metadata WHERE slug = $1 AND public_enabled = true LIMIT 1`,
+      [slug]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "not_found" });
+  } catch (e) {
+    console.error("[public/stream]", e.message);
+    return res.status(500).json({ error: "server_error" });
+  }
+
+  res.set({
+    "Content-Type":      "text/event-stream",
+    "Cache-Control":     "no-cache",
+    "X-Accel-Buffering": "no",   // disable Railway/Nginx proxy buffering
+    "Connection":        "keep-alive",
+  });
+  res.flushHeaders();
+
+  if (!streamClients.has(slug)) streamClients.set(slug, new Set());
+  const clients = streamClients.get(slug);
+  clients.add(res);
+  console.log(`[public-stream] connected — slug=${slug} streams=${clients.size}`);
+
+  const keepalive = setInterval(() => {
+    if (!res.writableEnded) res.write(": keepalive\n\n");
+  }, 15_000);
+
+  res.on("close", () => {
+    clearInterval(keepalive);
+    clients.delete(res);
+    if (clients.size === 0) streamClients.delete(slug);
+    console.log(`[public-stream] disconnected — slug=${slug} streams=${clients.size}`);
+  });
 });
 
 // ── Station metadata — public listener page config (Phase 2) ───────────────
