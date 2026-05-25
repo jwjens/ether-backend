@@ -1585,8 +1585,15 @@ async function upsertStationNowPlaying(rawKey, body) {
   if (rows.length === 0) return; // not a known station for this license — skip
 
   const playing  = !!body.playing;
-  const position = Number(body.position) || 0;
-  const duration = Number(body.duration) || 0;
+  // position_sec/duration_sec are INTEGER columns, but the desktop sends
+  // fractional seconds (the engine interpolates position between polls). An
+  // unrounded float makes Postgres reject the whole row ("invalid input syntax
+  // for type integer"), and the upsert's caller swallows the error — which
+  // silently dropped EVERY playing=true report (those carry non-zero, fractional
+  // position/duration), leaving the row stuck on the last playing=false post.
+  // Round to whole seconds so the row actually persists.
+  const position = Math.round(Number(body.position)) || 0;
+  const duration = Math.round(Number(body.duration)) || 0;
   // started_at lets listeners compute elapsed locally without per-second updates.
   const startedAt = playing ? new Date(Date.now() - position * 1000) : null;
 
