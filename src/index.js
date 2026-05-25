@@ -46,6 +46,7 @@ const zlib       = require("zlib");
 const { Pool }   = require("pg");
 const { Resend } = require("resend");
 const bcrypt     = require('bcrypt');
+const { validateSlug } = require("./slug");
 
 // multer is optional — install with: npm install multer
 let multer;
@@ -82,6 +83,25 @@ function getR2Client() {
   return _r2Client;
 }
 const R2_BUCKET = process.env.R2_BUCKET || "ether-audio";
+
+// Public assets bucket — station logos (Phase 2). SEPARATE from the private
+// audio/backup buckets because R2 public access is bucket-level: a public
+// listener PWA must fetch logos anonymously, so logo_url is a STABLE public URL
+// (R2_PUBLIC_BASE_URL), never a presigned/expiring one. If the env is absent,
+// logoStorageReady() is false → the logo-upload endpoint returns 503 and the
+// rest of the metadata API still works.
+const R2_PUBLIC_BUCKET   = process.env.R2_PUBLIC_BUCKET || "";
+const R2_PUBLIC_BASE_URL = (process.env.R2_PUBLIC_BASE_URL || "").replace(/\/+$/, "");
+function logoStorageReady() { return !!(getR2Client() && R2_PUBLIC_BUCKET && R2_PUBLIC_BASE_URL); }
+async function signLogoPutUrl(key, expiresInSeconds = 900) {
+  const { PutObjectCommand } = require("@aws-sdk/client-s3");
+  const { getSignedUrl }     = require("@aws-sdk/s3-request-presigner");
+  return getSignedUrl(
+    getR2Client(),
+    new PutObjectCommand({ Bucket: R2_PUBLIC_BUCKET, Key: key }),
+    { expiresIn: expiresInSeconds }
+  );
+}
 
 // Sanitize a customer-provided file_key. Rejects path traversal, separators,
 // null bytes, empty/oversized input. Returns { value } on success, { error }
@@ -1597,6 +1617,138 @@ app.post("/api/now-playing", async (req, res) => {
 
 app.get("/api/now-playing", (req, res) => {
   res.json(nowPlaying.data || { playing: false, title: null, artist: null, position: 0, duration: 0, queue: [], history: [] });
+});
+
+// ── Station metadata — public listener page config (Phase 2) ───────────────
+// Authorize by license + ownership: resolve the license key, then confirm the
+// :uuid station belongs to it. No plan gate here — a valid owner can configure;
+// product tier-gating is handled in the desktop UI. Returns the station UUID or
+// null (and sends the error response). All metadata routes gate on this.
+async function getOwnedStation(req, res) {
+  const rawKey = req.headers["x-license-key"];
+  if (!rawKey) { res.status(401).json({ error: "Missing x-license-key header" }); return null; }
+  const license = await lookupLicense(rawKey).catch(() => null);
+  if (!license) { res.status(401).json({ error: "invalid_license_key" }); return null; }
+  const { rows } = await pool.query(
+    `SELECT uuid FROM stations WHERE uuid = $1 AND license_key_id = $2`,
+    [req.params.uuid, license.id]
+  );
+  if (rows.length === 0) { res.status(404).json({ error: "station_not_found_or_not_owned" }); return null; }
+  return { license, stationUuid: req.params.uuid };
+}
+
+app.get("/api/station/:uuid/metadata", async (req, res) => {
+  const owned = await getOwnedStation(req, res);
+  if (!owned) return;
+  try {
+    const { rows } = await pool.query(`SELECT * FROM station_metadata WHERE station_uuid = $1`, [owned.stationUuid]);
+    if (rows.length === 0) {
+      return res.json({
+        station_uuid: owned.stationUuid, slug: null, display_name: null, logo_url: null,
+        color_primary: null, color_secondary: null, description: null, socials: {}, public_enabled: false,
+      });
+    }
+    res.json(rows[0]);
+  } catch (e) {
+    console.error("[GET metadata]", e.message);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
+app.post("/api/station/:uuid/metadata", async (req, res) => {
+  const owned = await getOwnedStation(req, res);
+  if (!owned) return;
+  const uuid = owned.stationUuid;
+  const b = req.body || {};
+  try {
+    // Slug is optional (a station can save branding before publishing a slug),
+    // but public_enabled requires one.
+    let slug = (b.slug == null || b.slug === "") ? null : String(b.slug).trim().toLowerCase();
+    if (slug !== null) {
+      const v = validateSlug(slug);
+      if (!v.ok) return res.status(400).json({ error: `slug_${v.reason}` });
+      const { rows: taken } = await pool.query(
+        `SELECT 1 FROM station_metadata     WHERE slug = $1     AND station_uuid <> $2
+         UNION
+         SELECT 1 FROM station_slug_history WHERE old_slug = $1 AND station_uuid <> $2
+         LIMIT 1`,
+        [slug, uuid]
+      );
+      if (taken.length) return res.status(409).json({ error: "slug_taken" });
+    }
+    if (b.public_enabled && !slug) return res.status(400).json({ error: "slug_required_for_public" });
+
+    // Archive the old slug for redirect history when it changes.
+    const { rows: existing } = await pool.query(`SELECT slug FROM station_metadata WHERE station_uuid = $1`, [uuid]);
+    const oldSlug = existing[0]?.slug || null;
+    if (oldSlug && oldSlug !== slug) {
+      await pool.query(
+        `INSERT INTO station_slug_history (old_slug, station_uuid) VALUES ($1, $2)
+         ON CONFLICT (old_slug) DO UPDATE SET station_uuid = $2, changed_at = NOW()`,
+        [oldSlug, uuid]
+      );
+    }
+
+    const socials = (b.socials && typeof b.socials === "object" && !Array.isArray(b.socials)) ? b.socials : {};
+    const { rows } = await pool.query(
+      `INSERT INTO station_metadata
+         (station_uuid, slug, display_name, logo_url, color_primary, color_secondary, description, socials, public_enabled, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, NOW())
+       ON CONFLICT (station_uuid) DO UPDATE SET
+         slug=$2, display_name=$3, logo_url=$4, color_primary=$5, color_secondary=$6,
+         description=$7, socials=$8, public_enabled=$9, updated_at=NOW()
+       RETURNING *`,
+      [uuid, slug, b.display_name ?? null, b.logo_url ?? null, b.color_primary ?? null,
+       b.color_secondary ?? null, b.description ?? null, JSON.stringify(socials), !!b.public_enabled]
+    );
+    res.json(rows[0]);
+  } catch (e) {
+    console.error("[POST metadata]", e.message);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
+// Slug availability. license-key auth (any valid license). Optional &uuid=
+// excludes the station being edited so re-saving your own slug reads available.
+app.get("/api/slugs/check", async (req, res) => {
+  const rawKey = req.headers["x-license-key"];
+  const license = rawKey ? await lookupLicense(rawKey).catch(() => null) : null;
+  if (!license) return res.status(401).json({ error: "invalid_license_key" });
+  const slug = String(req.query.slug || "").trim().toLowerCase();
+  const selfUuid = req.query.uuid ? String(req.query.uuid) : null;
+  const v = validateSlug(slug);
+  if (!v.ok) return res.json({ available: false, reason: v.reason });
+  try {
+    const { rows } = await pool.query(
+      `SELECT 1 FROM station_metadata     WHERE slug = $1     AND ($2::text IS NULL OR station_uuid <> $2)
+       UNION
+       SELECT 1 FROM station_slug_history WHERE old_slug = $1 AND ($2::text IS NULL OR station_uuid <> $2)
+       LIMIT 1`,
+      [slug, selfUuid]
+    );
+    res.json({ available: rows.length === 0, reason: rows.length === 0 ? null : "taken" });
+  } catch (e) {
+    console.error("[slugs/check]", e.message);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
+// Sign a PUT to the PUBLIC logos bucket. Returns the stable public_url to store
+// as logo_url. 503 if the public bucket env isn't configured (graceful degrade).
+app.post("/api/station/:uuid/logo-upload-url", async (req, res) => {
+  const owned = await getOwnedStation(req, res);
+  if (!owned) return;
+  if (!logoStorageReady()) return res.status(503).json({ error: "logo_storage_unconfigured" });
+  const ext = String(req.body?.ext || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (!["png", "jpg", "jpeg", "webp"].includes(ext)) return res.status(400).json({ error: "bad_image_type" });
+  const key = `station-logos/${owned.stationUuid}.${ext}`;
+  try {
+    const signed_url = await signLogoPutUrl(key);
+    res.json({ signed_url, public_url: `${R2_PUBLIC_BASE_URL}/${key}`, expires_at: Date.now() + 900_000 });
+  } catch (e) {
+    console.error("[logo-upload-url] signing failed:", e.message);
+    res.status(500).json({ error: "signing_failed", detail: e.message });
+  }
 });
 
 // ── Companion command bus ─────────────────────────────────────
