@@ -2113,17 +2113,30 @@ app.get("/public/station/:slug/stream", async (req, res) => {
 // :uuid station belongs to it. No plan gate here — a valid owner can configure;
 // product tier-gating is handled in the desktop UI. Returns the station UUID or
 // null (and sends the error response). All metadata routes gate on this.
+// Resolve + authorize the station in :uuid. Accepts EITHER a dashboard Bearer JWT
+// (Control Center) or x-license-key (desktop). Returns { licenseId, stationUuid, role }
+// where role is the JWT role ('admin'|'user') or null for x-license-key (desktop is
+// trusted/local). Write endpoints gate on role; reads don't.
 async function getOwnedStation(req, res) {
-  const rawKey = req.headers["x-license-key"];
-  if (!rawKey) { res.status(401).json({ error: "Missing x-license-key header" }); return null; }
-  const license = await lookupLicense(rawKey).catch(() => null);
-  if (!license) { res.status(401).json({ error: "invalid_license_key" }); return null; }
+  let licenseId = null, role = null;
+  const authz = req.headers["authorization"] || "";
+  if (authz.startsWith("Bearer ")) {
+    try { const p = jwt.verify(authz.slice(7), JWT_SECRET); licenseId = p.lk; role = p.role; }
+    catch { /* not a valid JWT — fall through to x-license-key */ }
+  }
+  if (licenseId == null) {
+    const rawKey = req.headers["x-license-key"];
+    if (!rawKey) { res.status(401).json({ error: "missing_auth" }); return null; }
+    const license = await lookupLicense(rawKey).catch(() => null);
+    if (!license) { res.status(401).json({ error: "invalid_license_key" }); return null; }
+    licenseId = license.id;
+  }
   const { rows } = await pool.query(
     `SELECT uuid FROM stations WHERE uuid = $1 AND license_key_id = $2`,
-    [req.params.uuid, license.id]
+    [req.params.uuid, licenseId]
   );
   if (rows.length === 0) { res.status(404).json({ error: "station_not_found_or_not_owned" }); return null; }
-  return { license, stationUuid: req.params.uuid };
+  return { licenseId, stationUuid: req.params.uuid, role };
 }
 
 app.get("/api/station/:uuid/metadata", async (req, res) => {
@@ -2148,6 +2161,7 @@ app.get("/api/station/:uuid/metadata", async (req, res) => {
 app.post("/api/station/:uuid/metadata", async (req, res) => {
   const owned = await getOwnedStation(req, res);
   if (!owned) return;
+  if (owned.role !== null && owned.role !== "admin") return res.status(403).json({ error: "admin_required" });
   const uuid = owned.stationUuid;
   const b = req.body || {};
   try {
@@ -2202,9 +2216,16 @@ app.post("/api/station/:uuid/metadata", async (req, res) => {
 // Slug availability. license-key auth (any valid license). Optional &uuid=
 // excludes the station being edited so re-saving your own slug reads available.
 app.get("/api/slugs/check", async (req, res) => {
-  const rawKey = req.headers["x-license-key"];
-  const license = rawKey ? await lookupLicense(rawKey).catch(() => null) : null;
-  if (!license) return res.status(401).json({ error: "invalid_license_key" });
+  // Accept a dashboard Bearer JWT or x-license-key — the check is global, so any
+  // authenticated caller is fine.
+  let authed = false;
+  const authz = req.headers["authorization"] || "";
+  if (authz.startsWith("Bearer ")) { try { jwt.verify(authz.slice(7), JWT_SECRET); authed = true; } catch { /* fall through */ } }
+  if (!authed) {
+    const rawKey = req.headers["x-license-key"];
+    const license = rawKey ? await lookupLicense(rawKey).catch(() => null) : null;
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+  }
   const slug = String(req.query.slug || "").trim().toLowerCase();
   const selfUuid = req.query.uuid ? String(req.query.uuid) : null;
   const v = validateSlug(slug);
@@ -2229,6 +2250,7 @@ app.get("/api/slugs/check", async (req, res) => {
 app.post("/api/station/:uuid/logo-upload-url", async (req, res) => {
   const owned = await getOwnedStation(req, res);
   if (!owned) return;
+  if (owned.role !== null && owned.role !== "admin") return res.status(403).json({ error: "admin_required" });
   if (!logoStorageReady()) return res.status(503).json({ error: "logo_storage_unconfigured" });
   const ext = String(req.body?.ext || "").toLowerCase().replace(/[^a-z0-9]/g, "");
   if (!["png", "jpg", "jpeg", "webp"].includes(ext)) return res.status(400).json({ error: "bad_image_type" });
