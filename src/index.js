@@ -432,6 +432,10 @@ async function initDB() {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_account_users_live
     ON account_users (license_key_id, lower(username)) WHERE deleted_at IS NULL
   `);
+  // origin: 'dashboard' (web bootstrap / Users tab) vs 'install' (mirrored up from a
+  // desktop install's local console users). The install push only ever touches its
+  // own 'install' rows, so it can never clobber a dashboard-managed user.
+  await pool.query(`ALTER TABLE account_users ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'dashboard'`);
 
   console.log("[DB] Schema ready");
 }
@@ -821,6 +825,72 @@ app.post("/api/account/users/:id/pin", requireAuthAdmin, async (req, res) => {
     return res.json({ ok: true });
   } catch (e) {
     console.error("[account/users:pin]", e.message);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// Mirror a desktop install's local console users up so the same people can sign in
+// to the dashboard with the same name + PIN. License-key authenticated (like the
+// now-playing push), one-way (install -> backend). Only users WITH a PIN are sent
+// by the client (no-PIN users stay console-only; pin_hash is NOT NULL here). pin_hash
+// arrives in the desktop's "salt:sha256" format, which verifyPin already understands.
+// Upserts only 'install'-origin rows — a dashboard-managed username is never clobbered.
+app.post("/api/account/users/sync", async (req, res) => {
+  try {
+    const key = req.headers["x-license-key"];
+    if (!key) return res.status(401).json({ error: "missing_license_key" });
+    const license = await lookupLicense(key);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+
+    const incoming = Array.isArray(req.body?.users) ? req.body.users : [];
+    let created = 0, updated = 0, skipped = 0;
+    const present = []; // lower(username) of every valid incoming user — for reconciliation
+    for (const u of incoming) {
+      const username = normUsername(u?.name);
+      const pin_hash = typeof u?.pin_hash === "string" && u.pin_hash ? u.pin_hash : null;
+      if (!isValidUsername(username) || !pin_hash) { skipped++; continue; }
+      const role = u?.role === "admin" ? "admin" : "user";
+      present.push(username.toLowerCase());
+
+      const { rows } = await pool.query(
+        `SELECT id, origin FROM account_users
+         WHERE license_key_id = $1 AND lower(username) = lower($2) AND deleted_at IS NULL`,
+        [license.id, username]
+      );
+      if (rows.length === 0) {
+        await pool.query(
+          `INSERT INTO account_users (license_key_id, username, display_name, role, pin_hash, origin)
+           VALUES ($1, $2, $2, $3, $4, 'install')`,
+          [license.id, username, role, pin_hash]
+        );
+        created++;
+      } else if (rows[0].origin === "install") {
+        await pool.query(
+          `UPDATE account_users SET pin_hash = $1, role = $2, display_name = $3, updated_at = NOW() WHERE id = $4`,
+          [pin_hash, role, username, rows[0].id]
+        );
+        updated++;
+      } else {
+        skipped++; // dashboard-managed username — leave it alone
+      }
+    }
+
+    // Reconcile: revoke install-origin users that are no longer present (deleted on
+    // the install, or had their PIN cleared so the client stopped sending them).
+    // Only runs on a non-empty push, so a transient empty read can't mass-revoke.
+    let revoked = 0;
+    if (present.length > 0) {
+      const r = await pool.query(
+        `UPDATE account_users SET deleted_at = NOW(), updated_at = NOW()
+         WHERE license_key_id = $1 AND origin = 'install' AND deleted_at IS NULL
+           AND lower(username) <> ALL($2::text[])`,
+        [license.id, present]
+      );
+      revoked = r.rowCount;
+    }
+    return res.json({ ok: true, created, updated, skipped, revoked });
+  } catch (e) {
+    console.error("[account/users:sync]", e.message);
     return res.status(500).json({ error: "server_error" });
   }
 });
