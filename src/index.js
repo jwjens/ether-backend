@@ -204,8 +204,8 @@ async function listR2ObjectsForPrefix(prefix) {
 }
 
 // ── In-memory state ───────────────────────────────────────────
-const pendingCmds = [];          // fallback queue when no SSE client is connected
-const sseClients  = new Map();   // license_key → Set<res> for cmd-stream subscribers
+const pendingCmds = new Map();   // licenseId(string) → array of queued cmds (per-license; drained on cmd-stream connect)
+const sseClients  = new Map();   // licenseId(string) → Set<res> for cmd-stream subscribers
 const streamClients = new Map(); // slug → Set<res> for public listener-page SSE (Phase 3)
 const nowPlaying  = { data: null };  // desktop pushes, mobile polls
 
@@ -436,6 +436,24 @@ async function initDB() {
   // desktop install's local console users). The install push only ever touches its
   // own 'install' rows, so it can never clobber a dashboard-managed user.
   await pool.query(`ALTER TABLE account_users ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'dashboard'`);
+
+  // ── Control Center data mirror (Roadmap Item 5, Phase 2) ───────────────────
+  // Generic per-station row mirror so the dashboard can VIEW install-owned data
+  // (categories, clocks, library, …) without the full sync engine. The desktop
+  // pushes rows per table (same pattern as now-playing/users); the dashboard reads
+  // them; edits go back via the command bus and the install re-pushes the result.
+  // One table for every domain — payload is the row as JSON; deleted_at tombstones.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS station_cc_data (
+      station_uuid TEXT NOT NULL REFERENCES stations(uuid) ON DELETE CASCADE,
+      table_name   TEXT NOT NULL,
+      row_uuid     TEXT NOT NULL,
+      payload      JSONB NOT NULL,
+      deleted_at   TIMESTAMPTZ,
+      updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (station_uuid, table_name, row_uuid)
+    )
+  `);
 
   console.log("[DB] Schema ready");
 }
@@ -891,6 +909,77 @@ app.post("/api/account/users/sync", async (req, res) => {
     return res.json({ ok: true, created, updated, skipped, revoked });
   } catch (e) {
     console.error("[account/users:sync]", e.message);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// ── Control Center data mirror (Phase 2) ──────────────────────────────────────
+// Install pushes its rows for one table up (x-license-key). Upserts into the mirror
+// and tombstones rows it no longer sees (reconcile, non-empty pushes only).
+app.post("/api/account/data/sync", async (req, res) => {
+  try {
+    const key = req.headers["x-license-key"];
+    if (!key) return res.status(401).json({ error: "missing_license_key" });
+    const license = await lookupLicense(key);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+
+    const stationUuid = String(req.body?.station_uuid || "");
+    const table = String(req.body?.table || "");
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    if (!stationUuid || !table) return res.status(400).json({ error: "missing_fields" });
+
+    const { rows: own } = await pool.query(
+      `SELECT 1 FROM stations WHERE uuid = $1 AND license_key_id = $2`, [stationUuid, license.id]
+    );
+    if (own.length === 0) return res.status(404).json({ error: "station_not_found" });
+
+    const present = [];
+    for (const r of rows) {
+      const rowUuid = r?.uuid ? String(r.uuid) : null;
+      if (!rowUuid) continue;
+      present.push(rowUuid);
+      await pool.query(
+        `INSERT INTO station_cc_data (station_uuid, table_name, row_uuid, payload, deleted_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,NOW())
+         ON CONFLICT (station_uuid, table_name, row_uuid) DO UPDATE SET
+           payload = $4, deleted_at = $5, updated_at = NOW()`,
+        [stationUuid, table, rowUuid, JSON.stringify(r), r.deleted_at ?? null]
+      );
+    }
+    if (present.length > 0) {
+      await pool.query(
+        `UPDATE station_cc_data SET deleted_at = NOW(), updated_at = NOW()
+         WHERE station_uuid = $1 AND table_name = $2 AND deleted_at IS NULL
+           AND row_uuid <> ALL($3::text[])`,
+        [stationUuid, table, present]
+      );
+    }
+    return res.json({ ok: true, count: present.length });
+  } catch (e) {
+    console.error("[account/data:sync]", e.message);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// Dashboard reads mirrored rows for one table of one of its stations (JWT).
+app.get("/api/account/station/:uuid/data", requireAuth, async (req, res) => {
+  try {
+    const stationUuid = req.params.uuid;
+    const table = String(req.query.table || "");
+    if (!table) return res.status(400).json({ error: "missing_table" });
+    const { rows: own } = await pool.query(
+      `SELECT 1 FROM stations WHERE uuid = $1 AND license_key_id = $2`, [stationUuid, req.auth.lk]
+    );
+    if (own.length === 0) return res.status(404).json({ error: "station_not_found" });
+    const { rows } = await pool.query(
+      `SELECT payload FROM station_cc_data
+       WHERE station_uuid = $1 AND table_name = $2 AND deleted_at IS NULL
+       ORDER BY updated_at ASC`,
+      [stationUuid, table]
+    );
+    return res.json({ rows: rows.map((r) => r.payload) });
+  } catch (e) {
+    console.error("[account/data:get]", e.message);
     return res.status(500).json({ error: "server_error" });
   }
 });
@@ -2266,26 +2355,41 @@ app.post("/api/station/:uuid/logo-upload-url", async (req, res) => {
 
 // ── Companion command bus ─────────────────────────────────────
 
-app.post("/api/cmd", requireLicense, (req, res) => {
+// Auth: dashboard Bearer JWT (admin — Control Center remote edits) OR x-license-key
+// (companion/desktop transport controls). Fan-out + offline queue are per-license.
+app.post("/api/cmd", async (req, res) => {
+  let licenseId = null, viaJwt = false, jwtRole = null;
+  const authz = req.headers["authorization"] || "";
+  if (authz.startsWith("Bearer ")) {
+    try { const p = jwt.verify(authz.slice(7), JWT_SECRET); licenseId = String(p.lk); jwtRole = p.role; viaJwt = true; }
+    catch { /* not a valid JWT — fall through to x-license-key */ }
+  }
+  if (licenseId == null) {
+    const rawKey = req.headers["x-license-key"];
+    const license = rawKey ? await lookupLicense(rawKey).catch(() => null) : null;
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+    if (!["pro", "station"].includes(license.plan)) return res.status(403).json({ error: "plan_required" });
+    licenseId = String(license.id);
+  }
+  // Dashboard callers must be admin to issue commands (desktop x-license-key is trusted).
+  if (viaJwt && jwtRole !== "admin") return res.status(403).json({ error: "admin_required" });
+
   const { cmd } = req.body;
   if (!cmd) return res.status(400).json({ error: "Missing cmd" });
 
-  const key     = String(req.license.id);  // license_key is NULL for bcrypt rows; use stable integer PK
   const payload = JSON.stringify({ cmd, data: req.body, ts: Math.floor(Date.now() / 1000) });
-  const clients = sseClients.get(key);
-
+  const clients = sseClients.get(licenseId);
   if (clients && clients.size > 0) {
-    // Instant fan-out to all connected SSE streams for this license
     for (const client of clients) {
       if (!client.writableEnded) client.write(`event: cmd\ndata: ${payload}\n\n`);
     }
-    console.log(`[cmd] ${cmd} → SSE fan-out to ${clients.size} client(s) for license=${key}`);
+    console.log(`[cmd] ${cmd} → SSE fan-out to ${clients.size} client(s) for license=${licenseId}`);
   } else {
-    // No SSE client connected — fall back to in-memory queue
-    pendingCmds.push({ cmd, data: req.body, ts: Math.floor(Date.now() / 1000) });
-    if (pendingCmds.length > 20) pendingCmds.splice(0, pendingCmds.length - 20);
+    const q = pendingCmds.get(licenseId) || [];
+    q.push({ cmd, data: req.body, ts: Math.floor(Date.now() / 1000) });
+    if (q.length > 20) q.splice(0, q.length - 20);
+    pendingCmds.set(licenseId, q);
   }
-
   res.json({ ok: true });
 });
 
@@ -2313,10 +2417,11 @@ app.get("/api/cmd-stream", async (req, res) => {
   clients.add(res);
   console.log(`[cmd-stream] connected — license=${licenseId} streams=${clients.size}`);
 
-  // Drain any commands queued before this connection arrived
-  if (pendingCmds.length > 0) {
-    const buffered = pendingCmds.splice(0);
-    for (const c of buffered) {
+  // Drain any commands queued for THIS license before the connection arrived
+  const queued = pendingCmds.get(licenseId);
+  if (queued && queued.length > 0) {
+    pendingCmds.delete(licenseId);
+    for (const c of queued) {
       res.write(`event: cmd\ndata: ${JSON.stringify(c)}\n\n`);
     }
   }
@@ -2335,8 +2440,9 @@ app.get("/api/cmd-stream", async (req, res) => {
 });
 
 app.get("/api/pending-cmds", requireLicense, (req, res) => {
-  const out = [...pendingCmds];
-  pendingCmds.length = 0;
+  const id = String(req.license.id);
+  const out = pendingCmds.get(id) || [];
+  pendingCmds.delete(id);
   res.json(out);
 });
 
