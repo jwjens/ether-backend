@@ -46,7 +46,20 @@ const zlib       = require("zlib");
 const { Pool }   = require("pg");
 const { Resend } = require("resend");
 const bcrypt     = require('bcrypt');
+const jwt        = require('jsonwebtoken');
+const rateLimit  = require('express-rate-limit');
 const { validateSlug } = require("./slug");
+
+// JWT signing secret for the Control Center dashboard. MUST be set in production
+// (Railway env). Falls back to a per-boot random secret in dev so tokens simply
+// invalidate on restart rather than failing hard.
+const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString("hex");
+if (!process.env.JWT_SECRET) {
+  console.warn("[AUTH] JWT_SECRET not set — using an ephemeral per-boot secret (dashboard sessions reset on restart). Set JWT_SECRET in production.");
+}
+const JWT_TTL = "12h";                       // access-token lifetime
+const PIN_MAX_FAILS = 5;                     // wrong PINs before lockout
+const PIN_LOCKOUT_MS = 15 * 60 * 1000;       // lockout duration
 
 // multer is optional — install with: npm install multer
 let multer;
@@ -393,6 +406,33 @@ async function initDB() {
   // TABLE IF NOT EXISTS is a no-op there and would never add the column.
   await pool.query(`ALTER TABLE station_metadata ADD COLUMN IF NOT EXISTS stream_url TEXT`);
 
+  // ── Control Center / Multi-Tenant dashboard (Roadmap Item 5, Phase 1) ──────
+  // Per-LICENSE human operators that can sign into app.ether-technologies.com.
+  // Distinct from license_activations (devices) and from the desktop's local
+  // per-install `users` table. role is 'admin' | 'user'. pin_hash uses the same
+  // "salt:sha256(salt+pin)" scheme as the desktop so install-pushed PINs and
+  // web-created PINs verify identically. Lockout columns guard 4-digit brute force.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS account_users (
+      id              SERIAL PRIMARY KEY,
+      license_key_id  INTEGER NOT NULL REFERENCES licenses(id) ON DELETE CASCADE,
+      username        TEXT NOT NULL,
+      display_name    TEXT,
+      role            TEXT NOT NULL DEFAULT 'user',
+      pin_hash        TEXT NOT NULL,
+      failed_attempts INTEGER NOT NULL DEFAULT 0,
+      locked_until    TIMESTAMPTZ,
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      deleted_at      TIMESTAMPTZ
+    )
+  `);
+  // One live username per license (case-insensitive); deleted rows don't block reuse.
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_account_users_live
+    ON account_users (license_key_id, lower(username)) WHERE deleted_at IS NULL
+  `);
+
   console.log("[DB] Schema ready");
 }
 
@@ -540,6 +580,250 @@ function requireAdmin(req, res, next) {
   if (s !== process.env.ADMIN_SECRET) return res.status(403).json({ error: "Forbidden" });
   next();
 }
+
+// ── Control Center auth (Roadmap Item 5, Phase 1) ─────────────────────────────
+// PIN hashing mirrors the desktop scheme (salt:sha256) so install-pushed and
+// web-created PINs verify identically.
+function hashPin(pin) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  return salt + ":" + crypto.createHash("sha256").update(salt + pin).digest("hex");
+}
+function verifyPin(pin, stored) {
+  if (!stored) return false;
+  if (!stored.includes(":")) return pin === stored;        // legacy plaintext
+  const [salt, hash] = stored.split(":");
+  return crypto.createHash("sha256").update(salt + pin).digest("hex") === hash;
+}
+function isValidPin(pin)    { return typeof pin === "string" && /^\d{4}$/.test(pin); }
+function normUsername(u)    { return typeof u === "string" ? u.trim() : ""; }
+function isValidUsername(u) { return /^[A-Za-z0-9 ._-]{1,32}$/.test(u); }
+
+function signAccountToken(user) {
+  return jwt.sign(
+    { uid: user.id, lk: user.license_key_id, role: user.role, username: user.username },
+    JWT_SECRET, { expiresIn: JWT_TTL }
+  );
+}
+function requireAuth(req, res, next) {
+  const h = req.headers["authorization"] || "";
+  const token = h.startsWith("Bearer ") ? h.slice(7) : null;
+  if (!token) return res.status(401).json({ error: "missing_token" });
+  try { req.auth = jwt.verify(token, JWT_SECRET); next(); }
+  catch { return res.status(401).json({ error: "invalid_token" }); }
+}
+function requireAuthAdmin(req, res, next) {
+  requireAuth(req, res, () => {
+    if (req.auth.role !== "admin") return res.status(403).json({ error: "admin_required" });
+    next();
+  });
+}
+// Never leak pin_hash to the client.
+function publicUser(u) {
+  return {
+    id: u.id, username: u.username, display_name: u.display_name, role: u.role,
+    has_pin: !!u.pin_hash, locked: !!(u.locked_until && new Date(u.locked_until) > new Date()),
+    created_at: u.created_at,
+  };
+}
+
+// IP rate limit on auth endpoints; per-account lockout (below) is the second layer.
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 40,
+  standardHeaders: true, legacyHeaders: false,
+  message: { error: "too_many_attempts" },
+});
+
+// First-admin bootstrap: paste license key + pick username + PIN. Allowed only
+// when the license has no live users yet — no admin intervention, no hijacking an
+// already-set-up account.
+app.post("/api/auth/bootstrap-admin", authLimiter, async (req, res) => {
+  try {
+    const { license_key } = req.body || {};
+    const username = normUsername(req.body?.username);
+    const pin = req.body?.pin;
+    if (!license_key?.trim())       return res.status(400).json({ error: "missing_license_key" });
+    if (!isValidUsername(username)) return res.status(400).json({ error: "invalid_username" });
+    if (!isValidPin(pin))           return res.status(400).json({ error: "invalid_pin", detail: "PIN must be 4 digits" });
+
+    const license = await lookupLicense(license_key);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+
+    const { rows: existing } = await pool.query(
+      `SELECT 1 FROM account_users WHERE license_key_id = $1 AND deleted_at IS NULL LIMIT 1`,
+      [license.id]
+    );
+    if (existing.length) return res.status(409).json({ error: "already_bootstrapped" });
+
+    const { rows } = await pool.query(
+      `INSERT INTO account_users (license_key_id, username, display_name, role, pin_hash)
+       VALUES ($1, $2, $2, 'admin', $3) RETURNING *`,
+      [license.id, username, hashPin(pin)]
+    );
+    return res.json({ token: signAccountToken(rows[0]), user: publicUser(rows[0]) });
+  } catch (e) {
+    console.error("[auth/bootstrap]", e.message);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// Login: license_key identifies the account; username + PIN identify the operator.
+app.post("/api/auth/login", authLimiter, async (req, res) => {
+  try {
+    const { license_key } = req.body || {};
+    const username = normUsername(req.body?.username);
+    const pin = req.body?.pin;
+    if (!license_key?.trim() || !username || !pin) return res.status(400).json({ error: "missing_fields" });
+
+    const license = await lookupLicense(license_key);
+    if (!license) return res.status(401).json({ error: "invalid_credentials" });
+
+    const { rows } = await pool.query(
+      `SELECT * FROM account_users
+       WHERE license_key_id = $1 AND lower(username) = lower($2) AND deleted_at IS NULL`,
+      [license.id, username]
+    );
+    const user = rows[0];
+    if (!user) return res.status(401).json({ error: "invalid_credentials" });
+
+    if (user.locked_until && new Date(user.locked_until) > new Date()) {
+      return res.status(423).json({ error: "locked", until: user.locked_until });
+    }
+
+    if (!verifyPin(pin, user.pin_hash)) {
+      const fails = (user.failed_attempts || 0) + 1;
+      const lock = fails >= PIN_MAX_FAILS ? new Date(Date.now() + PIN_LOCKOUT_MS) : null;
+      await pool.query(
+        `UPDATE account_users SET failed_attempts = $1, locked_until = $2, updated_at = NOW() WHERE id = $3`,
+        [lock ? 0 : fails, lock, user.id]
+      );
+      if (lock) return res.status(423).json({ error: "locked", until: lock });
+      return res.status(401).json({ error: "invalid_credentials" });
+    }
+
+    await pool.query(
+      `UPDATE account_users SET failed_attempts = 0, locked_until = NULL, updated_at = NOW() WHERE id = $1`,
+      [user.id]
+    );
+    return res.json({ token: signAccountToken(user), user: publicUser(user) });
+  } catch (e) {
+    console.error("[auth/login]", e.message);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// Whoami — current operator + license summary (dashboard header).
+app.get("/api/auth/me", requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT au.*, l.account_name, l.plan, l.email
+       FROM account_users au JOIN licenses l ON l.id = au.license_key_id
+       WHERE au.id = $1 AND au.deleted_at IS NULL`,
+      [req.auth.uid]
+    );
+    const u = rows[0];
+    if (!u) return res.status(401).json({ error: "invalid_token" });
+    return res.json({ user: publicUser(u), account: { name: u.account_name, plan: u.plan, email: u.email } });
+  } catch (e) {
+    console.error("[auth/me]", e.message);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// All stations for the signed-in operator's license, with branding + live
+// now-playing — the Phase 1 view-only payload (includes non-public stations).
+app.get("/api/account/stations", requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT s.uuid, s.name, s.nickname, s.frequency, s.call_letters, s.created_at,
+              m.slug, m.display_name, m.logo_url, m.color_primary, m.color_secondary,
+              m.description, m.public_enabled, m.stream_url,
+              n.playing, n.title, n.artist, n.started_at, n.duration_sec, n.queue,
+              n.updated_at AS now_playing_updated_at
+       FROM stations s
+       LEFT JOIN station_metadata    m ON m.station_uuid = s.uuid
+       LEFT JOIN station_now_playing n ON n.station_uuid = s.uuid
+       WHERE s.license_key_id = $1
+       ORDER BY s.created_at ASC`,
+      [req.auth.lk]
+    );
+    const stations = rows.map(r => ({
+      uuid: r.uuid, name: r.name, nickname: r.nickname, frequency: r.frequency,
+      call_letters: r.call_letters, created_at: r.created_at,
+      metadata: {
+        slug: r.slug, display_name: r.display_name, logo_url: r.logo_url,
+        color_primary: r.color_primary, color_secondary: r.color_secondary,
+        description: r.description, public_enabled: !!r.public_enabled, stream_url: r.stream_url,
+      },
+      now_playing: r.now_playing_updated_at ? {
+        playing: r.playing, title: r.title, artist: r.artist, started_at: r.started_at,
+        duration_sec: r.duration_sec, queue: r.queue || [], updated_at: r.now_playing_updated_at,
+      } : null,
+    }));
+    return res.json({ stations });
+  } catch (e) {
+    console.error("[account/stations]", e.message);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// ── User management (admin only) — Phase 1: list / create / reset-PIN ─────────
+app.get("/api/account/users", requireAuthAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT * FROM account_users WHERE license_key_id = $1 AND deleted_at IS NULL ORDER BY created_at ASC`,
+      [req.auth.lk]
+    );
+    return res.json({ users: rows.map(publicUser) });
+  } catch (e) {
+    console.error("[account/users:list]", e.message);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+app.post("/api/account/users", requireAuthAdmin, async (req, res) => {
+  try {
+    const username = normUsername(req.body?.username);
+    const display_name = normUsername(req.body?.display_name) || username;
+    const role = req.body?.role === "admin" ? "admin" : "user";
+    const pin = req.body?.pin;
+    if (!isValidUsername(username)) return res.status(400).json({ error: "invalid_username" });
+    if (!isValidPin(pin))           return res.status(400).json({ error: "invalid_pin", detail: "PIN must be 4 digits" });
+
+    const { rows: dup } = await pool.query(
+      `SELECT 1 FROM account_users WHERE license_key_id = $1 AND lower(username) = lower($2) AND deleted_at IS NULL`,
+      [req.auth.lk, username]
+    );
+    if (dup.length) return res.status(409).json({ error: "username_taken" });
+
+    const { rows } = await pool.query(
+      `INSERT INTO account_users (license_key_id, username, display_name, role, pin_hash)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [req.auth.lk, username, display_name, role, hashPin(pin)]
+    );
+    return res.json({ user: publicUser(rows[0]) });
+  } catch (e) {
+    console.error("[account/users:create]", e.message);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// Reset a user's PIN (admin) — also clears any lockout.
+app.post("/api/account/users/:id/pin", requireAuthAdmin, async (req, res) => {
+  try {
+    const pin = req.body?.pin;
+    if (!isValidPin(pin)) return res.status(400).json({ error: "invalid_pin", detail: "PIN must be 4 digits" });
+    const { rowCount } = await pool.query(
+      `UPDATE account_users SET pin_hash = $1, failed_attempts = 0, locked_until = NULL, updated_at = NOW()
+       WHERE id = $2 AND license_key_id = $3 AND deleted_at IS NULL`,
+      [hashPin(pin), req.params.id, req.auth.lk]
+    );
+    if (!rowCount) return res.status(404).json({ error: "not_found" });
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("[account/users:pin]", e.message);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
 
 // ── Static page fallbacks ────────────────────────────────────
 
