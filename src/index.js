@@ -1002,6 +1002,35 @@ app.get("/api/account/station/:uuid/data", requireAuth, async (req, res) => {
   }
 });
 
+// Dashboard (JWT-admin) gets a signed PUT URL to upload a NEW song's audio to R2.
+// Keyed identically to the desktop's /audio/upload-url (`${license.id}/<file_key>`) so
+// the install's fetchR2Track resolves it at play time. The backend mints a unique
+// file_key to avoid collisions; the dashboard PUTs the bytes, then issues a
+// `library:addSong` command carrying this file_key so the install creates the record.
+app.post("/api/account/audio/upload-url", requireAuthAdmin, async (req, res) => {
+  try {
+    const licenseId = req.auth.lk;
+    if (!getR2Client()) return res.status(503).json({ error: "r2_not_configured" });
+    const ext = String(req.body?.ext || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (!["mp3", "flac", "wav", "m4a", "aac", "ogg"].includes(ext)) {
+      return res.status(400).json({ error: "bad_audio_type", detail: "ext must be mp3/flac/wav/m4a/aac/ogg" });
+    }
+    const fileKey = `cc-${require("crypto").randomUUID()}.${ext}`;
+    const expiresInSeconds = 15 * 60;
+    let signedUrl;
+    try {
+      signedUrl = await signR2PutUrl(`${licenseId}/${fileKey}`, expiresInSeconds);
+    } catch (e) {
+      console.error("[account/audio/upload-url] signing failed:", e.message);
+      return res.status(500).json({ error: "signing_failed", detail: e.message });
+    }
+    res.json({ signed_url: signedUrl, file_key: fileKey, expires_at: new Date(Date.now() + expiresInSeconds * 1000).toISOString() });
+  } catch (e) {
+    console.error("[account/audio/upload-url]", e.message);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
 // ── Static page fallbacks ────────────────────────────────────
 
 app.get("/mobile",      (req, res) => res.sendFile(path.join(PUBLIC, "mobile.html")));
