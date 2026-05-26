@@ -933,17 +933,31 @@ app.post("/api/account/data/sync", async (req, res) => {
     );
     if (own.length === 0) return res.status(404).json({ error: "station_not_found" });
 
-    const present = [];
-    for (const r of rows) {
-      const rowUuid = r?.uuid ? String(r.uuid) : null;
-      if (!rowUuid) continue;
-      present.push(rowUuid);
+    // Dedupe by row_uuid (last wins) so a single multi-row upsert can't hit the same
+    // conflict target twice, then upsert in chunks. A per-row await loop is fine for
+    // ~50 categories but would be thousands of sequential round-trips for the song
+    // library (~5,600 rows) — chunked multi-row INSERT keeps it to a handful.
+    const byUuid = new Map();
+    for (const r of rows) { if (r?.uuid) byUuid.set(String(r.uuid), r); }
+    const present = [...byUuid.keys()];
+    const entries = [...byUuid.entries()];
+    const CHUNK = 500;
+    for (let i = 0; i < entries.length; i += CHUNK) {
+      const chunk = entries.slice(i, i + CHUNK);
+      const params = [stationUuid, table];
+      const tuples = [];
+      let p = 3;
+      for (const [rowUuid, r] of chunk) {
+        tuples.push(`($1,$2,$${p},$${p + 1},$${p + 2},NOW())`);
+        params.push(rowUuid, JSON.stringify(r), r.deleted_at ?? null);
+        p += 3;
+      }
       await pool.query(
         `INSERT INTO station_cc_data (station_uuid, table_name, row_uuid, payload, deleted_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,NOW())
+         VALUES ${tuples.join(",")}
          ON CONFLICT (station_uuid, table_name, row_uuid) DO UPDATE SET
-           payload = $4, deleted_at = $5, updated_at = NOW()`,
-        [stationUuid, table, rowUuid, JSON.stringify(r), r.deleted_at ?? null]
+           payload = EXCLUDED.payload, deleted_at = EXCLUDED.deleted_at, updated_at = NOW()`,
+        params
       );
     }
     if (present.length > 0) {
@@ -971,12 +985,16 @@ app.get("/api/account/station/:uuid/data", requireAuth, async (req, res) => {
       `SELECT 1 FROM stations WHERE uuid = $1 AND license_key_id = $2`, [stationUuid, req.auth.lk]
     );
     if (own.length === 0) return res.status(404).json({ error: "station_not_found" });
-    const { rows } = await pool.query(
-      `SELECT payload FROM station_cc_data
+    // Optional pagination (used by the song library; omitting both returns everything,
+    // preserving the original behavior for categories/clocks/shows).
+    const limit = req.query.limit != null ? Math.min(parseInt(req.query.limit, 10) || 0, 10000) : null;
+    const offset = req.query.offset != null ? Math.max(parseInt(req.query.offset, 10) || 0, 0) : 0;
+    let sql = `SELECT payload FROM station_cc_data
        WHERE station_uuid = $1 AND table_name = $2 AND deleted_at IS NULL
-       ORDER BY updated_at ASC`,
-      [stationUuid, table]
-    );
+       ORDER BY updated_at ASC`;
+    const params = [stationUuid, table];
+    if (limit != null) { sql += ` LIMIT $3 OFFSET $4`; params.push(limit, offset); }
+    const { rows } = await pool.query(sql, params);
     return res.json({ rows: rows.map((r) => r.payload) });
   } catch (e) {
     console.error("[account/data:get]", e.message);
