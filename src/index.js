@@ -1187,6 +1187,53 @@ app.get("/api/account/station/:uuid/listeners", requireAuth, async (req, res) =>
   }
 });
 
+// ── Billing (Phase 4) ──────────────────────────────────────────────────────
+// The dashboard NEVER talks to Stripe directly — these JWT endpoints proxy to
+// Stripe with the server-side secret key. GET returns live plan/status; /portal
+// mints a Stripe-hosted Customer Portal session and returns its URL.
+app.get("/api/account/billing", requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT plan, stripe_sub_id, email FROM licenses WHERE id = $1`, [req.auth.lk]);
+    const lic = rows[0];
+    if (!lic) return res.status(404).json({ error: "license_not_found" });
+    let status = null, renewsAt = null, cancelAtPeriodEnd = false;
+    if (lic.stripe_sub_id && process.env.STRIPE_SECRET_KEY) {
+      try {
+        const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+        const sub = await stripe.subscriptions.retrieve(lic.stripe_sub_id);
+        status = sub.status;
+        renewsAt = sub.current_period_end ? new Date(sub.current_period_end * 1000).toISOString() : null;
+        cancelAtPeriodEnd = !!sub.cancel_at_period_end;
+      } catch (e) { console.warn("[account/billing] sub retrieve failed:", e.message); }
+    }
+    return res.json({ plan: lic.plan, email: lic.email, manageable: !!lic.stripe_sub_id, status, renewsAt, cancelAtPeriodEnd });
+  } catch (e) {
+    console.error("[account/billing]", e.message);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+app.post("/api/account/billing/portal", requireAuth, async (req, res) => {
+  try {
+    if (!process.env.STRIPE_SECRET_KEY) return res.status(503).json({ error: "stripe_unconfigured" });
+    const { rows } = await pool.query(`SELECT stripe_sub_id FROM licenses WHERE id = $1`, [req.auth.lk]);
+    const subId = rows[0]?.stripe_sub_id;
+    if (!subId) return res.status(400).json({ error: "no_subscription" });
+    const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+    const sub = await stripe.subscriptions.retrieve(subId);
+    const customer = typeof sub.customer === "string" ? sub.customer : sub.customer?.id;
+    if (!customer) return res.status(400).json({ error: "no_customer" });
+    // return_url restricted to known dashboard origins (no open redirect).
+    const origin = req.headers.origin || "";
+    const returnUrl = /^https:\/\/(app\.ether-technologies\.com|ether-dashboard\.pages\.dev)$/.test(origin) ? origin : "https://app.ether-technologies.com";
+    const session = await stripe.billingPortal.sessions.create({ customer, return_url: returnUrl });
+    return res.json({ url: session.url });
+  } catch (e) {
+    console.error("[account/billing/portal]", e.message);
+    return res.status(500).json({ error: "portal_failed", detail: e.message });
+  }
+});
+
 // ── Static page fallbacks ────────────────────────────────────
 
 app.get("/mobile",      (req, res) => res.sendFile(path.join(PUBLIC, "mobile.html")));
