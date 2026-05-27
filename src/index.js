@@ -479,6 +479,17 @@ async function initDB() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_play_history_station_time ON station_play_history (station_uuid, played_at DESC)`);
 
+  // Periodic snapshots of concurrent listener count per station (Phase 3b) for peak /
+  // trend. Live "now" + by-country come from in-memory SSE connections; this is history.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS station_listener_samples (
+      station_uuid TEXT NOT NULL REFERENCES stations(uuid) ON DELETE CASCADE,
+      ts           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      count        INTEGER NOT NULL
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_listener_samples ON station_listener_samples (station_uuid, ts DESC)`);
+
   console.log("[DB] Schema ready");
 }
 
@@ -1135,6 +1146,43 @@ app.get("/api/account/station/:uuid/analytics", requireAuth, async (req, res) =>
     return res.json({ range: rangeParam, totals, topSongs, topArtists, byCategory, byDay, recent });
   } catch (e) {
     console.error("[account/analytics]", e.message);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// Dashboard-only (JWT, PRIVATE — never exposed on any /public endpoint) listener
+// metrics for one station. "now" + byCountry are computed from the live SSE
+// connections (the listener page reports its Cloudflare country); peak/trend come
+// from periodic samples. range = 7d|30d|90d|all (default 7d).
+app.get("/api/account/station/:uuid/listeners", requireAuth, async (req, res) => {
+  try {
+    const stationUuid = req.params.uuid;
+    const { rows: own } = await pool.query(`SELECT 1 FROM stations WHERE uuid = $1 AND license_key_id = $2`, [stationUuid, req.auth.lk]);
+    if (own.length === 0) return res.status(404).json({ error: "station_not_found" });
+    const meta = (await pool.query(`SELECT slug FROM station_metadata WHERE station_uuid = $1`, [stationUuid])).rows[0];
+    const slug = meta?.slug || null;
+
+    let now = 0;
+    const ccMap = new Map();
+    if (slug && streamClients.has(slug)) {
+      for (const c of streamClients.get(slug)) {
+        if (c.writableEnded) continue;
+        now++;
+        const cc = c._cc || "??";
+        ccMap.set(cc, (ccMap.get(cc) || 0) + 1);
+      }
+    }
+    const byCountry = [...ccMap.entries()].map(([cc, count]) => ({ cc, count })).sort((a, b) => b.count - a.count);
+
+    const d = { "7d": 7, "30d": 30, "90d": 90, "all": null }[String(req.query.range || "7d")];
+    const days = d === undefined ? 7 : d;
+    const since = days ? `NOW() - INTERVAL '${days} days'` : `to_timestamp(0)`;
+    const peak = (await pool.query(`SELECT COALESCE(MAX(count),0)::int AS peak FROM station_listener_samples WHERE station_uuid = $1 AND ts >= ${since}`, [stationUuid])).rows[0].peak;
+    const trend = (await pool.query(`SELECT to_char(date_trunc('hour', ts), 'YYYY-MM-DD HH24:00') AS hour, MAX(count)::int AS peak FROM station_listener_samples WHERE station_uuid = $1 AND ts >= ${since} GROUP BY 1 ORDER BY 1`, [stationUuid])).rows;
+
+    return res.json({ now, byCountry, peak, trend });
+  } catch (e) {
+    console.error("[account/listeners]", e.message);
     return res.status(500).json({ error: "server_error" });
   }
 });
@@ -2335,10 +2383,13 @@ app.get("/public/station/:slug/stream", async (req, res) => {
   });
   res.flushHeaders();
 
+  // Cloudflare-derived visitor country (2-letter), reported by the listener page for
+  // the dashboard's listeners-by-country map. Best-effort; "" if unknown.
+  res._cc = String(req.query.cc || "").toUpperCase().replace(/[^A-Z]/g, "").slice(0, 2);
   if (!streamClients.has(slug)) streamClients.set(slug, new Set());
   const clients = streamClients.get(slug);
   clients.add(res);
-  console.log(`[public-stream] connected — slug=${slug} streams=${clients.size}`);
+  console.log(`[public-stream] connected — slug=${slug} cc=${res._cc || "?"} streams=${clients.size}`);
 
   const keepalive = setInterval(() => {
     if (!res.writableEnded) res.write(": keepalive\n\n");
@@ -2805,6 +2856,19 @@ initDB().then(() => {
     console.log(`[Ether] API live → port ${PORT}`);
     if (!multer) console.warn("[Ether] multer not installed — backup upload disabled. Run: npm install multer");
   });
+
+  // Phase 3b: snapshot concurrent listener counts every 60s for peak/trend history.
+  setInterval(async () => {
+    try {
+      const slugs = [...streamClients.keys()].filter((s) => (streamClients.get(s)?.size || 0) > 0);
+      if (!slugs.length) return;
+      const { rows } = await pool.query(`SELECT station_uuid, slug FROM station_metadata WHERE slug = ANY($1)`, [slugs]);
+      for (const r of rows) {
+        const count = streamClients.get(r.slug)?.size || 0;
+        if (count > 0) await pool.query(`INSERT INTO station_listener_samples (station_uuid, count) VALUES ($1, $2)`, [r.station_uuid, count]);
+      }
+    } catch (e) { console.warn("[listener-sample]", e.message); }
+  }, 60_000);
 }).catch(e => {
   console.error("[Ether] DB init failed:", e.message);
   process.exit(1);
