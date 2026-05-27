@@ -1021,8 +1021,9 @@ app.post("/api/account/audio/upload-url", requireAuthAdmin, async (req, res) => 
     try {
       signedUrl = await signR2PutUrl(`${licenseId}/${fileKey}`, expiresInSeconds);
     } catch (e) {
-      console.error("[account/audio/upload-url] signing failed:", e.message);
-      return res.status(500).json({ error: "signing_failed", detail: e.message });
+      console.error("[account/audio/upload-url] signing failed:", e && (e.stack || e.message));
+      // Fold the reason into `error` too, so it surfaces even on a cached dashboard build.
+      return res.status(500).json({ error: `signing_failed: ${e && (e.message || e.name) || "unknown"}`, detail: e && e.message });
     }
     res.json({ signed_url: signedUrl, file_key: fileKey, expires_at: new Date(Date.now() + expiresInSeconds * 1000).toISOString() });
   } catch (e) {
