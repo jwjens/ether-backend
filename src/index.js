@@ -89,13 +89,13 @@ function getR2Client() {
     endpoint: (process.env.R2_ENDPOINT || "").trim() ||
               `https://${(process.env.R2_ACCOUNT_ID || "").trim()}.r2.cloudflarestorage.com`,
     credentials: {
-      accessKeyId:     process.env.R2_ACCESS_KEY_ID,
-      secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
+      accessKeyId:     (process.env.R2_ACCESS_KEY_ID || "").trim(),
+      secretAccessKey: (process.env.R2_SECRET_ACCESS_KEY || "").trim(),
     },
   });
   return _r2Client;
 }
-const R2_BUCKET = process.env.R2_BUCKET || "ether-audio";
+const R2_BUCKET = (process.env.R2_BUCKET || "ether-audio").trim();
 
 // Public assets bucket — station logos (Phase 2). SEPARATE from the private
 // audio/backup buckets because R2 public access is bucket-level: a public
