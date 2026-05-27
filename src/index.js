@@ -86,6 +86,11 @@ function getR2Client() {
   const { S3Client } = require("@aws-sdk/client-s3");
   _r2Client = new S3Client({
     region: "auto",
+    // Recent AWS SDK versions default to adding a CRC32 checksum to PutObject, which
+    // breaks presigned PUT URLs: the checksum is computed over an empty body at sign
+    // time, then mismatches the real upload → R2 403. Only checksum when required.
+    requestChecksumCalculation: "WHEN_REQUIRED",
+    responseChecksumValidation: "WHEN_REQUIRED",
     endpoint: (process.env.R2_ENDPOINT || "").trim() ||
               `https://${(process.env.R2_ACCOUNT_ID || "").trim()}.r2.cloudflarestorage.com`,
     credentials: {
