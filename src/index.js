@@ -86,8 +86,8 @@ function getR2Client() {
   const { S3Client } = require("@aws-sdk/client-s3");
   _r2Client = new S3Client({
     region: "auto",
-    endpoint: process.env.R2_ENDPOINT ||
-              `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+    endpoint: (process.env.R2_ENDPOINT || "").trim() ||
+              `https://${(process.env.R2_ACCOUNT_ID || "").trim()}.r2.cloudflarestorage.com`,
     credentials: {
       accessKeyId:     process.env.R2_ACCESS_KEY_ID,
       secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
@@ -1021,9 +1021,14 @@ app.post("/api/account/audio/upload-url", requireAuthAdmin, async (req, res) => 
     try {
       signedUrl = await signR2PutUrl(`${licenseId}/${fileKey}`, expiresInSeconds);
     } catch (e) {
-      console.error("[account/audio/upload-url] signing failed:", e && (e.stack || e.message));
-      // Fold the reason into `error` too, so it surfaces even on a cached dashboard build.
-      return res.status(500).json({ error: `signing_failed: ${e && (e.message || e.name) || "unknown"}`, detail: e && e.message });
+      const msg = (e && (e.message || e.name)) || "unknown";
+      const epRaw = (process.env.R2_ENDPOINT || "").trim();
+      const acct = (process.env.R2_ACCOUNT_ID || "").trim();
+      const resolved = epRaw || `https://${acct}.r2.cloudflarestorage.com`;
+      const masked = acct ? resolved.replace(acct, acct.slice(0, 4) + "…") : resolved;
+      console.error("[account/audio/upload-url] signing failed:", e && (e.stack || e.message), "| endpoint:", masked, "| R2_ENDPOINT_set:", !!epRaw);
+      // Fold the reason + resolved endpoint into the response so it's diagnosable from the UI.
+      return res.status(500).json({ error: `signing_failed: ${msg}`, detail: `${msg} | endpoint=${masked} | R2_ENDPOINT_set=${!!epRaw}` });
     }
     res.json({ signed_url: signedUrl, file_key: fileKey, expires_at: new Date(Date.now() + expiresInSeconds * 1000).toISOString() });
   } catch (e) {
