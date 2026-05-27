@@ -460,6 +460,25 @@ async function initDB() {
     )
   `);
 
+  // Append-only play history for cross-install analytics (Phase 3a). The install pushes
+  // new play_log rows incrementally; rows are never updated (ON CONFLICT DO NOTHING).
+  // Distinct from station_cc_data (which tombstones) because history only grows.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS station_play_history (
+      station_uuid  TEXT NOT NULL REFERENCES stations(uuid) ON DELETE CASCADE,
+      row_uuid      TEXT NOT NULL,
+      title         TEXT,
+      artist        TEXT,
+      category_code TEXT,
+      show_name     TEXT,
+      duration_ms   INTEGER,
+      played_at     TIMESTAMPTZ,
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (station_uuid, row_uuid)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_play_history_station_time ON station_play_history (station_uuid, played_at DESC)`);
+
   console.log("[DB] Schema ready");
 }
 
@@ -1039,6 +1058,84 @@ app.post("/api/account/audio/upload-url", requireAuthAdmin, async (req, res) => 
   } catch (e) {
     console.error("[account/audio/upload-url]", e.message);
     res.status(500).json({ error: "server_error" });
+  }
+});
+
+// Install pushes new play_log rows for analytics (x-license-key). Append-only —
+// dedupe by row_uuid, ON CONFLICT DO NOTHING (history only grows, never updates).
+// played_at arrives as unix SECONDS (play_log.played_at). Chunked for backfills.
+app.post("/api/account/play-history", async (req, res) => {
+  try {
+    const key = req.headers["x-license-key"];
+    if (!key) return res.status(401).json({ error: "missing_license_key" });
+    const license = await lookupLicense(key);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+    const stationUuid = String(req.body?.station_uuid || "");
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    if (!stationUuid) return res.status(400).json({ error: "missing_fields" });
+    const { rows: own } = await pool.query(
+      `SELECT 1 FROM stations WHERE uuid = $1 AND license_key_id = $2`, [stationUuid, license.id]
+    );
+    if (own.length === 0) return res.status(404).json({ error: "station_not_found" });
+
+    const byUuid = new Map();
+    for (const r of rows) { if (r?.row_uuid) byUuid.set(String(r.row_uuid), r); }
+    const entries = [...byUuid.values()];
+    let inserted = 0;
+    const CHUNK = 500;
+    for (let i = 0; i < entries.length; i += CHUNK) {
+      const chunk = entries.slice(i, i + CHUNK);
+      const params = [stationUuid];
+      const tuples = [];
+      let p = 2;
+      for (const r of chunk) {
+        tuples.push(`($1,$${p},$${p + 1},$${p + 2},$${p + 3},$${p + 4},$${p + 5},to_timestamp($${p + 6}))`);
+        params.push(String(r.row_uuid), r.title ?? null, r.artist ?? null, r.category_code ?? null, r.show_name ?? null, r.duration_ms ?? null, Number(r.played_at) || 0);
+        p += 7;
+      }
+      const result = await pool.query(
+        `INSERT INTO station_play_history (station_uuid, row_uuid, title, artist, category_code, show_name, duration_ms, played_at)
+         VALUES ${tuples.join(",")}
+         ON CONFLICT (station_uuid, row_uuid) DO NOTHING`,
+        params
+      );
+      inserted += result.rowCount || 0;
+    }
+    return res.json({ ok: true, received: entries.length, inserted });
+  } catch (e) {
+    console.error("[account/play-history]", e.message);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// Dashboard reads aggregated analytics for one station (JWT). Server-side GROUP BY so
+// the browser never sees raw rows. range = 7d | 30d | 90d | all (default 30d).
+app.get("/api/account/station/:uuid/analytics", requireAuth, async (req, res) => {
+  try {
+    const stationUuid = req.params.uuid;
+    const { rows: own } = await pool.query(
+      `SELECT 1 FROM stations WHERE uuid = $1 AND license_key_id = $2`, [stationUuid, req.auth.lk]
+    );
+    if (own.length === 0) return res.status(404).json({ error: "station_not_found" });
+
+    const days = { "7d": 7, "30d": 30, "90d": 90, "all": null }[String(req.query.range || "30d")];
+    const rangeParam = days === undefined ? "30d" : String(req.query.range || "30d");
+    const d = days === undefined ? 30 : days; // d is a whitelisted int or null — no injection
+    const since = d ? `NOW() - INTERVAL '${d} days'` : `to_timestamp(0)`;
+    const where = `station_uuid = $1 AND played_at >= ${since}`;
+    const a = [stationUuid];
+
+    const totals = (await pool.query(`SELECT COUNT(*)::int AS plays, COALESCE(SUM(duration_ms),0)::bigint AS total_ms FROM station_play_history WHERE ${where}`, a)).rows[0];
+    const topSongs = (await pool.query(`SELECT title, artist, COUNT(*)::int AS plays FROM station_play_history WHERE ${where} AND title IS NOT NULL GROUP BY title, artist ORDER BY plays DESC LIMIT 20`, a)).rows;
+    const topArtists = (await pool.query(`SELECT artist, COUNT(*)::int AS plays FROM station_play_history WHERE ${where} AND artist IS NOT NULL AND artist <> '' GROUP BY artist ORDER BY plays DESC LIMIT 20`, a)).rows;
+    const byCategory = (await pool.query(`SELECT COALESCE(NULLIF(category_code,''),'(uncategorized)') AS category_code, COUNT(*)::int AS plays FROM station_play_history WHERE ${where} GROUP BY 1 ORDER BY plays DESC`, a)).rows;
+    const byDay = (await pool.query(`SELECT to_char(date_trunc('day', played_at), 'YYYY-MM-DD') AS day, COUNT(*)::int AS plays FROM station_play_history WHERE ${where} GROUP BY 1 ORDER BY 1`, a)).rows;
+    const recent = (await pool.query(`SELECT title, artist, category_code, show_name, duration_ms, played_at FROM station_play_history WHERE station_uuid = $1 ORDER BY played_at DESC LIMIT 50`, [stationUuid])).rows;
+
+    return res.json({ range: rangeParam, totals, topSongs, topArtists, byCategory, byDay, recent });
+  } catch (e) {
+    console.error("[account/analytics]", e.message);
+    return res.status(500).json({ error: "server_error" });
   }
 });
 
