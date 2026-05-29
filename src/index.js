@@ -387,6 +387,10 @@ async function initDB() {
   // art_url: public R2 URL of the on-air track's embedded cover art (primary artwork
   // for the listener page; iTunes is the listener's fallback). Additive.
   await pool.query(`ALTER TABLE station_now_playing ADD COLUMN IF NOT EXISTS art_url TEXT`);
+  // decks: full per-physical-deck snapshot {A,B,C} (title/artist/status/positionSec/durationSec)
+  // so consumers (dashboard) can show each song on its REAL deck instead of normalizing the
+  // on-air track to "Deck A". JSONB → no integer-strictness issue with fractional positions.
+  await pool.query(`ALTER TABLE station_now_playing ADD COLUMN IF NOT EXISTS decks JSONB`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS station_metadata (
       station_uuid    TEXT PRIMARY KEY REFERENCES stations(uuid) ON DELETE CASCADE,
@@ -797,7 +801,7 @@ app.get("/api/account/stations", requireAuth, async (req, res) => {
       `SELECT s.uuid, s.name, s.nickname, s.frequency, s.call_letters, s.created_at,
               m.slug, m.display_name, m.logo_url, m.color_primary, m.color_secondary,
               m.description, m.public_enabled, m.stream_url,
-              n.playing, n.title, n.artist, n.started_at, n.duration_sec, n.queue,
+              n.playing, n.title, n.artist, n.deck, n.decks, n.started_at, n.duration_sec, n.queue,
               n.updated_at AS now_playing_updated_at
        FROM stations s
        LEFT JOIN station_metadata    m ON m.station_uuid = s.uuid
@@ -815,8 +819,9 @@ app.get("/api/account/stations", requireAuth, async (req, res) => {
         description: r.description, public_enabled: !!r.public_enabled, stream_url: r.stream_url,
       },
       now_playing: r.now_playing_updated_at ? {
-        playing: r.playing, title: r.title, artist: r.artist, started_at: r.started_at,
-        duration_sec: r.duration_sec, queue: r.queue || [], updated_at: r.now_playing_updated_at,
+        playing: r.playing, title: r.title, artist: r.artist, deck: r.deck, decks: r.decks || null,
+        started_at: r.started_at, duration_sec: r.duration_sec, queue: r.queue || [],
+        updated_at: r.now_playing_updated_at,
       } : null,
     }));
     return res.json({ stations });
@@ -2293,18 +2298,20 @@ async function upsertStationNowPlaying(rawKey, body) {
   // started_at lets listeners compute elapsed locally without per-second updates.
   const startedAt = playing ? new Date(Date.now() - position * 1000) : null;
 
+  const decksJson = body.decks && typeof body.decks === "object" ? JSON.stringify(body.decks) : null;
+
   await pool.query(
     `INSERT INTO station_now_playing
-       (station_uuid, playing, title, artist, deck, started_at, position_sec, duration_sec, queue, art_url, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, NOW())
+       (station_uuid, playing, title, artist, deck, started_at, position_sec, duration_sec, queue, art_url, decks, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, NOW())
      ON CONFLICT (station_uuid) DO UPDATE SET
        playing=$2, title=$3, artist=$4, deck=$5, started_at=$6,
-       position_sec=$7, duration_sec=$8, queue=$9, art_url=$10, updated_at=NOW()`,
+       position_sec=$7, duration_sec=$8, queue=$9, art_url=$10, decks=$11, updated_at=NOW()`,
     [
       body.station_uuid, playing, body.title ?? null, body.artist ?? null,
       body.deck ?? null, startedAt, position, duration,
       JSON.stringify(Array.isArray(body.queue) ? body.queue : []),
-      body.art_url ?? null,
+      body.art_url ?? null, decksJson,
     ]
   );
 
@@ -2319,6 +2326,7 @@ async function upsertStationNowPlaying(rawKey, body) {
     if (meta.length) {
       broadcastNowPlaying(meta[0].slug, {
         playing, title: body.title ?? null, artist: body.artist ?? null,
+        deck: body.deck ?? null, decks: body.decks ?? null,
         started_at: startedAt, duration_sec: duration, art_url: body.art_url ?? null,
         queue: Array.isArray(body.queue) ? body.queue : [], updated_at: Date.now(),
       });
@@ -2369,7 +2377,7 @@ app.get("/public/station/:slug", async (req, res) => {
     const { rows } = await pool.query(
       `SELECT m.slug, m.display_name, m.logo_url, m.color_primary, m.color_secondary,
               m.description, m.socials, m.public_enabled, m.stream_url,
-              n.playing, n.title, n.artist, n.started_at, n.duration_sec, n.queue, n.art_url, n.updated_at
+              n.playing, n.title, n.artist, n.deck, n.decks, n.started_at, n.duration_sec, n.queue, n.art_url, n.updated_at
        FROM station_metadata m
        LEFT JOIN station_now_playing n ON n.station_uuid = m.station_uuid
        WHERE m.slug = $1`,
@@ -2387,7 +2395,7 @@ app.get("/public/station/:slug", async (req, res) => {
         socials: r.socials || {},
         stream_url: r.stream_url || null,
         now_playing: r.updated_at ? {
-          playing: r.playing, title: r.title, artist: r.artist,
+          playing: r.playing, title: r.title, artist: r.artist, deck: r.deck, decks: r.decks || null,
           started_at: r.started_at, duration_sec: r.duration_sec, art_url: r.art_url || null,
           queue: r.queue || [], updated_at: r.updated_at,
         } : null,
