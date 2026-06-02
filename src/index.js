@@ -293,6 +293,25 @@ async function initDB() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_licenses_email    ON licenses(email)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_activations_key   ON license_activations(license_key)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_backups_station   ON backups(station_id)`);
+
+  // Customer accounts (email + password) — the simplified customer-facing identity that will
+  // replace license keys in the apps. Free signup captures the email + starts a 15-day trial;
+  // a paid Stripe subscription links license_key_id. The license stays the internal entitlement.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id              SERIAL PRIMARY KEY,
+      email           TEXT NOT NULL UNIQUE,
+      password_hash   TEXT NOT NULL,
+      email_verified  BOOLEAN NOT NULL DEFAULT false,
+      verify_token    TEXT,
+      reset_token     TEXT,
+      reset_expires   TIMESTAMPTZ,
+      trial_ends_at   TIMESTAMPTZ,
+      license_key_id  INTEGER REFERENCES licenses(id),
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_login_at   TIMESTAMPTZ
+    )
+  `);
   await pool.query(`DELETE FROM guest_presence WHERE joined_at < NOW() - INTERVAL '24 hours'`).catch(() => {});
 
   // Schema migrations: original DB used status TEXT and lacked active/last_validated.
@@ -943,6 +962,137 @@ const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, max: 40,
   standardHeaders: true, legacyHeaders: false,
   message: { error: "too_many_attempts" },
+});
+
+// ── Customer accounts (email + password) ──────────────────────────────────
+// The simplified customer identity: free signup → 15-day trial → paid subscription. Distinct from
+// the dashboard's license-key + PIN auth (/api/auth/*); these live at /api/user/*. JWT carries
+// typ:"user". The license remains the internal entitlement; this hides it behind email+password.
+const ACCOUNT_APP_URL = process.env.ACCOUNT_APP_URL || "https://ether-technologies.com";
+const TRIAL_DAYS = 15;
+const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+
+function signUserToken(u) {
+  return jwt.sign({ uid: u.id, email: u.email, typ: "user" }, JWT_SECRET, { expiresIn: JWT_TTL });
+}
+function requireUser(req, res, next) {
+  const h = req.headers["authorization"] || "";
+  const token = h.startsWith("Bearer ") ? h.slice(7) : null;
+  if (!token) return res.status(401).json({ error: "missing_token" });
+  try {
+    const p = jwt.verify(token, JWT_SECRET);
+    if (p.typ !== "user") return res.status(401).json({ error: "invalid_token" });
+    req.user = p; next();
+  } catch { return res.status(401).json({ error: "invalid_token" }); }
+}
+// Current entitlement: an active paid license wins; else an unexpired trial; else expired/none.
+async function userEntitlement(u) {
+  if (u.license_key_id) {
+    const { rows } = await pool.query(`SELECT plan, active FROM licenses WHERE id = $1`, [u.license_key_id]);
+    if (rows[0] && rows[0].active) return { status: "active", plan: rows[0].plan, trial_days_left: 0 };
+  }
+  if (u.trial_ends_at) {
+    const ms = new Date(u.trial_ends_at).getTime() - Date.now();
+    if (ms > 0) return { status: "trial", plan: "trial", trial_days_left: Math.ceil(ms / 86400000) };
+    return { status: "expired", plan: null, trial_days_left: 0 };
+  }
+  return { status: "none", plan: null, trial_days_left: 0 };
+}
+function publicAccount(u, ent) {
+  return { id: u.id, email: u.email, email_verified: !!u.email_verified, trial_ends_at: u.trial_ends_at, entitlement: ent };
+}
+async function sendAccountEmail(to, subject, heading, body, button) {
+  const from = process.env.FROM_EMAIL || "noreply@ether-technologies.com";
+  try {
+    await resend.emails.send({ from, to, subject, html: `
+<div style="font-family:system-ui,sans-serif;max-width:560px;margin:0 auto;padding:32px 24px;background:#0d0d18;color:#f0f0f8;border-radius:12px">
+  <div style="font-size:22px;font-weight:900;color:#22d3ee;margin-bottom:24px">Ether Technologies</div>
+  <p style="font-size:16px;font-weight:700;margin:0 0 10px">${heading}</p>
+  <div style="color:#94a3b8;font-size:13px;line-height:1.7;margin-bottom:22px">${body}</div>
+  ${button ? `<a href="${button.url}" style="display:inline-block;background:#22d3ee;color:#04222a;font-weight:800;padding:12px 22px;border-radius:8px;text-decoration:none">${button.label}</a>` : ""}
+  <div style="margin-top:28px;padding-top:14px;border-top:1px solid #1e293b;font-size:10px;color:#334155">Ether Technologies · ether-technologies.com · ${new Date().getFullYear()}</div>
+</div>` });
+  } catch (e) { console.error("[account-email]", e.message); }
+}
+
+// Free signup → create the account, start the 15-day trial, send a (non-blocking) verify email.
+app.post("/api/user/signup", authLimiter, async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const password = String(req.body?.password || "");
+    if (!EMAIL_RE.test(email)) return res.status(400).json({ error: "invalid_email" });
+    if (password.length < 8) return res.status(400).json({ error: "weak_password" });
+    if ((await pool.query(`SELECT 1 FROM users WHERE email = $1`, [email])).rows[0]) return res.status(409).json({ error: "email_taken" });
+    const hash = await bcrypt.hash(password, 12);
+    const verifyToken = crypto.randomBytes(24).toString("base64url");
+    const { rows } = await pool.query(
+      `INSERT INTO users (email, password_hash, verify_token, trial_ends_at)
+       VALUES ($1, $2, $3, NOW() + INTERVAL '${TRIAL_DAYS} days') RETURNING *`,
+      [email, hash, verifyToken]
+    );
+    const u = rows[0];
+    sendAccountEmail(email, "Verify your Ether account", "Welcome to Ether",
+      `Your ${TRIAL_DAYS}-day free trial has started. Confirm your email to secure your account.`,
+      { url: `${ACCOUNT_APP_URL}/verify?token=${verifyToken}`, label: "Verify email" });
+    res.json({ token: signUserToken(u), account: publicAccount(u, await userEntitlement(u)) });
+  } catch (e) { console.error("[user/signup]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+app.post("/api/user/login", authLimiter, async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const password = String(req.body?.password || "");
+    const u = (await pool.query(`SELECT * FROM users WHERE email = $1`, [email])).rows[0];
+    if (!u || !(await bcrypt.compare(password, u.password_hash))) return res.status(401).json({ error: "invalid_credentials" });
+    await pool.query(`UPDATE users SET last_login_at = NOW() WHERE id = $1`, [u.id]);
+    res.json({ token: signUserToken(u), account: publicAccount(u, await userEntitlement(u)) });
+  } catch (e) { console.error("[user/login]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+app.get("/api/user/me", requireUser, async (req, res) => {
+  try {
+    const u = (await pool.query(`SELECT * FROM users WHERE id = $1`, [req.user.uid])).rows[0];
+    if (!u) return res.status(404).json({ error: "not_found" });
+    res.json({ account: publicAccount(u, await userEntitlement(u)) });
+  } catch (e) { console.error("[user/me]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+app.post("/api/user/verify", async (req, res) => {
+  try {
+    const token = String(req.body?.token || "");
+    if (!token) return res.status(400).json({ error: "missing_token" });
+    const r = await pool.query(`UPDATE users SET email_verified = true, verify_token = NULL WHERE verify_token = $1 RETURNING id`, [token]);
+    if (!r.rowCount) return res.status(400).json({ error: "invalid_token" });
+    res.json({ ok: true });
+  } catch (e) { console.error("[user/verify]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+app.post("/api/user/forgot", authLimiter, async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const u = (await pool.query(`SELECT id FROM users WHERE email = $1`, [email])).rows[0];
+    if (u) {
+      const token = crypto.randomBytes(24).toString("base64url");
+      await pool.query(`UPDATE users SET reset_token = $1, reset_expires = NOW() + INTERVAL '1 hour' WHERE id = $2`, [token, u.id]);
+      sendAccountEmail(email, "Reset your Ether password", "Password reset",
+        `We received a request to reset your password. This link expires in 1 hour — if you didn't request it, ignore this email.`,
+        { url: `${ACCOUNT_APP_URL}/reset?token=${token}`, label: "Reset password" });
+    }
+    res.json({ ok: true });   // never reveal whether the email exists
+  } catch (e) { console.error("[user/forgot]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+app.post("/api/user/reset", authLimiter, async (req, res) => {
+  try {
+    const token = String(req.body?.token || "");
+    const password = String(req.body?.password || "");
+    if (password.length < 8) return res.status(400).json({ error: "weak_password" });
+    const u = (await pool.query(`SELECT id FROM users WHERE reset_token = $1 AND reset_expires > NOW()`, [token])).rows[0];
+    if (!u) return res.status(400).json({ error: "invalid_or_expired" });
+    const hash = await bcrypt.hash(password, 12);
+    await pool.query(`UPDATE users SET password_hash = $1, reset_token = NULL, reset_expires = NULL WHERE id = $2`, [hash, u.id]);
+    res.json({ ok: true });
+  } catch (e) { console.error("[user/reset]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
 // First-admin bootstrap: paste license key + pick username + PIN. Allowed only
