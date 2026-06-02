@@ -323,6 +323,9 @@ async function initDB() {
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS key_prefix TEXT`);
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS key_hash   TEXT`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_licenses_key_prefix ON licenses(key_prefix)`);
+  // Drop the stale plan CHECK constraint — it predates the newer tiers (pro_lifetime,
+  // station_lifetime, operator) and rejected them. Plan is validated in code against VALID_PLANS.
+  await pool.query(`ALTER TABLE licenses DROP CONSTRAINT IF EXISTS licenses_plan_check`);
   // Allow NULL license_key for new bcrypt-format rows (key stored as key_hash + key_prefix only).
   // Idempotent: no-op if column is already nullable.
   await pool.query(`ALTER TABLE licenses ALTER COLUMN license_key DROP NOT NULL`);
