@@ -1150,6 +1150,32 @@ app.post("/api/user/reset", authLimiter, async (req, res) => {
   } catch (e) { console.error("[user/reset]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
+// Start a Stripe Checkout to convert a trial into a paid subscription. Ties the session to the
+// user (client_reference_id) + plan (metadata) so the webhook can flip THIS account to paid.
+app.post("/api/user/checkout", requireUser, async (req, res) => {
+  try {
+    if (!process.env.STRIPE_SECRET_KEY) return res.status(503).json({ error: "stripe_unconfigured" });
+    const plan = String(req.body?.plan || "");
+    const priceId = plan === "station" ? process.env.PRICE_STATION : plan === "pro" ? process.env.PRICE_PRO : null;
+    if (!priceId) return res.status(400).json({ error: "invalid_plan" });
+    const u = (await pool.query(`SELECT id, email FROM users WHERE id = $1`, [req.user.uid])).rows[0];
+    if (!u) return res.status(404).json({ error: "not_found" });
+    const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+    const base = ACCOUNT_APP_URL.replace(/\/$/, "");
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      line_items: [{ price: priceId, quantity: 1 }],
+      customer_email: u.email,
+      client_reference_id: String(u.id),
+      metadata: { user_id: String(u.id), plan },
+      success_url: `${base}/?subscribed=1`,
+      cancel_url: `${base}/`,
+      allow_promotion_codes: true,
+    });
+    res.json({ url: session.url });
+  } catch (e) { console.error("[user/checkout]", e.message); res.status(500).json({ error: "server_error", detail: e.message }); }
+});
+
 // First-admin bootstrap: paste license key + pick username + PIN. Allowed only
 // when the license has no live users yet — no admin intervention, no hijacking an
 // already-set-up account.
@@ -2785,6 +2811,37 @@ app.post("/webhook/stripe", async (req, res) => {
   }
 
   console.log(`[Stripe] ${event.type}`);
+
+  // Account-linked subscription (from the signup app's /api/user/checkout): the session carries the
+  // user id (client_reference_id) + chosen plan (metadata). Create/activate the license and link it
+  // to that account so its entitlement flips to paid. No key email — the customer uses email+password.
+  if (event.type === "checkout.session.completed" && event.data.object.client_reference_id) {
+    const s = event.data.object;
+    const userId = parseInt(s.client_reference_id, 10);
+    const email  = (s.customer_details?.email || s.customer_email || "").toLowerCase().trim();
+    const plan   = s.metadata?.plan;
+    const subId  = s.subscription || s.id;
+    if (userId && plan && VALID_PLANS.has(plan)) {
+      const { rows: existing } = await pool.query("SELECT id FROM licenses WHERE stripe_sub_id=$1", [subId]);
+      let licId;
+      if (existing.length) {
+        await pool.query("UPDATE licenses SET active=true, plan=$1, email=$2 WHERE id=$3", [plan, email || null, existing[0].id]);
+        licId = existing[0].id;
+      } else {
+        const key = generateLicenseKey(plan);
+        const r = await pool.query(
+          "INSERT INTO licenses (email,plan,stripe_sub_id,key_prefix,key_hash) VALUES ($1,$2,$3,$4,$5) RETURNING id",
+          [email || null, plan, subId, key.slice(0, 12), await bcrypt.hash(key, 12)]
+        );
+        licId = r.rows[0].id;
+      }
+      await pool.query("UPDATE users SET license_key_id=$1 WHERE id=$2", [licId, userId]);
+      console.log(`[Stripe] account subscription: user ${userId} → license ${licId} (${plan})`);
+    } else {
+      console.warn(`[Stripe] account checkout missing userId/plan (ref=${s.client_reference_id}, plan=${plan})`);
+    }
+    return res.json({ received: true });
+  }
 
   if (["checkout.session.completed","invoice.payment_succeeded"].includes(event.type)) {
     const obj   = event.data.object;
