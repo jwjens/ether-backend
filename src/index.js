@@ -1237,17 +1237,17 @@ app.get("/api/account/station/:uuid/listenership", requireAuth, async (req, res)
               COALESCE(ROUND(AVG(duration_sec)),0)::int AS avg_sec
        FROM listener_sessions WHERE ${W}`, [stationUuid])).rows[0];
     const byDay = (await pool.query(
-      `SELECT to_char(date_trunc('day', started_at), 'YYYY-MM-DD') AS day, COUNT(*)::int AS sessions, COUNT(DISTINCT NULLIF(lid,''))::int AS unique
+      `SELECT to_char(date_trunc('day', started_at), 'YYYY-MM-DD') AS day, COUNT(*)::int AS sessions, COUNT(DISTINCT NULLIF(lid,''))::int AS uniq
        FROM listener_sessions WHERE ${W} GROUP BY 1 ORDER BY 1`, [stationUuid])).rows;
     const byHour = (await pool.query(
-      `SELECT EXTRACT(HOUR FROM started_at)::int AS hour, COUNT(*)::int AS sessions
+      `SELECT EXTRACT(HOUR FROM started_at)::int AS hour, COUNT(*)::int AS sessions, COUNT(DISTINCT NULLIF(lid,''))::int AS uniq
        FROM listener_sessions WHERE ${W} GROUP BY 1 ORDER BY 1`, [stationUuid])).rows;
     const byCountry = (await pool.query(
-      `SELECT cc, COUNT(*)::int AS sessions FROM listener_sessions WHERE ${W} AND COALESCE(cc,'') <> '' GROUP BY 1 ORDER BY 2 DESC LIMIT 25`, [stationUuid])).rows;
+      `SELECT cc, COUNT(*)::int AS sessions, COUNT(DISTINCT NULLIF(lid,''))::int AS uniq FROM listener_sessions WHERE ${W} AND COALESCE(cc,'') <> '' GROUP BY 1 ORDER BY uniq DESC, sessions DESC LIMIT 10`, [stationUuid])).rows;
     const byRegion = (await pool.query(
-      `SELECT region, cc, COUNT(*)::int AS sessions FROM listener_sessions WHERE ${W} AND COALESCE(region,'') <> '' GROUP BY 1,2 ORDER BY 3 DESC LIMIT 25`, [stationUuid])).rows;
+      `SELECT region, cc, COUNT(*)::int AS sessions, COUNT(DISTINCT NULLIF(lid,''))::int AS uniq FROM listener_sessions WHERE ${W} AND COALESCE(region,'') <> '' GROUP BY 1,2 ORDER BY uniq DESC, sessions DESC LIMIT 10`, [stationUuid])).rows;
     const byCity = (await pool.query(
-      `SELECT city, cc, COUNT(*)::int AS sessions FROM listener_sessions WHERE ${W} AND COALESCE(city,'') <> '' GROUP BY 1,2 ORDER BY 3 DESC LIMIT 25`, [stationUuid])).rows;
+      `SELECT city, cc, COUNT(*)::int AS sessions, COUNT(DISTINCT NULLIF(lid,''))::int AS uniq FROM listener_sessions WHERE ${W} AND COALESCE(city,'') <> '' GROUP BY 1,2 ORDER BY uniq DESC, sessions DESC LIMIT 10`, [stationUuid])).rows;
 
     const peakConcurrent = (await pool.query(`SELECT COALESCE(MAX(count),0)::int AS peak FROM station_listener_samples WHERE station_uuid = $1 AND ts >= ${since}`, [stationUuid])).rows[0].peak;
     const concurrent = (await pool.query(`SELECT to_char(date_trunc('hour', ts), 'YYYY-MM-DD HH24:00') AS ts, MAX(count)::int AS count FROM station_listener_samples WHERE station_uuid = $1 AND ts >= ${since} GROUP BY 1 ORDER BY 1`, [stationUuid])).rows;

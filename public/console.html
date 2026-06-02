@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ether — Station Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=DM+Mono:wght@400;500&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg:     #07070e; --bg2: #0d0d1a; --bg3: #13131f;
+  --border: rgba(255,255,255,0.07); --border2: rgba(255,255,255,0.12);
+  --text:   #f0f0f8; --text2: rgba(240,240,248,0.6); --text3: rgba(240,240,248,0.28);
+  --cyan: #38bdf8; --green: #34d399; --red: #f87171; --amber: #fbbf24; --purple: #a78bfa;
+}
+html, body { min-height: 100vh; background: var(--bg); color: var(--text); font-family: 'Inter', system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+
+header {
+  height: 52px; display: flex; align-items: center; justify-content: space-between;
+  padding: 0 28px; background: rgba(7,7,14,0.95); backdrop-filter: blur(20px);
+  border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 50;
+}
+.logo { display: flex; align-items: center; gap: 10px; font-family: 'Syne', sans-serif; font-size: 15px; font-weight: 800; }
+.logo-icon { width: 28px; height: 28px; border-radius: 8px; background: linear-gradient(135deg, var(--cyan), var(--purple)); display: flex; align-items: center; justify-content: center; }
+
+.main { padding: 24px; max-width: 1400px; margin: 0 auto; }
+
+/* Station cards */
+.stations-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 16px; margin-bottom: 24px; }
+
+.station-card { background: var(--bg2); border: 1px solid var(--border); border-radius: 14px; overflow: hidden; transition: border-color 0.15s; }
+.station-card:hover { border-color: var(--border2); }
+.station-stripe { height: 3px; }
+.station-body { padding: 16px 18px; }
+
+.station-header { display: flex; align-items: center; gap: 12; margin-bottom: 14px; }
+.station-avatar { width: 40px; height: 40px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-family: 'Syne', sans-serif; font-size: 12px; font-weight: 800; flex-shrink: 0; }
+.station-name { font-size: 15px; font-weight: 800; letter-spacing: -0.02em; }
+.station-freq { font-size: 9px; font-weight: 700; padding: 1px 7px; border-radius: 4px; display: inline-block; margin-top: 3px; }
+
+.now-playing { background: var(--bg3); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; margin-bottom: 12px; }
+.np-label { font-size: 8px; font-weight: 800; letter-spacing: 0.16em; text-transform: uppercase; margin-bottom: 6px; }
+.np-title { font-size: 13px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 2px; }
+.np-artist { font-size: 11px; color: var(--text3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 8px; }
+.progress-track { height: 3px; background: rgba(255,255,255,0.06); border-radius: 2px; overflow: hidden; }
+.progress-fill { height: 100%; border-radius: 2px; transition: width 1s linear; }
+.progress-times { display: flex; justify-content: space-between; font-size: 9px; color: var(--text3); font-family: 'DM Mono', monospace; margin-top: 4px; }
+
+.controls { display: flex; gap: 6px; }
+.ctrl-btn {
+  flex: 1; padding: 7px 8px; border-radius: 8px; border: none; cursor: pointer;
+  font-size: 10px; font-weight: 700; transition: all 0.12s; letter-spacing: 0.04em;
+}
+.ctrl-btn:active { transform: scale(0.96); }
+
+.on-air-badge { display: flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 20px; font-size: 8px; font-weight: 700; letter-spacing: 0.12em; }
+.on-air-live { background: rgba(239,68,68,0.12); color: var(--red); border: 1px solid rgba(248,113,113,0.25); }
+.on-air-off  { background: rgba(255,255,255,0.04); color: var(--text3); border: 1px solid var(--border); }
+.on-air-dot  { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+.on-air-live .on-air-dot { animation: blink 1.2s ease-in-out infinite; }
+
+/* Summary bar */
+.summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 24px; }
+.summary-card { background: var(--bg2); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
+.summary-val { font-size: 22px; font-weight: 800; font-family: 'DM Mono', monospace; color: var(--cyan); letter-spacing: -0.03em; line-height: 1; margin-bottom: 4px; }
+.summary-lbl { font-size: 8.5px; color: var(--text3); text-transform: uppercase; letter-spacing: 0.12em; }
+
+.clock { font-family: 'DM Mono', monospace; font-size: 12px; color: var(--text3); }
+
+.pulse-ring { width: 8px; height: 8px; border-radius: 50%; background: var(--green); position: relative; }
+.pulse-ring::after { content:''; position:absolute; inset:-3px; border-radius:50%; border:1px solid var(--green); animation: ring 2s ease-out infinite; }
+
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+@keyframes ring  { 0%{opacity:1;transform:scale(1)} 100%{opacity:0;transform:scale(2.2)} }
+@keyframes spin  { to{transform:rotate(360deg)} }
+
+.spinner { width: 20px; height: 20px; border-radius: 50%; border: 2px solid var(--border2); border-top-color: var(--cyan); animation: spin 0.7s linear infinite; }
+.empty-state { text-align: center; padding: 60px 24px; color: var(--text3); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5" stroke-linecap="round">
+        <path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
+      </svg>
+    </div>
+    Ether Technologies — Station Console
+  </div>
+  <div style="display:flex;align-items:center;gap:14px">
+    <div class="pulse-ring" id="pulseRing" style="display:none"></div>
+    <div class="clock" id="clock"></div>
+  </div>
+</header>
+
+<div class="main">
+
+  <!-- Summary -->
+  <div class="summary">
+    <div class="summary-card">
+      <div class="summary-val" id="sumStations">—</div>
+      <div class="summary-lbl">Stations</div>
+    </div>
+    <div class="summary-card">
+      <div class="summary-val" id="sumOnAir" style="color:var(--red)">—</div>
+      <div class="summary-lbl">On Air</div>
+    </div>
+    <div class="summary-card">
+      <div class="summary-val" id="sumOffAir" style="color:var(--text3)">—</div>
+      <div class="summary-lbl">Off Air</div>
+    </div>
+    <div class="summary-card">
+      <div class="summary-val" id="sumUpdated">—</div>
+      <div class="summary-lbl">Last Update</div>
+    </div>
+  </div>
+
+  <!-- Station cards -->
+  <div class="stations-grid" id="stationsGrid">
+    <div class="empty-state">
+      <div style="font-size:32px;margin-bottom:12px">📻</div>
+      <div style="font-size:14px;font-weight:600;color:var(--text2);margin-bottom:6px">Waiting for stations...</div>
+      <div style="font-size:12px">Stations will appear here when Ether is running and pushing now-playing data.</div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const API = 'https://ether-backend-production.up.railway.app';
+
+// All known stations — populated from now-playing pushes
+const stationData = {};
+
+function tick() {
+  const d = new Date();
+  document.getElementById('clock').textContent =
+    d.getHours().toString().padStart(2,'0') + ':' +
+    d.getMinutes().toString().padStart(2,'0') + ':' +
+    d.getSeconds().toString().padStart(2,'0');
+}
+setInterval(tick, 1000); tick();
+
+function fmt(s) {
+  if (!s || s <= 0) return '0:00';
+  return Math.floor(s/60) + ':' + String(Math.floor(s%60)).padStart(2,'0');
+}
+
+function timeAgo(ts) {
+  const diff = (Date.now() - ts) / 1000;
+  if (diff < 60)   return `${Math.floor(diff)}s ago`;
+  if (diff < 3600) return `${Math.floor(diff/60)}m ago`;
+  return `${Math.floor(diff/3600)}h ago`;
+}
+
+function esc(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+async function sendCmd(stationId, cmd) {
+  try {
+    await fetch(`${API}/api/cmd`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cmd, station_id: stationId }),
+    });
+  } catch (e) { console.error('cmd failed:', e); }
+}
+
+function renderStations() {
+  const grid = document.getElementById('stationsGrid');
+  const entries = Object.values(stationData);
+
+  if (entries.length === 0) {
+    grid.innerHTML = `<div class="empty-state">
+      <div style="font-size:32px;margin-bottom:12px">📻</div>
+      <div style="font-size:14px;font-weight:600;color:var(--text2);margin-bottom:6px">No stations connected</div>
+      <div style="font-size:12px">Stations appear here when Ether is running.</div>
+    </div>`;
+    return;
+  }
+
+  const onAirCount  = entries.filter(s => s.playing).length;
+  const offAirCount = entries.length - onAirCount;
+  document.getElementById('sumStations').textContent = entries.length;
+  document.getElementById('sumOnAir').textContent    = onAirCount;
+  document.getElementById('sumOffAir').textContent   = offAirCount;
+  document.getElementById('sumUpdated').textContent  = timeAgo(Math.max(...entries.map(s => s.updated_at || 0)));
+
+  const color = entries[0]?.station_color || '#38bdf8';
+
+  grid.innerHTML = entries.map(station => {
+    const pos = station.position || 0;
+    const dur = station.duration || 0;
+    const pct = dur > 0 ? Math.min(100, (pos / dur) * 100) : 0;
+    const c   = station.station_color || '#38bdf8';
+    const sid = station.station_id || 'default';
+
+    return `
+    <div class="station-card" style="border-color: ${station.playing ? c + '40' : 'rgba(255,255,255,0.07)'}">
+      <div class="station-stripe" style="background:${c}"></div>
+      <div class="station-body">
+        <div class="station-header" style="display:flex;align-items:center;gap:12px;margin-bottom:14px">
+          <div class="station-avatar" style="background:${c}18;border:1px solid ${c}35;color:${c}">
+            ${esc((station.station_short || station.station_name || 'STA').slice(0,4).toUpperCase())}
+          </div>
+          <div style="flex:1;min-width:0">
+            <div class="station-name">${esc(station.station_name || 'Station')}</div>
+            ${station.frequency ? `<span class="station-freq" style="background:${c}15;color:${c};border:1px solid ${c}30">${esc(station.frequency)}</span>` : ''}
+          </div>
+          <div class="on-air-badge ${station.playing ? 'on-air-live' : 'on-air-off'}">
+            <div class="on-air-dot"></div>
+            ${station.playing ? 'ON AIR' : 'OFF AIR'}
+          </div>
+        </div>
+
+        <div class="now-playing">
+          <div class="np-label" style="color:${c}">${station.playing ? '▶ NOW PLAYING' : 'IDLE'}</div>
+          <div class="np-title">${esc(station.title || 'No track loaded')}</div>
+          <div class="np-artist">${esc(station.artist || '—')}</div>
+          <div class="progress-track">
+            <div class="progress-fill" style="width:${pct}%;background:${c}"></div>
+          </div>
+          <div class="progress-times">
+            <span>${fmt(pos)}</span>
+            <span>${dur > 0 ? fmt(dur - pos) + ' left' : '—:——'}</span>
+          </div>
+        </div>
+
+        <div class="controls">
+          <button class="ctrl-btn" onclick="sendCmd('${sid}','play')"
+            style="background:rgba(52,211,153,0.1);color:#34d399;border:1px solid rgba(52,211,153,0.2)">
+            ▶ Resume
+          </button>
+          <button class="ctrl-btn" onclick="sendCmd('${sid}','pause')"
+            style="background:rgba(255,255,255,0.04);color:var(--text2);border:1px solid var(--border)">
+            ⏸ Pause
+          </button>
+          <button class="ctrl-btn" onclick="sendCmd('${sid}','skip')"
+            style="background:rgba(56,189,248,0.08);color:var(--cyan);border:1px solid rgba(56,189,248,0.2)">
+            ⏭ Skip
+          </button>
+          <button class="ctrl-btn" onclick="if(confirm('Stop all audio on ${esc(station.station_name || 'Station')}?')) sendCmd('${sid}','stop_all')"
+            style="background:rgba(239,68,68,0.08);color:var(--red);border:1px solid rgba(248,113,113,0.2)">
+            🛑 Stop
+          </button>
+        </div>
+
+        <div style="margin-top:8px;font-size:9px;color:var(--text3);font-family:'DM Mono',monospace;text-align:right">
+          Updated ${timeAgo(station.updated_at || Date.now())}
+          ${station.queue?.length ? ` · ${station.queue.length} in queue` : ''}
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function poll() {
+  try {
+    const res  = await fetch(`${API}/api/now-playing`, { signal: AbortSignal.timeout(4000) });
+    const data = await res.json();
+
+    document.getElementById('pulseRing').style.display = 'block';
+
+    if (data && (data.title || data.playing !== undefined)) {
+      const sid = data.station_id || data.station_name || 'default';
+      stationData[sid] = { ...data, updated_at: Date.now() };
+    }
+
+    // Remove stale stations (no update in 5 minutes)
+    const now = Date.now();
+    for (const [k, v] of Object.entries(stationData)) {
+      if (now - (v.updated_at || 0) > 300000) delete stationData[k];
+    }
+
+    renderStations();
+  } catch (e) {
+    // Keep showing last known state
+  }
+}
+
+poll();
+setInterval(poll, 3000);
+setInterval(renderStations, 1000); // Update time displays
+</script>
+</body>
+</html>
