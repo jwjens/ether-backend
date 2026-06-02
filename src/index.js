@@ -766,6 +766,94 @@ app.get("/api/platform/accounts/:id/stations", requirePlatform, async (req, res)
     res.json({ account: acct, stations: rows });
   } catch (e) { console.error("[platform/stations]", e.message); res.status(500).json({ error: "server_error" }); }
 });
+
+// Network analytics rollup across ALL stations for a custom date range (the report you submit
+// to ASCAP / BMI / SoundExchange — it's just the aggregated analytics). from/to = YYYY-MM-DD,
+// inclusive of the `to` day. Listening hours (ATH) from listener_sessions; performances (plays)
+// from station_play_history.
+function validRange(req) {
+  const from = String(req.query.from || ""), to = String(req.query.to || "");
+  const re = /^\d{4}-\d{2}-\d{2}$/;
+  return re.test(from) && re.test(to) ? { from, to } : null;
+}
+app.get("/api/platform/rollup", requirePlatform, async (req, res) => {
+  try {
+    const r = validRange(req);
+    if (!r) return res.status(400).json({ error: "bad_range" });
+    const p = [r.from, r.to];
+    const sW = `started_at >= $1::timestamptz AND started_at < ($2::date + 1)`;
+    const pW = `played_at  >= $1::timestamptz AND played_at  < ($2::date + 1)`;
+
+    const totals = (await pool.query(`
+      SELECT
+        (SELECT COUNT(*)::int                          FROM listener_sessions   WHERE ${sW}) AS sessions,
+        (SELECT COUNT(DISTINCT NULLIF(lid,''))::int    FROM listener_sessions   WHERE ${sW}) AS unique_listeners,
+        (SELECT COALESCE(SUM(duration_sec),0)::bigint  FROM listener_sessions   WHERE ${sW}) AS listen_sec,
+        (SELECT COUNT(*)::int                          FROM station_play_history WHERE ${pW}) AS performances`, p)).rows[0];
+
+    const byAccount = (await pool.query(`
+      WITH sess AS (
+        SELECT s.license_key_id AS lk, COUNT(*)::int AS sessions,
+               COUNT(DISTINCT NULLIF(ls.lid,''))::int AS uniq, COALESCE(SUM(ls.duration_sec),0)::bigint AS listen_sec
+          FROM listener_sessions ls JOIN stations s ON s.uuid = ls.station_uuid WHERE ls.${sW} GROUP BY s.license_key_id),
+      plays AS (
+        SELECT s.license_key_id AS lk, COUNT(*)::int AS performances
+          FROM station_play_history ph JOIN stations s ON s.uuid = ph.station_uuid WHERE ph.${pW} GROUP BY s.license_key_id)
+      SELECT l.id, l.email, l.plan,
+             COALESCE(sess.sessions,0) AS sessions, COALESCE(sess.uniq,0) AS uniq,
+             COALESCE(sess.listen_sec,0) AS listen_sec, COALESCE(plays.performances,0) AS performances
+        FROM licenses l LEFT JOIN sess ON sess.lk = l.id LEFT JOIN plays ON plays.lk = l.id
+       WHERE COALESCE(sess.sessions,0) > 0 OR COALESCE(plays.performances,0) > 0
+       ORDER BY listen_sec DESC, l.email`, p)).rows;
+
+    const byStation = (await pool.query(`
+      WITH sess AS (
+        SELECT station_uuid, COUNT(*)::int AS sessions, COUNT(DISTINCT NULLIF(lid,''))::int AS uniq,
+               COALESCE(SUM(duration_sec),0)::bigint AS listen_sec FROM listener_sessions WHERE ${sW} GROUP BY station_uuid),
+      plays AS (
+        SELECT station_uuid, COUNT(*)::int AS performances FROM station_play_history WHERE ${pW} GROUP BY station_uuid)
+      SELECT s.uuid, s.name, l.email AS account, m.display_name,
+             COALESCE(sess.sessions,0) AS sessions, COALESCE(sess.uniq,0) AS uniq,
+             COALESCE(sess.listen_sec,0) AS listen_sec, COALESCE(plays.performances,0) AS performances
+        FROM stations s JOIN licenses l ON l.id = s.license_key_id
+        LEFT JOIN station_metadata m ON m.station_uuid = s.uuid
+        LEFT JOIN sess ON sess.station_uuid = s.uuid LEFT JOIN plays ON plays.station_uuid = s.uuid
+       WHERE COALESCE(sess.sessions,0) > 0 OR COALESCE(plays.performances,0) > 0
+       ORDER BY listen_sec DESC, account`, p)).rows;
+
+    const byDay = (await pool.query(`
+      SELECT to_char(date_trunc('day', started_at),'YYYY-MM-DD') AS day,
+             COALESCE(SUM(duration_sec),0)::bigint AS listen_sec, COUNT(*)::int AS sessions
+        FROM listener_sessions WHERE ${sW} GROUP BY 1 ORDER BY 1`, p)).rows;
+
+    res.json({ from: r.from, to: r.to, totals, byAccount, byStation, byDay });
+  } catch (e) { console.error("[platform/rollup]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+// Per-performance detail across ALL stations for the range — the source rows the dashboard turns
+// into the ASCAP / BMI / standard CSV (same column formats as the desktop play log, but with the
+// REAL duration_ms, not a placeholder). Capped; `truncated` flags when the cap is hit.
+app.get("/api/platform/performances", requirePlatform, async (req, res) => {
+  try {
+    const r = validRange(req);
+    if (!r) return res.status(400).json({ error: "bad_range" });
+    const CAP = 100000;
+    const { rows } = await pool.query(
+      `SELECT ph.title, ph.artist, ph.duration_ms, ph.played_at, ph.category_code, ph.show_name,
+              l.email AS account, COALESCE(m.display_name, s.name) AS station
+         FROM station_play_history ph
+         JOIN stations s ON s.uuid = ph.station_uuid
+         JOIN licenses l ON l.id = s.license_key_id
+         LEFT JOIN station_metadata m ON m.station_uuid = s.uuid
+        WHERE ph.played_at >= $1::timestamptz AND ph.played_at < ($2::date + 1) AND COALESCE(ph.title,'') <> ''
+        ORDER BY ph.played_at
+        LIMIT ${CAP + 1}`,
+      [r.from, r.to]
+    );
+    const truncated = rows.length > CAP;
+    res.json({ from: r.from, to: r.to, truncated, performances: truncated ? rows.slice(0, CAP) : rows });
+  } catch (e) { console.error("[platform/performances]", e.message); res.status(500).json({ error: "server_error" }); }
+});
 // Never leak pin_hash to the client.
 function publicUser(u) {
   return {
