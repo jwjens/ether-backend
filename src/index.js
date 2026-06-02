@@ -497,6 +497,24 @@ async function initDB() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_listener_samples ON station_listener_samples (station_uuid, ts DESC)`);
 
+  // Per-session listening log (Phase 3c) — one row per completed listen, written on SSE disconnect.
+  // Powers the audience report: total sessions, unique listeners (anonymous lid), total listening
+  // hours (TLH), avg session length, tune-in-by-hour, and by country/state/city over any range.
+  // No IP / PII — only Cloudflare's country/region/city + a random browser-generated id.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS listener_sessions (
+      station_uuid TEXT NOT NULL REFERENCES stations(uuid) ON DELETE CASCADE,
+      started_at   TIMESTAMPTZ NOT NULL,
+      ended_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      duration_sec INTEGER NOT NULL DEFAULT 0,
+      cc           TEXT,
+      region       TEXT,
+      city         TEXT,
+      lid          TEXT
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_listener_sessions ON listener_sessions (station_uuid, started_at DESC)`);
+
   console.log("[DB] Schema ready");
 }
 
@@ -1191,9 +1209,61 @@ app.get("/api/account/station/:uuid/listeners", requireAuth, async (req, res) =>
     const peak = (await pool.query(`SELECT COALESCE(MAX(count),0)::int AS peak FROM station_listener_samples WHERE station_uuid = $1 AND ts >= ${since}`, [stationUuid])).rows[0].peak;
     const trend = (await pool.query(`SELECT to_char(date_trunc('hour', ts), 'YYYY-MM-DD HH24:00') AS hour, MAX(count)::int AS peak FROM station_listener_samples WHERE station_uuid = $1 AND ts >= ${since} GROUP BY 1 ORDER BY 1`, [stationUuid])).rows;
 
-    return res.json({ now, byCountry, peak, trend });
+    return res.json({ now, byCountry, byRegion, peak, trend });
   } catch (e) {
     console.error("[account/listeners]", e.message);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// Audience analytics (Phase 3c) — from the per-session log: total sessions, unique listeners
+// (anonymous lid), total listening hours (TLH), avg session length, listenership by day, tune-in by
+// hour-of-day, and by country/state/city. Plus peak concurrent + concurrent trend from samples.
+app.get("/api/account/station/:uuid/listenership", requireAuth, async (req, res) => {
+  try {
+    const stationUuid = req.params.uuid;
+    const { rows: own } = await pool.query(`SELECT 1 FROM stations WHERE uuid = $1 AND license_key_id = $2`, [stationUuid, req.auth.lk]);
+    if (own.length === 0) return res.status(404).json({ error: "station_not_found" });
+
+    const d = { "7d": 7, "30d": 30, "90d": 90, "all": null }[String(req.query.range || "30d")];
+    const days = d === undefined ? 30 : d;
+    const since = days ? `NOW() - INTERVAL '${days} days'` : `to_timestamp(0)`;
+    const W = `station_uuid = $1 AND started_at >= ${since}`;
+
+    const totals = (await pool.query(
+      `SELECT COUNT(*)::int AS sessions,
+              COUNT(DISTINCT NULLIF(lid,''))::int AS unique_listeners,
+              COALESCE(SUM(duration_sec),0)::bigint AS tlh_sec,
+              COALESCE(ROUND(AVG(duration_sec)),0)::int AS avg_sec
+       FROM listener_sessions WHERE ${W}`, [stationUuid])).rows[0];
+    const byDay = (await pool.query(
+      `SELECT to_char(date_trunc('day', started_at), 'YYYY-MM-DD') AS day, COUNT(*)::int AS sessions, COUNT(DISTINCT NULLIF(lid,''))::int AS unique
+       FROM listener_sessions WHERE ${W} GROUP BY 1 ORDER BY 1`, [stationUuid])).rows;
+    const byHour = (await pool.query(
+      `SELECT EXTRACT(HOUR FROM started_at)::int AS hour, COUNT(*)::int AS sessions
+       FROM listener_sessions WHERE ${W} GROUP BY 1 ORDER BY 1`, [stationUuid])).rows;
+    const byCountry = (await pool.query(
+      `SELECT cc, COUNT(*)::int AS sessions FROM listener_sessions WHERE ${W} AND COALESCE(cc,'') <> '' GROUP BY 1 ORDER BY 2 DESC LIMIT 25`, [stationUuid])).rows;
+    const byRegion = (await pool.query(
+      `SELECT region, cc, COUNT(*)::int AS sessions FROM listener_sessions WHERE ${W} AND COALESCE(region,'') <> '' GROUP BY 1,2 ORDER BY 3 DESC LIMIT 25`, [stationUuid])).rows;
+    const byCity = (await pool.query(
+      `SELECT city, cc, COUNT(*)::int AS sessions FROM listener_sessions WHERE ${W} AND COALESCE(city,'') <> '' GROUP BY 1,2 ORDER BY 3 DESC LIMIT 25`, [stationUuid])).rows;
+
+    const peakConcurrent = (await pool.query(`SELECT COALESCE(MAX(count),0)::int AS peak FROM station_listener_samples WHERE station_uuid = $1 AND ts >= ${since}`, [stationUuid])).rows[0].peak;
+    const concurrent = (await pool.query(`SELECT to_char(date_trunc('hour', ts), 'YYYY-MM-DD HH24:00') AS ts, MAX(count)::int AS count FROM station_listener_samples WHERE station_uuid = $1 AND ts >= ${since} GROUP BY 1 ORDER BY 1`, [stationUuid])).rows;
+
+    return res.json({
+      totals: {
+        sessions: totals.sessions,
+        unique: totals.unique_listeners,
+        tlhHours: Math.round(Number(totals.tlh_sec) / 360) / 10,
+        avgSessionSec: totals.avg_sec,
+        peakConcurrent,
+      },
+      byDay, byHour, byCountry, byRegion, byCity, concurrent,
+    });
+  } catch (e) {
+    console.error("[account/listenership]", e.message);
     return res.status(500).json({ error: "server_error" });
   }
 });
@@ -2426,12 +2496,14 @@ app.get("/public/station/:slug", async (req, res) => {
 // slugs get a stream; old/renamed slugs 404 (the client re-GETs to rediscover).
 app.get("/public/station/:slug/stream", async (req, res) => {
   const slug = String(req.params.slug || "").toLowerCase();
+  let stationUuid = null;
   try {
     const { rows } = await pool.query(
-      `SELECT 1 FROM station_metadata WHERE slug = $1 AND public_enabled = true LIMIT 1`,
+      `SELECT station_uuid FROM station_metadata WHERE slug = $1 AND public_enabled = true LIMIT 1`,
       [slug]
     );
     if (rows.length === 0) return res.status(404).json({ error: "not_found" });
+    stationUuid = rows[0].station_uuid;
   } catch (e) {
     console.error("[public/stream]", e.message);
     return res.status(500).json({ error: "server_error" });
@@ -2451,6 +2523,12 @@ app.get("/public/station/:slug/stream", async (req, res) => {
   // Cloudflare-derived region/state (e.g. "Texas"), reported by the listener page for the
   // dashboard's "Top states / regions" breakdown. Best-effort; "" if unknown.
   res._region = String(req.query.region || "").trim().slice(0, 60);
+  // City + an anonymous, browser-generated listener id (no PII) for unique-listener counts +
+  // the per-session log written on disconnect.
+  res._city = String(req.query.city || "").trim().slice(0, 80);
+  res._lid = String(req.query.lid || "").trim().slice(0, 40);
+  res._stationUuid = stationUuid;
+  res._connectedAt = Date.now();
   if (!streamClients.has(slug)) streamClients.set(slug, new Set());
   const clients = streamClients.get(slug);
   clients.add(res);
@@ -2464,6 +2542,15 @@ app.get("/public/station/:slug/stream", async (req, res) => {
     clearInterval(keepalive);
     clients.delete(res);
     if (clients.size === 0) streamClients.delete(slug);
+    // Log the completed listening session (powers the audience report: TLH, duration, tune-in, geo).
+    if (res._stationUuid) {
+      const durationSec = Math.max(0, Math.round((Date.now() - (res._connectedAt || Date.now())) / 1000));
+      pool.query(
+        `INSERT INTO listener_sessions (station_uuid, started_at, ended_at, duration_sec, cc, region, city, lid)
+         VALUES ($1, to_timestamp($2/1000.0), NOW(), $3, $4, $5, $6, $7)`,
+        [res._stationUuid, res._connectedAt || Date.now(), durationSec, res._cc || null, res._region || null, res._city || null, res._lid || null]
+      ).catch((e) => console.error("[listener_sessions]", e.message));
+    }
     console.log(`[public-stream] disconnected — slug=${slug} streams=${clients.size}`);
   });
 });
