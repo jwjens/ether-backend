@@ -500,6 +500,19 @@ async function initDB() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_listener_samples ON station_listener_samples (station_uuid, ts DESC)`);
 
+  // Phase 3 — true stream listener samples polled from each station's Icecast (status-json.xsl),
+  // sampled every 60s. Counts EVERY listener (web player + external apps), unlike the SSE samples
+  // above. Integrating these (Σ listeners × 1 min) gives Aggregate Tuning Hours (ATH) for royalty
+  // reporting — the defensible all-listener number.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS station_stream_samples (
+      station_uuid TEXT NOT NULL REFERENCES stations(uuid) ON DELETE CASCADE,
+      ts           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      listeners    INTEGER NOT NULL DEFAULT 0
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_stream_samples ON station_stream_samples (station_uuid, ts DESC)`);
+
   // Per-session listening log (Phase 3c) — one row per completed listen, written on SSE disconnect.
   // Powers the audience report: total sessions, unique listeners (anonymous lid), total listening
   // hours (TLH), avg session length, tune-in-by-hour, and by country/state/city over any range.
@@ -776,6 +789,31 @@ function validRange(req) {
   const re = /^\d{4}-\d{2}-\d{2}$/;
   return re.test(from) && re.test(to) ? { from, to } : null;
 }
+
+// Current listener count on a station's Icecast mount, via the public status-json.xsl. Returns the
+// integer count, or null if unreachable / unparseable (caller skips). 5s timeout; no creds needed.
+async function icecastListeners(streamUrl) {
+  try {
+    const u = new URL(streamUrl);
+    const mount = u.pathname;
+    const statusUrl = `${u.protocol}//${u.host}/status-json.xsl`;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5000);
+    let res;
+    try { res = await fetch(statusUrl, { signal: ctrl.signal }); } finally { clearTimeout(timer); }
+    if (!res || !res.ok) return null;
+    const j = await res.json();
+    let sources = j && j.icestats && j.icestats.source;
+    if (!sources) return null;
+    if (!Array.isArray(sources)) sources = [sources];
+    const match = sources.find((s) => {
+      try { return new URL(s.listenurl).pathname === mount; } catch { return String(s.listenurl || "").endsWith(mount); }
+    }) || (sources.length === 1 ? sources[0] : null);
+    if (!match) return null;
+    const n = Number(match.listeners);
+    return Number.isFinite(n) ? n : null;
+  } catch { return null; }
+}
 app.get("/api/platform/rollup", requirePlatform, async (req, res) => {
   try {
     const r = validRange(req);
@@ -783,12 +821,14 @@ app.get("/api/platform/rollup", requirePlatform, async (req, res) => {
     const p = [r.from, r.to];
     const sW = `started_at >= $1::timestamptz AND started_at < ($2::date + 1)`;
     const pW = `played_at  >= $1::timestamptz AND played_at  < ($2::date + 1)`;
+    const aW = `ts         >= $1::timestamptz AND ts         < ($2::date + 1)`;  // stream samples → ATH
 
     const totals = (await pool.query(`
       SELECT
         (SELECT COUNT(*)::int                          FROM listener_sessions   WHERE ${sW}) AS sessions,
         (SELECT COUNT(DISTINCT NULLIF(lid,''))::int    FROM listener_sessions   WHERE ${sW}) AS unique_listeners,
         (SELECT COALESCE(SUM(duration_sec),0)::bigint  FROM listener_sessions   WHERE ${sW}) AS listen_sec,
+        (SELECT COALESCE(SUM(listeners),0)::bigint     FROM station_stream_samples WHERE ${aW}) AS ath_min,
         (SELECT COUNT(*)::int                          FROM station_play_history WHERE ${pW}) AS performances`, p)).rows[0];
 
     const byAccount = (await pool.query(`
@@ -798,12 +838,16 @@ app.get("/api/platform/rollup", requirePlatform, async (req, res) => {
           FROM listener_sessions ls JOIN stations s ON s.uuid = ls.station_uuid WHERE ls.${sW} GROUP BY s.license_key_id),
       plays AS (
         SELECT s.license_key_id AS lk, COUNT(*)::int AS performances
-          FROM station_play_history ph JOIN stations s ON s.uuid = ph.station_uuid WHERE ph.${pW} GROUP BY s.license_key_id)
+          FROM station_play_history ph JOIN stations s ON s.uuid = ph.station_uuid WHERE ph.${pW} GROUP BY s.license_key_id),
+      ath AS (
+        SELECT s.license_key_id AS lk, COALESCE(SUM(ss.listeners),0)::bigint AS ath_min
+          FROM station_stream_samples ss JOIN stations s ON s.uuid = ss.station_uuid WHERE ss.${aW} GROUP BY s.license_key_id)
       SELECT l.id, l.email, l.plan,
              COALESCE(sess.sessions,0) AS sessions, COALESCE(sess.uniq,0) AS uniq,
-             COALESCE(sess.listen_sec,0) AS listen_sec, COALESCE(plays.performances,0) AS performances
-        FROM licenses l LEFT JOIN sess ON sess.lk = l.id LEFT JOIN plays ON plays.lk = l.id
-       WHERE COALESCE(sess.sessions,0) > 0 OR COALESCE(plays.performances,0) > 0
+             COALESCE(sess.listen_sec,0) AS listen_sec, COALESCE(ath.ath_min,0) AS ath_min,
+             COALESCE(plays.performances,0) AS performances
+        FROM licenses l LEFT JOIN sess ON sess.lk = l.id LEFT JOIN plays ON plays.lk = l.id LEFT JOIN ath ON ath.lk = l.id
+       WHERE COALESCE(sess.sessions,0) > 0 OR COALESCE(plays.performances,0) > 0 OR COALESCE(ath.ath_min,0) > 0
        ORDER BY listen_sec DESC, l.email`, p)).rows;
 
     const byStation = (await pool.query(`
@@ -811,14 +855,17 @@ app.get("/api/platform/rollup", requirePlatform, async (req, res) => {
         SELECT station_uuid, COUNT(*)::int AS sessions, COUNT(DISTINCT NULLIF(lid,''))::int AS uniq,
                COALESCE(SUM(duration_sec),0)::bigint AS listen_sec FROM listener_sessions WHERE ${sW} GROUP BY station_uuid),
       plays AS (
-        SELECT station_uuid, COUNT(*)::int AS performances FROM station_play_history WHERE ${pW} GROUP BY station_uuid)
+        SELECT station_uuid, COUNT(*)::int AS performances FROM station_play_history WHERE ${pW} GROUP BY station_uuid),
+      ath AS (
+        SELECT station_uuid, COALESCE(SUM(listeners),0)::bigint AS ath_min FROM station_stream_samples WHERE ${aW} GROUP BY station_uuid)
       SELECT s.uuid, s.name, l.email AS account, m.display_name,
              COALESCE(sess.sessions,0) AS sessions, COALESCE(sess.uniq,0) AS uniq,
-             COALESCE(sess.listen_sec,0) AS listen_sec, COALESCE(plays.performances,0) AS performances
+             COALESCE(sess.listen_sec,0) AS listen_sec, COALESCE(ath.ath_min,0) AS ath_min,
+             COALESCE(plays.performances,0) AS performances
         FROM stations s JOIN licenses l ON l.id = s.license_key_id
         LEFT JOIN station_metadata m ON m.station_uuid = s.uuid
-        LEFT JOIN sess ON sess.station_uuid = s.uuid LEFT JOIN plays ON plays.station_uuid = s.uuid
-       WHERE COALESCE(sess.sessions,0) > 0 OR COALESCE(plays.performances,0) > 0
+        LEFT JOIN sess ON sess.station_uuid = s.uuid LEFT JOIN plays ON plays.station_uuid = s.uuid LEFT JOIN ath ON ath.station_uuid = s.uuid
+       WHERE COALESCE(sess.sessions,0) > 0 OR COALESCE(plays.performances,0) > 0 OR COALESCE(ath.ath_min,0) > 0
        ORDER BY listen_sec DESC, account`, p)).rows;
 
     const byDay = (await pool.query(`
@@ -3297,6 +3344,21 @@ initDB().then(() => {
         if (count > 0) await pool.query(`INSERT INTO station_listener_samples (station_uuid, count) VALUES ($1, $2)`, [r.station_uuid, count]);
       }
     } catch (e) { console.warn("[listener-sample]", e.message); }
+  }, 60_000);
+
+  // Phase 3: sample TRUE stream listeners from each public station's Icecast every 60s → ATH.
+  // status-json.xsl is public (no creds); we match the source whose mount = the stream_url path.
+  // Best-effort: a station whose Icecast is unreachable / has status-json off is simply skipped.
+  setInterval(async () => {
+    try {
+      const { rows } = await pool.query(
+        `SELECT station_uuid, stream_url FROM station_metadata WHERE public_enabled = true AND COALESCE(stream_url,'') <> ''`
+      );
+      await Promise.allSettled(rows.map(async (r) => {
+        const n = await icecastListeners(r.stream_url);
+        if (n !== null) await pool.query(`INSERT INTO station_stream_samples (station_uuid, listeners) VALUES ($1, $2)`, [r.station_uuid, n]);
+      }));
+    } catch (e) { console.warn("[stream-sample]", e.message); }
   }, 60_000);
 }).catch(e => {
   console.error("[Ether] DB init failed:", e.message);
