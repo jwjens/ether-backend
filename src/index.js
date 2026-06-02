@@ -1172,15 +1172,18 @@ app.get("/api/account/station/:uuid/listeners", requireAuth, async (req, res) =>
 
     let now = 0;
     const ccMap = new Map();
+    const regionMap = new Map();   // "region|cc" → count (region scoped to its country)
     if (slug && streamClients.has(slug)) {
       for (const c of streamClients.get(slug)) {
         if (c.writableEnded) continue;
         now++;
         const cc = c._cc || "??";
         ccMap.set(cc, (ccMap.get(cc) || 0) + 1);
+        if (c._region) { const k = `${c._region}|${cc}`; regionMap.set(k, (regionMap.get(k) || 0) + 1); }
       }
     }
     const byCountry = [...ccMap.entries()].map(([cc, count]) => ({ cc, count })).sort((a, b) => b.count - a.count);
+    const byRegion = [...regionMap.entries()].map(([k, count]) => { const [region, cc] = k.split("|"); return { region, cc, count }; }).sort((a, b) => b.count - a.count);
 
     const d = { "7d": 7, "30d": 30, "90d": 90, "all": null }[String(req.query.range || "7d")];
     const days = d === undefined ? 7 : d;
@@ -2445,6 +2448,9 @@ app.get("/public/station/:slug/stream", async (req, res) => {
   // Cloudflare-derived visitor country (2-letter), reported by the listener page for
   // the dashboard's listeners-by-country map. Best-effort; "" if unknown.
   res._cc = String(req.query.cc || "").toUpperCase().replace(/[^A-Z]/g, "").slice(0, 2);
+  // Cloudflare-derived region/state (e.g. "Texas"), reported by the listener page for the
+  // dashboard's "Top states / regions" breakdown. Best-effort; "" if unknown.
+  res._region = String(req.query.region || "").trim().slice(0, 60);
   if (!streamClients.has(slug)) streamClients.set(slug, new Set());
   const clients = streamClients.get(slug);
   clients.add(res);
