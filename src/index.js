@@ -702,6 +702,70 @@ function requireAuthAdmin(req, res, next) {
     next();
   });
 }
+
+// ── Platform owner (Ether Technologies) ───────────────────────────────────
+// A single platform-operator login that sees ALL accounts/stations — for the company's
+// own cross-account analytics + BMI/ASCAP/SoundExchange listening-hour reporting. Gated by
+// a shared secret in ETHER_PLATFORM_SECRET (set in Railway env, never in code); exchanged
+// for a JWT carrying { platform:true }. requirePlatform admits only that token.
+const PLATFORM_SECRET = process.env.ETHER_PLATFORM_SECRET || "";
+function requirePlatform(req, res, next) {
+  requireAuth(req, res, () => {
+    if (!req.auth.platform) return res.status(403).json({ error: "platform_required" });
+    next();
+  });
+}
+// An account token must OWN the station; a platform token may read ANY station's reports.
+async function stationReadable(req, stationUuid) {
+  if (req.auth && req.auth.platform) {
+    const { rows } = await pool.query(`SELECT 1 FROM stations WHERE uuid = $1`, [stationUuid]);
+    return rows.length > 0;
+  }
+  const { rows } = await pool.query(`SELECT 1 FROM stations WHERE uuid = $1 AND license_key_id = $2`, [stationUuid, req.auth.lk]);
+  return rows.length > 0;
+}
+
+app.post("/api/platform/login", (req, res) => {
+  if (!PLATFORM_SECRET) return res.status(503).json({ error: "platform_not_configured" });
+  const secret = String(req.body?.secret || "");
+  const a = Buffer.from(secret), b = Buffer.from(PLATFORM_SECRET);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).json({ error: "invalid_secret" });
+  const token = jwt.sign({ platform: true }, JWT_SECRET, { expiresIn: JWT_TTL });
+  res.json({ token });
+});
+
+// All accounts (= licenses) with their station counts — the top-level folder list.
+app.get("/api/platform/accounts", requirePlatform, async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT l.id, l.email, l.plan, l.active, l.created_at, COUNT(s.uuid)::int AS stations
+         FROM licenses l
+         LEFT JOIN stations s ON s.license_key_id = l.id
+        GROUP BY l.id
+        ORDER BY l.email`
+    );
+    res.json({ accounts: rows });
+  } catch (e) { console.error("[platform/accounts]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+// Stations under one account.
+app.get("/api/platform/accounts/:id/stations", requirePlatform, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ error: "bad_id" });
+    const acct = (await pool.query(`SELECT id, email, plan, active, created_at FROM licenses WHERE id = $1`, [id])).rows[0];
+    if (!acct) return res.status(404).json({ error: "account_not_found" });
+    const { rows } = await pool.query(
+      `SELECT s.uuid, s.name, s.created_at, m.slug, m.display_name, m.public_enabled
+         FROM stations s
+         LEFT JOIN station_metadata m ON m.station_uuid = s.uuid
+        WHERE s.license_key_id = $1
+        ORDER BY COALESCE(m.display_name, s.name)`,
+      [id]
+    );
+    res.json({ account: acct, stations: rows });
+  } catch (e) { console.error("[platform/stations]", e.message); res.status(500).json({ error: "server_error" }); }
+});
 // Never leak pin_hash to the client.
 function publicUser(u) {
   return {
@@ -1153,10 +1217,7 @@ app.post("/api/account/play-history", async (req, res) => {
 app.get("/api/account/station/:uuid/analytics", requireAuth, async (req, res) => {
   try {
     const stationUuid = req.params.uuid;
-    const { rows: own } = await pool.query(
-      `SELECT 1 FROM stations WHERE uuid = $1 AND license_key_id = $2`, [stationUuid, req.auth.lk]
-    );
-    if (own.length === 0) return res.status(404).json({ error: "station_not_found" });
+    if (!(await stationReadable(req, stationUuid))) return res.status(404).json({ error: "station_not_found" });
 
     const days = { "7d": 7, "30d": 30, "90d": 90, "all": null }[String(req.query.range || "30d")];
     const rangeParam = days === undefined ? "30d" : String(req.query.range || "30d");
@@ -1187,10 +1248,7 @@ app.get("/api/account/station/:uuid/analytics", requireAuth, async (req, res) =>
 app.get("/api/account/station/:uuid/affidavit", requireAuth, async (req, res) => {
   try {
     const stationUuid = req.params.uuid;
-    const { rows: own } = await pool.query(
-      `SELECT 1 FROM stations WHERE uuid = $1 AND license_key_id = $2`, [stationUuid, req.auth.lk]
-    );
-    if (own.length === 0) return res.status(404).json({ error: "station_not_found" });
+    if (!(await stationReadable(req, stationUuid))) return res.status(404).json({ error: "station_not_found" });
 
     const days = { "7d": 7, "30d": 30, "90d": 90, "all": null }[String(req.query.range || "30d")];
     const rangeParam = days === undefined ? "30d" : String(req.query.range || "30d");
@@ -1267,8 +1325,7 @@ app.get("/api/account/station/:uuid/affidavit", requireAuth, async (req, res) =>
 app.get("/api/account/station/:uuid/listeners", requireAuth, async (req, res) => {
   try {
     const stationUuid = req.params.uuid;
-    const { rows: own } = await pool.query(`SELECT 1 FROM stations WHERE uuid = $1 AND license_key_id = $2`, [stationUuid, req.auth.lk]);
-    if (own.length === 0) return res.status(404).json({ error: "station_not_found" });
+    if (!(await stationReadable(req, stationUuid))) return res.status(404).json({ error: "station_not_found" });
     const meta = (await pool.query(`SELECT slug FROM station_metadata WHERE station_uuid = $1`, [stationUuid])).rows[0];
     const slug = meta?.slug || null;
 
@@ -1306,8 +1363,7 @@ app.get("/api/account/station/:uuid/listeners", requireAuth, async (req, res) =>
 app.get("/api/account/station/:uuid/listenership", requireAuth, async (req, res) => {
   try {
     const stationUuid = req.params.uuid;
-    const { rows: own } = await pool.query(`SELECT 1 FROM stations WHERE uuid = $1 AND license_key_id = $2`, [stationUuid, req.auth.lk]);
-    if (own.length === 0) return res.status(404).json({ error: "station_not_found" });
+    if (!(await stationReadable(req, stationUuid))) return res.status(404).json({ error: "station_not_found" });
 
     const d = { "7d": 7, "30d": 30, "90d": 90, "all": null }[String(req.query.range || "30d")];
     const days = d === undefined ? 30 : d;
