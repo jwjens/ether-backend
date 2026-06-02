@@ -318,6 +318,11 @@ async function initDB() {
   // ADD COLUMN IF NOT EXISTS backfills existing rows with the declared DEFAULT.
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT true`);
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS last_validated TIMESTAMPTZ`);
+  // bcrypt key storage (key_prefix + key_hash) — queried by lookupLicense / minted by /admin/issue,
+  // /api/platform/licenses and the Stripe webhook, but never actually created on the table before.
+  await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS key_prefix TEXT`);
+  await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS key_hash   TEXT`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_licenses_key_prefix ON licenses(key_prefix)`);
   // Allow NULL license_key for new bcrypt-format rows (key stored as key_hash + key_prefix only).
   // Idempotent: no-op if column is already nullable.
   await pool.query(`ALTER TABLE licenses ALTER COLUMN license_key DROP NOT NULL`);
@@ -855,7 +860,7 @@ app.post("/api/platform/licenses", requirePlatform, async (req, res) => {
     );
     if (req.body?.send_email) { try { await sendLicenseEmail(email, key, plan); } catch (e) { console.error("[Email]", e.message); } }
     res.json({ ok: true, id: rows[0].id, license_key: key, plan, email });
-  } catch (e) { console.error("[platform/licenses:create]", e.message); res.status(500).json({ error: "server_error" }); }
+  } catch (e) { console.error("[platform/licenses:create]", e.message); res.status(500).json({ error: "server_error", detail: e.message }); }
 });
 
 // Network analytics rollup across ALL stations for a custom date range (the report you submit
