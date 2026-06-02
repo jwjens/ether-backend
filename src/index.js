@@ -827,6 +827,37 @@ app.delete("/api/platform/accounts/:id", requirePlatform, async (req, res) => {
   } finally { client.release(); }
 });
 
+// ── License management (platform owner) — mint comp/promo keys + assign a tier, no payment ──
+const LICENSE_TIERS = ["free", "pro", "pro_lifetime", "station", "station_lifetime", "operator"];
+app.get("/api/platform/licenses", requirePlatform, async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT l.id, l.email, l.plan, l.active, l.created_at, l.key_prefix, l.last_validated,
+              (SELECT COUNT(*)::int FROM stations s WHERE s.license_key_id = l.id) AS stations,
+              (SELECT COUNT(*)::int FROM license_activations a
+                 WHERE (a.license_key = l.license_key OR a.license_key = 'lic-' || l.id) AND a.deauthorized_at IS NULL) AS activations
+         FROM licenses l ORDER BY l.created_at DESC`
+    );
+    res.json({ tiers: LICENSE_TIERS, licenses: rows });
+  } catch (e) { console.error("[platform/licenses]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+app.post("/api/platform/licenses", requirePlatform, async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const plan = String(req.body?.plan || "");
+    if (!email) return res.status(400).json({ error: "missing_email" });
+    if (!VALID_PLANS.has(plan)) return res.status(400).json({ error: "invalid_plan", detail: `plan must be one of: ${[...VALID_PLANS].join(", ")}` });
+    const key = generateLicenseKey(plan);
+    const { rows } = await pool.query(
+      `INSERT INTO licenses (email, plan, key_prefix, key_hash) VALUES ($1,$2,$3,$4) RETURNING id`,
+      [email, plan, key.slice(0, 12), await bcrypt.hash(key, 12)]
+    );
+    if (req.body?.send_email) { try { await sendLicenseEmail(email, key, plan); } catch (e) { console.error("[Email]", e.message); } }
+    res.json({ ok: true, id: rows[0].id, license_key: key, plan, email });
+  } catch (e) { console.error("[platform/licenses:create]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
 // Network analytics rollup across ALL stations for a custom date range (the report you submit
 // to ASCAP / BMI / SoundExchange — it's just the aggregated analytics). from/to = YYYY-MM-DD,
 // inclusive of the `to` day. Listening hours (ATH) from listener_sessions; performances (plays)
@@ -1793,15 +1824,15 @@ app.post("/validate", async (req, res) => {
     if (!machine_id?.trim())
       return res.status(400).json({ valid: false, error: "Missing machine_id — please update to the latest Ether version." });
 
-    // 1. Verify license exists and is active for this email
-    const { rows } = await pool.query(
-      "SELECT * FROM licenses WHERE license_key=$1 AND email=$2 AND active=true",
-      [license_key.trim(), email.trim().toLowerCase()]
-    );
-    if (!rows.length)
+    // 1. Verify license exists + is active (bcrypt OR legacy plaintext key), then match email.
+    //    Uses lookupLicense so admin/platform-issued keys (bcrypt key_hash, no plaintext) activate.
+    const license = await lookupLicense(license_key.trim());
+    if (!license || (license.email || "").toLowerCase() !== email.trim().toLowerCase())
       return res.json({ valid: false, error: "License key not found or does not match this email." });
 
-    const license = rows[0];
+    // Activation rows key on the plaintext key for legacy licenses; bcrypt licenses have none, so
+    // use a stable per-license token instead (license.id is the PK → guaranteed unique).
+    const activationKey = license.license_key || `lic-${license.id}`;
     const limit = PLAN_MACHINE_LIMITS[license.plan] ?? 1;
     const ip = (req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress || "").trim();
 
@@ -1810,7 +1841,7 @@ app.post("/validate", async (req, res) => {
     //    who deauthorizes a machine then re-installs on it should reactivate cleanly.
     const { rows: existingActivations } = await pool.query(
       "SELECT * FROM license_activations WHERE license_key=$1 AND machine_id=$2 AND deauthorized_at IS NULL",
-      [license.license_key, machine_id.trim()]
+      [activationKey, machine_id.trim()]
     );
 
     if (existingActivations.length) {
@@ -1823,7 +1854,7 @@ app.post("/validate", async (req, res) => {
       // 3. Not activated here — check if we have room. Only active (non-deauthorized) seats count.
       const { rows: activeList } = await pool.query(
         "SELECT machine_id, machine_name, os, activated_at, last_seen FROM license_activations WHERE license_key=$1 AND deauthorized_at IS NULL ORDER BY last_seen DESC",
-        [license.license_key]
+        [activationKey]
       );
 
       if (activeList.length >= limit) {
@@ -1851,9 +1882,9 @@ app.post("/validate", async (req, res) => {
            ip_address      = EXCLUDED.ip_address,
            last_seen       = NOW(),
            deauthorized_at = NULL`,
-        [license.license_key, machine_id.trim(), machine_name || null, os || null, ip]
+        [activationKey, machine_id.trim(), machine_name || null, os || null, ip]
       );
-      console.log(`[Activation] ${license.license_key} → ${machine_name || machine_id.slice(0, 8)} (${activeList.length + 1}/${limit})`);
+      console.log(`[Activation] ${activationKey} → ${machine_name || machine_id.slice(0, 8)} (${activeList.length + 1}/${limit})`);
     }
 
     await pool.query("UPDATE licenses SET last_validated=NOW() WHERE id=$1", [license.id]);
@@ -1862,7 +1893,7 @@ app.post("/validate", async (req, res) => {
       plan: license.plan,
       email: license.email,
       machine_limit: limit,
-      license_key: license.license_key,
+      license_key: license.license_key || license_key.trim(),
     });
   } catch (e) {
     console.error("[/validate]", e.message);
