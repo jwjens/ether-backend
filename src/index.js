@@ -1842,11 +1842,12 @@ app.get("/health", (req, res) =>
 
 app.post("/validate", async (req, res) => {
   try {
-    const { license_key, email, machine_id, machine_name, os } = req.body;
+    const { license_key, email, machine_name, os } = req.body;
     if (!license_key?.trim() || !email?.trim())
       return res.status(400).json({ valid: false, error: "Missing license_key or email" });
-    if (!machine_id?.trim())
-      return res.status(400).json({ valid: false, error: "Missing machine_id — please update to the latest Ether version." });
+    // machine_id is optional for backward-compat — builds that don't send one still activate, on a
+    // stable per-email seat. (Newer builds send a real machine_id for proper per-machine seats.)
+    const mid = req.body.machine_id?.trim() || `legacy-${email.trim().toLowerCase()}`;
 
     // 1. Verify license exists + is active (bcrypt OR legacy plaintext key), then match email.
     //    Uses lookupLicense so admin/platform-issued keys (bcrypt key_hash, no plaintext) activate.
@@ -1865,7 +1866,7 @@ app.post("/validate", async (req, res) => {
     //    who deauthorizes a machine then re-installs on it should reactivate cleanly.
     const { rows: existingActivations } = await pool.query(
       "SELECT * FROM license_activations WHERE license_key=$1 AND machine_id=$2 AND deauthorized_at IS NULL",
-      [activationKey, machine_id.trim()]
+      [activationKey, mid]
     );
 
     if (existingActivations.length) {
@@ -1906,9 +1907,9 @@ app.post("/validate", async (req, res) => {
            ip_address      = EXCLUDED.ip_address,
            last_seen       = NOW(),
            deauthorized_at = NULL`,
-        [activationKey, machine_id.trim(), machine_name || null, os || null, ip]
+        [activationKey, mid, machine_name || null, os || null, ip]
       );
-      console.log(`[Activation] ${activationKey} → ${machine_name || machine_id.slice(0, 8)} (${activeList.length + 1}/${limit})`);
+      console.log(`[Activation] ${activationKey} → ${machine_name || mid.slice(0, 8)} (${activeList.length + 1}/${limit})`);
     }
 
     await pool.query("UPDATE licenses SET last_validated=NOW() WHERE id=$1", [license.id]);
