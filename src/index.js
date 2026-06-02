@@ -611,7 +611,9 @@ const PLAN_STATION_LIMITS = {
 };
 
 function generateLicenseKey(plan) {
-  const prefix = plan === "station" ? "ETH-STN" : "ETH-PRO";
+  const prefix = (plan === "station" || plan === "station_lifetime") ? "ETH-STN"
+               : plan === "operator" ? "ETH-ENT"
+               : "ETH-PRO";   // pro / pro_lifetime / free
   const rand   = crypto.randomBytes(12).toString("hex").toUpperCase();
   return `${prefix}-${rand.slice(0,4)}-${rand.slice(4,8)}-${rand.slice(8,12)}`;
 }
@@ -864,6 +866,20 @@ app.post("/api/platform/licenses", requirePlatform, async (req, res) => {
     if (req.body?.send_email) { try { await sendLicenseEmail(email, key, plan); } catch (e) { console.error("[Email]", e.message); } }
     res.json({ ok: true, id: rows[0].id, license_key: key, plan, email });
   } catch (e) { console.error("[platform/licenses:create]", e.message); res.status(500).json({ error: "server_error", detail: e.message }); }
+});
+
+// Change a license's tier in place — the existing key keeps working; the desktop picks up the new
+// plan on its next /validate (relaunch). Lets you fix a wrong tier without reissuing a key.
+app.patch("/api/platform/licenses/:id", requirePlatform, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const plan = String(req.body?.plan || "");
+    if (!id) return res.status(400).json({ error: "bad_id" });
+    if (!VALID_PLANS.has(plan)) return res.status(400).json({ error: "invalid_plan" });
+    const r = await pool.query(`UPDATE licenses SET plan = $1 WHERE id = $2 RETURNING id`, [plan, id]);
+    if (!r.rowCount) return res.status(404).json({ error: "not_found" });
+    res.json({ ok: true, id, plan });
+  } catch (e) { console.error("[platform/licenses:update]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
 // Network analytics rollup across ALL stations for a custom date range (the report you submit
