@@ -2555,6 +2555,33 @@ app.get("/public/station/:slug/stream", async (req, res) => {
   });
 });
 
+// Public "recently played" — last N aired songs, for embeddable website widgets.
+// Same slug resolution + open CORS as the now-playing endpoints. Returns titled rows
+// newest-first; the embed widget renders them with album art.
+app.get("/public/station/:slug/recent-plays", async (req, res) => {
+  const slug = String(req.params.slug || "").toLowerCase();
+  const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 12));
+  try {
+    const { rows: sm } = await pool.query(
+      `SELECT station_uuid FROM station_metadata WHERE slug = $1 AND public_enabled = true LIMIT 1`,
+      [slug]
+    );
+    if (sm.length === 0) return res.status(404).json({ error: "not_found" });
+    const { rows } = await pool.query(
+      `SELECT title, artist, played_at
+         FROM station_play_history
+        WHERE station_uuid = $1 AND COALESCE(title, '') <> ''
+        ORDER BY played_at DESC
+        LIMIT $2`,
+      [sm[0].station_uuid, limit]
+    );
+    res.json({ plays: rows.map((r) => ({ title: r.title, artist: r.artist || null, played_at: r.played_at })) });
+  } catch (e) {
+    console.error("[public/recent-plays]", e.message);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
 // ── Station metadata — public listener page config (Phase 2) ───────────────
 // Authorize by license + ownership: resolve the license key, then confirm the
 // :uuid station belongs to it. No plan gate here — a valid owner can configure;
