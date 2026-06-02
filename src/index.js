@@ -776,6 +776,20 @@ app.post("/api/platform/login", (req, res) => {
   res.json({ token });
 });
 
+// Platform-gated config diagnostic — exposes only suffixes/booleans, never full secrets.
+app.get("/api/platform/diag", requirePlatform, (_req, res) => {
+  const k = process.env.STRIPE_SECRET_KEY || "";
+  res.json({
+    stripe_key_set: !!k,
+    stripe_key_suffix: k ? k.slice(-4) : null,
+    stripe_key_mode: k.startsWith("sk_live") ? "live" : k.startsWith("sk_test") ? "test" : "unknown",
+    price_pro_set: !!process.env.PRICE_PRO,
+    price_station_set: !!process.env.PRICE_STATION,
+    stripe_webhook_secret_set: !!process.env.STRIPE_WEBHOOK_SECRET,
+    account_app_url: process.env.ACCOUNT_APP_URL || null,
+  });
+});
+
 // All accounts (= licenses) with their station counts — the top-level folder list.
 app.get("/api/platform/accounts", requirePlatform, async (_req, res) => {
   try {
