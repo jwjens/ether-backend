@@ -854,7 +854,7 @@ app.post("/api/platform/licenses", requirePlatform, async (req, res) => {
   try {
     const email = String(req.body?.email || "").trim().toLowerCase();
     const plan = String(req.body?.plan || "");
-    if (!email) return res.status(400).json({ error: "missing_email" });
+    if (!EMAIL_RE.test(email)) return res.status(400).json({ error: "invalid_email" });
     if (!VALID_PLANS.has(plan)) return res.status(400).json({ error: "invalid_plan", detail: `plan must be one of: ${[...VALID_PLANS].join(", ")}` });
     const key = generateLicenseKey(plan);
     const { rows } = await pool.query(
