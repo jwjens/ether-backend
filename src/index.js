@@ -780,6 +780,34 @@ app.get("/api/platform/accounts/:id/stations", requirePlatform, async (req, res)
   } catch (e) { console.error("[platform/stations]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
+// Delete an account (license) and everything under it — platform-owner only. Transactional, in
+// FK-safe order: station_* data cascades when its station is deleted; stations + mutations reference
+// licenses WITHOUT cascade so they're removed first; account_users cascades on the license delete.
+app.delete("/api/platform/accounts/:id", requirePlatform, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!id) return res.status(400).json({ error: "bad_id" });
+  const client = await pool.connect();
+  try {
+    const { rows: lic } = await client.query(`SELECT license_key, email FROM licenses WHERE id = $1`, [id]);
+    if (!lic.length) { client.release(); return res.status(404).json({ error: "account_not_found" }); }
+    const key = lic[0].license_key;
+    await client.query("BEGIN");
+    await client.query(`DELETE FROM mutations WHERE license_key_id = $1`, [id]);   // FK, no cascade
+    await client.query(`DELETE FROM stations  WHERE license_key_id = $1`, [id]);   // cascades all station_* data
+    if (key) {
+      await client.query(`DELETE FROM license_activations WHERE license_key = $1`, [key]);
+      await client.query(`DELETE FROM backups            WHERE license_key = $1`, [key]);
+    }
+    const del = await client.query(`DELETE FROM licenses WHERE id = $1`, [id]);    // cascades account_users
+    await client.query("COMMIT");
+    res.json({ ok: true, deleted: del.rowCount, email: lic[0].email });
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("[platform/delete-account]", e.message);
+    res.status(500).json({ error: "server_error", detail: e.message });
+  } finally { client.release(); }
+});
+
 // Network analytics rollup across ALL stations for a custom date range (the report you submit
 // to ASCAP / BMI / SoundExchange — it's just the aggregated analytics). from/to = YYYY-MM-DD,
 // inclusive of the `to` day. Listening hours (ATH) from listener_sessions; performances (plays)
