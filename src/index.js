@@ -480,11 +480,14 @@ async function initDB() {
       show_name     TEXT,
       duration_ms   INTEGER,
       played_at     TIMESTAMPTZ,
+      file_path     TEXT,
       created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       PRIMARY KEY (station_uuid, row_uuid)
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_play_history_station_time ON station_play_history (station_uuid, played_at DESC)`);
+  // file_path (the aired audio) is the affidavit join key — add to pre-existing deployments.
+  await pool.query(`ALTER TABLE station_play_history ADD COLUMN IF NOT EXISTS file_path TEXT`);
 
   // Periodic snapshots of concurrent listener count per station (Phase 3b) for peak /
   // trend. Live "now" + by-country come from in-memory SSE connections; this is history.
@@ -1126,12 +1129,12 @@ app.post("/api/account/play-history", async (req, res) => {
       const tuples = [];
       let p = 2;
       for (const r of chunk) {
-        tuples.push(`($1,$${p},$${p + 1},$${p + 2},$${p + 3},$${p + 4},$${p + 5},to_timestamp($${p + 6}))`);
-        params.push(String(r.row_uuid), r.title ?? null, r.artist ?? null, r.category_code ?? null, r.show_name ?? null, r.duration_ms ?? null, Number(r.played_at) || 0);
-        p += 7;
+        tuples.push(`($1,$${p},$${p + 1},$${p + 2},$${p + 3},$${p + 4},$${p + 5},to_timestamp($${p + 6}),$${p + 7})`);
+        params.push(String(r.row_uuid), r.title ?? null, r.artist ?? null, r.category_code ?? null, r.show_name ?? null, r.duration_ms ?? null, Number(r.played_at) || 0, r.file_path ?? null);
+        p += 8;
       }
       const result = await pool.query(
-        `INSERT INTO station_play_history (station_uuid, row_uuid, title, artist, category_code, show_name, duration_ms, played_at)
+        `INSERT INTO station_play_history (station_uuid, row_uuid, title, artist, category_code, show_name, duration_ms, played_at, file_path)
          VALUES ${tuples.join(",")}
          ON CONFLICT (station_uuid, row_uuid) DO NOTHING`,
         params
@@ -1172,6 +1175,87 @@ app.get("/api/account/station/:uuid/analytics", requireAuth, async (req, res) =>
     return res.json({ range: rangeParam, totals, topSongs, topArtists, byCategory, byDay, recent });
   } catch (e) {
     console.error("[account/analytics]", e.message);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// Advertiser affidavit / proof-of-performance (JWT). Attributes aired spots to advertisers
+// by joining play history to the mirrored `spots` table on file_path (a spot's stable
+// identity — survives a title rename). Songs carry a file_path too but don't match a spot
+// row, so they're naturally excluded. range = 7d|30d|90d|all (default 30d); optional
+// ?advertiser= narrows to one client.
+app.get("/api/account/station/:uuid/affidavit", requireAuth, async (req, res) => {
+  try {
+    const stationUuid = req.params.uuid;
+    const { rows: own } = await pool.query(
+      `SELECT 1 FROM stations WHERE uuid = $1 AND license_key_id = $2`, [stationUuid, req.auth.lk]
+    );
+    if (own.length === 0) return res.status(404).json({ error: "station_not_found" });
+
+    const days = { "7d": 7, "30d": 30, "90d": 90, "all": null }[String(req.query.range || "30d")];
+    const rangeParam = days === undefined ? "30d" : String(req.query.range || "30d");
+    const d = days === undefined ? 30 : days; // whitelisted int or null — no injection
+    const since = d ? `NOW() - INTERVAL '${d} days'` : `to_timestamp(0)`;
+
+    const advFilter = req.query.advertiser ? String(req.query.advertiser).slice(0, 200) : null;
+    const a = [stationUuid];
+    let advClause = "";
+    if (advFilter) { a.push(advFilter); advClause = ` AND s.advertiser = $2`; }
+
+    // Mirrored spots (keyed by file_path) ⋈ aired plays in range.
+    const base = `
+      WITH spot AS (
+        SELECT payload->>'file_path' AS file_path,
+               NULLIF(TRIM(payload->>'advertiser'), '') AS advertiser,
+               payload->>'title'     AS spot_title,
+               NULLIF(payload->>'isci_code','')  AS isci_code,
+               NULLIF(payload->>'spot_type','')  AS spot_type,
+               NULLIF(payload->>'length_sec','') AS length_sec
+        FROM station_cc_data
+        WHERE station_uuid = $1 AND table_name = 'spots' AND deleted_at IS NULL
+          AND COALESCE(payload->>'file_path','') <> ''
+      ),
+      aired AS (
+        SELECT file_path, played_at
+        FROM station_play_history
+        WHERE station_uuid = $1 AND played_at >= ${since} AND COALESCE(file_path,'') <> ''
+      ),
+      joined AS (
+        SELECT s.advertiser, s.spot_title, s.isci_code, s.spot_type, s.length_sec, ap.played_at
+        FROM aired ap JOIN spot s ON s.file_path = ap.file_path
+        WHERE TRUE${advClause}
+      )`;
+
+    const totals = (await pool.query(`${base}
+      SELECT COUNT(*)::int AS spins,
+             COUNT(DISTINCT advertiser)::int AS advertisers,
+             COUNT(DISTINCT spot_title)::int AS spots
+      FROM joined`, a)).rows[0];
+
+    const byAdvertiser = (await pool.query(`${base}
+      SELECT COALESCE(advertiser,'(unattributed)') AS advertiser,
+             COUNT(*)::int AS spins,
+             COUNT(DISTINCT spot_title)::int AS spots
+      FROM joined GROUP BY 1 ORDER BY spins DESC, advertiser`, a)).rows;
+
+    const bySpot = (await pool.query(`${base}
+      SELECT COALESCE(advertiser,'(unattributed)') AS advertiser,
+             spot_title AS title, isci_code, spot_type, length_sec,
+             COUNT(*)::int AS spins,
+             to_char(MIN(played_at),'YYYY-MM-DD HH24:MI') AS first_aired,
+             to_char(MAX(played_at),'YYYY-MM-DD HH24:MI') AS last_aired
+      FROM joined GROUP BY advertiser, spot_title, isci_code, spot_type, length_sec
+      ORDER BY advertiser, spins DESC`, a)).rows;
+
+    const asRun = (await pool.query(`${base}
+      SELECT COALESCE(advertiser,'(unattributed)') AS advertiser,
+             spot_title AS title, isci_code,
+             to_char(played_at,'YYYY-MM-DD HH24:MI:SS') AS played_at
+      FROM joined ORDER BY played_at DESC LIMIT 2000`, a)).rows;
+
+    return res.json({ range: rangeParam, advertiser: advFilter, totals, byAdvertiser, bySpot, asRun });
+  } catch (e) {
+    console.error("[account/affidavit]", e.message);
     return res.status(500).json({ error: "server_error" });
   }
 });
