@@ -314,6 +314,10 @@ async function initDB() {
     )
   `);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS name TEXT`);
+  // Email marketing opt-out (CAN-SPAM). Each user gets a stable, opaque unsubscribe token.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS marketing_opt_out BOOLEAN NOT NULL DEFAULT false`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS unsubscribe_token TEXT`);
+  await pool.query(`UPDATE users SET unsubscribe_token = md5(random()::text || clock_timestamp()::text || id::text) WHERE unsubscribe_token IS NULL`);
   await pool.query(`DELETE FROM guest_presence WHERE joined_at < NOW() - INTERVAL '24 hours'`).catch(() => {});
 
   // Schema migrations: original DB used status TEXT and lacked active/last_validated.
@@ -628,43 +632,70 @@ function escapeHtml(s) {
     .replace(/"/g, "&quot;");
 }
 
+// ── Email theme — light card, Ether purple (#8868D8) accent, CAN-SPAM footer ──
+const COMPANY_NAME = "Ether Technologies";
+const SUPPORT_EMAIL = "support@ether-technologies.com";
+// Physical postal address for CAN-SPAM. Set COMPANY_ADDRESS in Railway once a real
+// mailing address exists; required before sending any marketing (non-transactional) email.
+const COMPANY_ADDRESS = process.env.COMPANY_ADDRESS || "Mailing address available on request";
+const API_PUBLIC_URL = (process.env.API_PUBLIC_URL || "https://ether-backend-production.up.railway.app").replace(/\/$/, "");
+
+function emailButton(button) {
+  if (!button) return "";
+  return `<table role="presentation" cellpadding="0" cellspacing="0" style="margin:22px 0 6px"><tr><td style="border-radius:8px;background:#8868D8">
+      <a href="${button.url}" style="display:inline-block;padding:13px 26px;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;border-radius:8px">${button.label}</a>
+    </td></tr></table>`;
+}
+
+// Wrap body HTML in the standard light card + footer. `unsubUrl` (when present) adds the
+// CAN-SPAM unsubscribe link; transactional mail (verify / reset / receipts) passes none.
+function emailShell({ heading, bodyHtml, button, unsubUrl }) {
+  const year = new Date().getFullYear();
+  const sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f4f7">
+  <div style="display:none;max-height:0;overflow:hidden;opacity:0">${heading}</div>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f7;padding:32px 16px">
+    <tr><td align="center">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;background:#ffffff;border:1px solid #ececf1;border-radius:14px">
+        <tr><td style="padding:32px 32px 30px;font-family:${sans}">
+          <div style="font-size:19px;font-weight:800;color:#8868D8;letter-spacing:-0.02em;margin-bottom:26px">&#x2B22; Ether</div>
+          <h1 style="font-size:20px;font-weight:700;color:#18181b;margin:0 0 14px;letter-spacing:-0.01em">${heading}</h1>
+          <div style="font-size:15px;line-height:1.65;color:#52525b">${bodyHtml}</div>
+          ${emailButton(button)}
+        </td></tr>
+      </table>
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:480px">
+        <tr><td style="padding:20px 32px;font-family:${sans};font-size:12px;line-height:1.7;color:#a1a1aa">
+          <div style="color:#71717a;font-weight:600;margin-bottom:3px">${COMPANY_NAME}</div>
+          ${COMPANY_ADDRESS} &middot; <a href="mailto:${SUPPORT_EMAIL}" style="color:#8868D8;text-decoration:none">${SUPPORT_EMAIL}</a>${unsubUrl ? ` &middot; <a href="${unsubUrl}" style="color:#a1a1aa;text-decoration:underline">Unsubscribe</a>` : ""}
+          <div style="margin-top:8px;color:#c4c4cc">&copy; ${year} ${COMPANY_NAME}. You're receiving this because you have an Ether account.</div>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>`;
+}
+
 async function sendLicenseEmail(email, licenseKey, plan) {
   const label = plan === "station" ? "Network" : "Studio";
   const price = plan === "station" ? "$79/mo" : "$19/mo";
   const from  = process.env.FROM_EMAIL || "noreply@ether-technologies.com";
-
-  const { error } = await resend.emails.send({
-    from, to: email,
-    subject: `Your Ether Technologies ${label} License Key`,
-    html: `
-<div style="font-family:system-ui,sans-serif;max-width:560px;margin:0 auto;padding:32px 24px;background:#0d0d18;color:#f0f0f8;border-radius:12px">
-  <div style="font-size:22px;font-weight:900;color:#22d3ee;letter-spacing:-0.5px;margin-bottom:3px">Ether Technologies</div>
-  <div style="font-size:10px;letter-spacing:2.5px;text-transform:uppercase;color:#475569;margin-bottom:28px">Broadcast Automation Platform</div>
-  <p style="font-size:16px;font-weight:700;margin-bottom:10px">Your ${label} License Key</p>
-  <p style="color:#94a3b8;font-size:13px;line-height:1.7;margin-bottom:24px">
-    Thank you for subscribing to Ether ${label} (${price}). Save this email — you'll need the key if you reinstall.
-  </p>
-  <div style="background:#0f172a;border:1px solid #1e293b;border-radius:10px;padding:22px;margin-bottom:24px;text-align:center">
-    <div style="font-size:9px;color:#475569;letter-spacing:2px;text-transform:uppercase;margin-bottom:10px">License Key</div>
-    <div style="font-family:'Courier New',monospace;font-size:19px;font-weight:800;color:#22d3ee;letter-spacing:2.5px">${licenseKey}</div>
-  </div>
-  <div style="background:#0a1520;border-radius:8px;padding:16px 18px;margin-bottom:22px">
-    <div style="font-size:12px;font-weight:700;color:#e2e8f0;margin-bottom:10px">How to activate</div>
-    <ol style="color:#94a3b8;font-size:12px;line-height:2.2;padding-left:18px;margin:0">
-      <li>Open <strong style="color:#f0f0f8">Ether</strong> on your computer</li>
-      <li>Click the <strong style="color:#f0f0f8">Studio</strong> button in the top toolbar</li>
-      <li>Click <strong style="color:#f0f0f8">Enter License Key</strong></li>
+  const bodyHtml = `
+    <p style="margin:0 0 18px">Thanks for subscribing to <strong style="color:#18181b">Ether ${label}</strong> (${price}). Save this email — you'll need the key if you ever reinstall.</p>
+    <div style="background:#f7f6fc;border:1px solid #e6e1f7;border-radius:10px;padding:18px;text-align:center;margin:0 0 20px">
+      <div style="font-size:10px;color:#8a8a96;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:8px">License Key</div>
+      <div style="font-family:'Courier New',monospace;font-size:18px;font-weight:800;color:#6040C0;letter-spacing:2px">${escapeHtml(licenseKey)}</div>
+    </div>
+    <div style="font-size:13px;font-weight:700;color:#18181b;margin:0 0 8px">How to activate</div>
+    <ol style="color:#52525b;font-size:13px;line-height:2;padding-left:20px;margin:0">
+      <li>Open <strong style="color:#18181b">Ether</strong> on your computer</li>
+      <li>Click the <strong style="color:#18181b">Studio</strong> button in the top toolbar</li>
+      <li>Click <strong style="color:#18181b">Enter License Key</strong></li>
       <li>Enter your email and the key above</li>
-    </ol>
-  </div>
-  <p style="color:#475569;font-size:11px">
-    Questions? <a href="mailto:support@ether-technologies.com" style="color:#22d3ee;text-decoration:none">support@ether-technologies.com</a>
-  </p>
-  <div style="margin-top:28px;padding-top:14px;border-top:1px solid #1e293b;font-size:10px;color:#334155">
-    Ether Technologies · ether-technologies.com · ${new Date().getFullYear()}
-  </div>
-</div>`,
-  });
+    </ol>`;
+  const html = emailShell({ heading: `Your ${label} license key`, bodyHtml, button: null, unsubUrl: null });
+  const { error } = await resend.emails.send({ from, to: email, subject: `Your Ether ${label} License Key`, html });
   if (error) throw new Error(JSON.stringify(error));
 }
 
@@ -1113,17 +1144,14 @@ async function userEntitlement(u) {
 function publicAccount(u, ent) {
   return { id: u.id, name: u.name || null, email: u.email, email_verified: !!u.email_verified, trial_ends_at: u.trial_ends_at, entitlement: ent };
 }
-async function sendAccountEmail(to, subject, heading, body, button) {
+async function sendAccountEmail(to, subject, heading, body, button, opts = {}) {
   const from = process.env.FROM_EMAIL || "noreply@ether-technologies.com";
+  const unsubUrl = opts.unsubscribeToken ? `${API_PUBLIC_URL}/u/${opts.unsubscribeToken}` : null;
+  const html = emailShell({ heading, bodyHtml: `<p style="margin:0">${body}</p>`, button, unsubUrl });
+  // RFC 8058 one-click unsubscribe for clients that surface it (Gmail/Apple Mail).
+  const headers = unsubUrl ? { "List-Unsubscribe": `<${unsubUrl}>`, "List-Unsubscribe-Post": "List-Unsubscribe=One-Click" } : undefined;
   try {
-    await resend.emails.send({ from, to, subject, html: `
-<div style="font-family:system-ui,sans-serif;max-width:560px;margin:0 auto;padding:32px 24px;background:#0d0d18;color:#f0f0f8;border-radius:12px">
-  <div style="font-size:22px;font-weight:900;color:#22d3ee;margin-bottom:24px">Ether Technologies</div>
-  <p style="font-size:16px;font-weight:700;margin:0 0 10px">${heading}</p>
-  <div style="color:#94a3b8;font-size:13px;line-height:1.7;margin-bottom:22px">${body}</div>
-  ${button ? `<a href="${button.url}" style="display:inline-block;background:#22d3ee;color:#04222a;font-weight:800;padding:12px 22px;border-radius:8px;text-decoration:none">${button.label}</a>` : ""}
-  <div style="margin-top:28px;padding-top:14px;border-top:1px solid #1e293b;font-size:10px;color:#334155">Ether Technologies · ether-technologies.com · ${new Date().getFullYear()}</div>
-</div>` });
+    await resend.emails.send(headers ? { from, to, subject, html, headers } : { from, to, subject, html });
   } catch (e) { console.error("[account-email]", e.message); }
 }
 
@@ -1138,15 +1166,18 @@ app.post("/api/user/signup", authLimiter, async (req, res) => {
     if ((await pool.query(`SELECT 1 FROM users WHERE email = $1`, [email])).rows[0]) return res.status(409).json({ error: "email_taken" });
     const hash = await bcrypt.hash(password, 12);
     const verifyToken = crypto.randomBytes(24).toString("base64url");
+    const unsubToken = crypto.randomBytes(18).toString("base64url");
     const { rows } = await pool.query(
-      `INSERT INTO users (name, email, password_hash, verify_token, trial_ends_at)
-       VALUES ($1, $2, $3, $4, NOW() + INTERVAL '${TRIAL_DAYS} days') RETURNING *`,
-      [name, email, hash, verifyToken]
+      `INSERT INTO users (name, email, password_hash, verify_token, unsubscribe_token, trial_ends_at)
+       VALUES ($1, $2, $3, $4, $5, NOW() + INTERVAL '${TRIAL_DAYS} days') RETURNING *`,
+      [name, email, hash, verifyToken, unsubToken]
     );
     const u = rows[0];
-    sendAccountEmail(email, "Verify your Ether account", "Welcome to Ether",
-      `Your ${TRIAL_DAYS}-day free trial has started. Confirm your email to secure your account.`,
-      { url: `${ACCOUNT_APP_URL}/verify?token=${verifyToken}`, label: "Verify email" });
+    const hi = name ? `Welcome, ${escapeHtml(name.split(/\s+/)[0])}` : "Welcome to Ether";
+    sendAccountEmail(email, "Verify your Ether account", hi,
+      `Your ${TRIAL_DAYS}-day free trial has started. Confirm your email address to secure your account and keep your station online.`,
+      { url: `${ACCOUNT_APP_URL}/verify?token=${verifyToken}`, label: "Verify email" },
+      { unsubscribeToken: unsubToken });
     res.json({ token: signUserToken(u), account: publicAccount(u, await userEntitlement(u)) });
   } catch (e) { console.error("[user/signup]", e.message); res.status(500).json({ error: "server_error" }); }
 });
@@ -1206,6 +1237,24 @@ app.post("/api/user/reset", authLimiter, async (req, res) => {
     await pool.query(`UPDATE users SET password_hash = $1, reset_token = NULL, reset_expires = NULL WHERE id = $2`, [hash, u.id]);
     res.json({ ok: true });
   } catch (e) { console.error("[user/reset]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+// Email unsubscribe (CAN-SPAM). GET = human clicks the footer link → opt out, land on the
+// confirmation page. POST = RFC 8058 one-click (List-Unsubscribe-Post). Idempotent; never
+// reveals whether the token matched. Opting out stops marketing only — transactional mail
+// (verify / password reset / billing receipts) still sends.
+async function applyUnsubscribe(token) {
+  if (!token) return;
+  try { await pool.query(`UPDATE users SET marketing_opt_out = true WHERE unsubscribe_token = $1`, [token]); }
+  catch (e) { console.error("[unsubscribe]", e.message); }
+}
+app.get("/u/:token", async (req, res) => {
+  await applyUnsubscribe(req.params.token);
+  res.redirect(302, `${ACCOUNT_APP_URL.replace(/\/$/, "")}/unsubscribe?done=1`);
+});
+app.post("/u/:token", async (req, res) => {
+  await applyUnsubscribe(req.params.token);
+  res.status(200).json({ ok: true });
 });
 
 // Start a Stripe Checkout to convert a trial into a paid subscription. Ties the session to the
