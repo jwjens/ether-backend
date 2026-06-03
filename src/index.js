@@ -776,18 +776,34 @@ app.post("/api/platform/login", (req, res) => {
   res.json({ token });
 });
 
-// Platform-gated config diagnostic — exposes only suffixes/booleans, never full secrets.
-app.get("/api/platform/diag", requirePlatform, (_req, res) => {
+// Platform-gated config diagnostic. Price IDs aren't secrets; the secret key is never returned.
+// Asks Stripe (with the configured key) which ACCOUNT it belongs to + lists the real prices it
+// can see, so we can see exactly why a checkout price isn't found.
+app.get("/api/platform/diag", requirePlatform, async (_req, res) => {
   const k = process.env.STRIPE_SECRET_KEY || "";
-  res.json({
-    stripe_key_set: !!k,
+  const out = {
     stripe_key_suffix: k ? k.slice(-4) : null,
     stripe_key_mode: k.startsWith("sk_live") ? "live" : k.startsWith("sk_test") ? "test" : "unknown",
-    price_pro_set: !!process.env.PRICE_PRO,
-    price_station_set: !!process.env.PRICE_STATION,
+    price_pro_env: process.env.PRICE_PRO || null,
+    price_station_env: process.env.PRICE_STATION || null,
     stripe_webhook_secret_set: !!process.env.STRIPE_WEBHOOK_SECRET,
     account_app_url: process.env.ACCOUNT_APP_URL || null,
-  });
+  };
+  if (k) {
+    try {
+      const stripe = require("stripe")(k);
+      const acct = await stripe.accounts.retrieve();
+      out.key_belongs_to_account = acct.id;
+      const prices = await stripe.prices.list({ limit: 20, expand: ["data.product"] });
+      out.prices_visible_to_key = prices.data.map((p) => ({
+        id: p.id, amount: p.unit_amount, interval: p.recurring?.interval || "one-time",
+        product: (p.product && p.product.name) || String(p.product), active: p.active,
+      }));
+      out.price_pro_found = prices.data.some((p) => p.id === process.env.PRICE_PRO);
+      out.price_station_found = prices.data.some((p) => p.id === process.env.PRICE_STATION);
+    } catch (e) { out.stripe_error = e.message; }
+  }
+  res.json(out);
 });
 
 // All accounts (= licenses) with their station counts — the top-level folder list.
