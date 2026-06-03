@@ -324,6 +324,8 @@ async function initDB() {
   // ADD COLUMN IF NOT EXISTS backfills existing rows with the declared DEFAULT.
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT true`);
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS last_validated TIMESTAMPTZ`);
+  // Trial licenses expire (expires_at = the user's trial_ends_at); paid licenses leave it NULL = perpetual.
+  await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ`);
   // bcrypt key storage (key_prefix + key_hash) — queried by lookupLicense / minted by /admin/issue,
   // /api/platform/licenses and the Stripe webhook, but never actually created on the table before.
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS key_prefix TEXT`);
@@ -715,6 +717,8 @@ async function lookupLicense(rawKey) {
     [prefix, rawKey]
   ).catch(() => ({ rows: [] }));
   for (const row of rows) {
+    // Expired trial license → treat as no match (paid licenses have expires_at = NULL, always pass).
+    if (row.expires_at && new Date(row.expires_at).getTime() < Date.now()) continue;
     if (row.key_hash != null) {
       if (await bcrypt.compare(rawKey, row.key_hash)) return row;
     } else if (rawKey === row.license_key) {
@@ -1255,6 +1259,79 @@ app.get("/u/:token", async (req, res) => {
 app.post("/u/:token", async (req, res) => {
   await applyUnsubscribe(req.params.token);
   res.status(200).json({ ok: true });
+});
+
+// Desktop activation bridge — the desktop signs in with the web account's email + password instead
+// of pasting a key. We authenticate, resolve the license matching the user's entitlement (their paid
+// license, or a Network trial license that expires with the trial), register THIS machine as a seat,
+// and return the key + plan so the desktop activates through its normal plan_tier path. trial_ends_at
+// lets the desktop run the Adobe-style end-of-trial gate (Subscribe, or continue on free Solo).
+app.post("/api/user/desktop-activate", authLimiter, async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const password = String(req.body?.password || "");
+    const u = (await pool.query(`SELECT * FROM users WHERE email = $1`, [email])).rows[0];
+    if (!u || !(await bcrypt.compare(password, u.password_hash))) return res.status(401).json({ error: "invalid_credentials" });
+
+    const ent = await userEntitlement(u);
+    if (ent.status === "expired" || ent.status === "none")
+      return res.status(403).json({ error: "trial_expired", message: "Your free trial has ended. Subscribe to activate Ether, or continue on the free Solo plan." });
+
+    // Resolve the license to activate: the user's paid license if linked, else an existing/new
+    // Network trial license tied to this email (plaintext key so we can always hand it back).
+    let license = null;
+    if (u.license_key_id)
+      license = (await pool.query(`SELECT * FROM licenses WHERE id = $1 AND active = true`, [u.license_key_id])).rows[0] || null;
+    if (!license) {
+      license = (await pool.query(
+        `SELECT * FROM licenses WHERE email = $1 AND expires_at IS NOT NULL AND active = true ORDER BY id DESC LIMIT 1`, [email]
+      )).rows[0] || null;
+      if (!license) {
+        const rawKey = generateLicenseKey("station");
+        license = (await pool.query(
+          `INSERT INTO licenses (email, plan, license_key, key_prefix, expires_at, active)
+           VALUES ($1, 'station', $2, $3, $4, true) RETURNING *`,
+          [email, rawKey, rawKey.slice(0, 12), u.trial_ends_at]
+        )).rows[0];
+      }
+      await pool.query(`UPDATE users SET license_key_id = $1 WHERE id = $2`, [license.id, u.id]);
+    }
+
+    // Register this machine as a seat (mirrors /validate). Trial keys store a plaintext license_key.
+    const activationKey = license.license_key || `lic-${license.id}`;
+    const limit = PLAN_MACHINE_LIMITS[license.plan] ?? 1;
+    const mid = String(req.body.machine_id || "").trim() || `acct-${u.id}`;
+    const ip = (req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress || "").trim();
+    const existing = await pool.query(
+      `SELECT id FROM license_activations WHERE license_key=$1 AND machine_id=$2 AND deauthorized_at IS NULL`, [activationKey, mid]
+    );
+    if (existing.rows.length) {
+      await pool.query(`UPDATE license_activations SET last_seen=NOW(), ip_address=$1 WHERE id=$2`, [ip, existing.rows[0].id]);
+    } else {
+      const { rows: active } = await pool.query(
+        `SELECT machine_id, machine_name, os, activated_at, last_seen FROM license_activations WHERE license_key=$1 AND deauthorized_at IS NULL ORDER BY last_seen DESC`, [activationKey]
+      );
+      if (active.length >= limit)
+        return res.status(403).json({ error: "activation_limit_reached", message: `This account is already active on ${active.length} of ${limit} machines. Deactivate one to sign in here.`, limit, activations: active });
+      await pool.query(
+        `INSERT INTO license_activations (license_key, machine_id, machine_name, os, ip_address)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (license_key, machine_id) DO UPDATE SET machine_name=EXCLUDED.machine_name, os=EXCLUDED.os, ip_address=EXCLUDED.ip_address, last_seen=NOW(), deauthorized_at=NULL`,
+        [activationKey, mid, req.body.machine_name || null, req.body.os || null, ip]
+      );
+    }
+    await pool.query(`UPDATE licenses SET last_validated=NOW() WHERE id=$1`, [license.id]);
+
+    res.json({
+      ok: true,
+      plan: license.plan,
+      email: u.email,
+      name: u.name || null,
+      license_key: license.license_key || null,   // trial keys are plaintext; paid bcrypt keys omit it
+      trial: ent.status === "trial",
+      trial_ends_at: ent.status === "trial" ? u.trial_ends_at : null,
+    });
+  } catch (e) { console.error("[user/desktop-activate]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
 // Start a Stripe Checkout to convert a trial into a paid subscription. Ties the session to the
