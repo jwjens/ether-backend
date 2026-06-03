@@ -300,6 +300,7 @@ async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id              SERIAL PRIMARY KEY,
+      name            TEXT,
       email           TEXT NOT NULL UNIQUE,
       password_hash   TEXT NOT NULL,
       email_verified  BOOLEAN NOT NULL DEFAULT false,
@@ -312,6 +313,7 @@ async function initDB() {
       last_login_at   TIMESTAMPTZ
     )
   `);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS name TEXT`);
   await pool.query(`DELETE FROM guest_presence WHERE joined_at < NOW() - INTERVAL '24 hours'`).catch(() => {});
 
   // Schema migrations: original DB used status TEXT and lacked active/last_validated.
@@ -806,6 +808,31 @@ app.get("/api/platform/diag", requirePlatform, async (_req, res) => {
   res.json(out);
 });
 
+// One-click "download the latest Ether installer" — resolves the newest GitHub release asset for
+// the OS and 302-redirects to it, so the link is always current (filenames are versioned).
+// os = mac | windows | linux. Cached 5 min to respect GitHub's unauthenticated rate limit.
+let _relCache = { at: 0, assets: null };
+async function latestEtherAssets() {
+  if (_relCache.assets && Date.now() - _relCache.at < 300000) return _relCache.assets;
+  const r = await fetch("https://api.github.com/repos/jwjens/ether/releases/latest", { headers: { "User-Agent": "ether-backend", "Accept": "application/vnd.github+json" } });
+  if (!r.ok) throw new Error("github " + r.status);
+  const j = await r.json();
+  _relCache = { at: Date.now(), assets: j.assets || [] };
+  return _relCache.assets;
+}
+app.get("/download/:os", async (req, res) => {
+  try {
+    const os = String(req.params.os || "").toLowerCase();
+    const a = (await latestEtherAssets()).filter((x) => !x.name.endsWith(".blockmap"));
+    let pick;
+    if (os === "windows" || os === "win") pick = a.find((x) => x.name.endsWith(".exe"));
+    else if (os === "mac" || os === "macos") pick = a.find((x) => x.name.endsWith(".dmg") && !x.name.includes("arm64")) || a.find((x) => x.name.endsWith(".dmg"));
+    else if (os === "linux") pick = a.find((x) => x.name.endsWith(".AppImage"));
+    if (!pick) return res.status(404).json({ error: "no_installer_for_os" });
+    res.redirect(302, pick.browser_download_url);
+  } catch (e) { console.error("[download]", e.message); res.status(502).json({ error: "download_unavailable" }); }
+});
+
 // All accounts (= licenses) with their station counts — the top-level folder list.
 app.get("/api/platform/accounts", requirePlatform, async (_req, res) => {
   try {
@@ -1084,7 +1111,7 @@ async function userEntitlement(u) {
   return { status: "none", plan: null, trial_days_left: 0 };
 }
 function publicAccount(u, ent) {
-  return { id: u.id, email: u.email, email_verified: !!u.email_verified, trial_ends_at: u.trial_ends_at, entitlement: ent };
+  return { id: u.id, name: u.name || null, email: u.email, email_verified: !!u.email_verified, trial_ends_at: u.trial_ends_at, entitlement: ent };
 }
 async function sendAccountEmail(to, subject, heading, body, button) {
   const from = process.env.FROM_EMAIL || "noreply@ether-technologies.com";
@@ -1105,15 +1132,16 @@ app.post("/api/user/signup", authLimiter, async (req, res) => {
   try {
     const email = String(req.body?.email || "").trim().toLowerCase();
     const password = String(req.body?.password || "");
+    const name = String(req.body?.name || "").trim().slice(0, 80) || null;
     if (!EMAIL_RE.test(email)) return res.status(400).json({ error: "invalid_email" });
     if (password.length < 8) return res.status(400).json({ error: "weak_password" });
     if ((await pool.query(`SELECT 1 FROM users WHERE email = $1`, [email])).rows[0]) return res.status(409).json({ error: "email_taken" });
     const hash = await bcrypt.hash(password, 12);
     const verifyToken = crypto.randomBytes(24).toString("base64url");
     const { rows } = await pool.query(
-      `INSERT INTO users (email, password_hash, verify_token, trial_ends_at)
-       VALUES ($1, $2, $3, NOW() + INTERVAL '${TRIAL_DAYS} days') RETURNING *`,
-      [email, hash, verifyToken]
+      `INSERT INTO users (name, email, password_hash, verify_token, trial_ends_at)
+       VALUES ($1, $2, $3, $4, NOW() + INTERVAL '${TRIAL_DAYS} days') RETURNING *`,
+      [name, email, hash, verifyToken]
     );
     const u = rows[0];
     sendAccountEmail(email, "Verify your Ether account", "Welcome to Ether",
