@@ -915,6 +915,7 @@ app.delete("/api/platform/accounts/:id", requirePlatform, async (req, res) => {
     await client.query("BEGIN");
     await client.query(`DELETE FROM mutations WHERE license_key_id = $1`, [id]);   // FK, no cascade
     await client.query(`DELETE FROM stations  WHERE license_key_id = $1`, [id]);   // cascades all station_* data
+    await client.query(`DELETE FROM users     WHERE license_key_id = $1`, [id]);   // account holder (signup) — FK, no cascade; nothing references users
     if (key) {
       await client.query(`DELETE FROM license_activations WHERE license_key = $1`, [key]);
       await client.query(`DELETE FROM backups            WHERE license_key = $1`, [key]);
