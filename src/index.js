@@ -3009,6 +3009,10 @@ app.post("/account/devices", async (req, res) => {
     if (!rawKey) return res.status(400).json({ error: "missing_fields", detail: "license_key is required" });
     const license = await lookupLicense(rawKey);
     if (!license) return res.status(401).json({ error: "invalid_license_key" });
+    // Multi-Device Sync is Network-tier only.
+    if (!["station", "station_lifetime", "operator"].includes(license.plan)) {
+      return res.status(403).json({ error: "network_plan_required", detail: "Multi-Device Sync requires the Network plan." });
+    }
     const activationKey = license.license_key || `lic-${license.id}`;
     const { rows } = await pool.query(
       `SELECT machine_id, machine_name, os, activated_at, last_seen
