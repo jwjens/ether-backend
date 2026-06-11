@@ -3000,6 +3000,30 @@ app.post("/backup/download-url", async (req, res) => {
   }
 });
 
+// POST /account/devices — list the machines (seats) registered to this account, for the
+// Multi-Device Sync clarity panel. Each row: machine_id, machine_name, os, activated_at,
+// last_seen. The desktop marks which one is "this machine" by machine_id (= client_id).
+app.post("/account/devices", async (req, res) => {
+  try {
+    const rawKey = (req.body || {}).license_key?.trim();
+    if (!rawKey) return res.status(400).json({ error: "missing_fields", detail: "license_key is required" });
+    const license = await lookupLicense(rawKey);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+    const activationKey = license.license_key || `lic-${license.id}`;
+    const { rows } = await pool.query(
+      `SELECT machine_id, machine_name, os, activated_at, last_seen
+         FROM license_activations
+        WHERE license_key = $1 AND deauthorized_at IS NULL
+        ORDER BY last_seen DESC`, [activationKey]
+    );
+    const limit = PLAN_MACHINE_LIMITS[license.plan] ?? 1;
+    res.json({ devices: rows, limit, plan: license.plan });
+  } catch (e) {
+    console.error("[/account/devices]", e.message);
+    res.status(500).json({ error: "internal", detail: e.message });
+  }
+});
+
 // ── Admin endpoints ───────────────────────────────────────────
 
 app.get("/admin/licenses", requireAdmin, async (req, res) => {
