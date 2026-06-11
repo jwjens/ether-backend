@@ -2954,6 +2954,52 @@ app.post("/backup/upload-url", async (req, res) => {
   }
 });
 
+// POST /backup/download-url — signs a GET URL for the account's LATEST gzipped DB
+// backup. Mirror of /backup/upload-url. Used by a NEW install to restore the full
+// openair.db from the cloud (install a station from your account).
+//
+//   POST { license_key } → { db_signed_url, key, timestamp, expires_at }
+//
+// Backups live at ${license.id}/backups/${timestamp}.db.gz — the timestamp names
+// sort lexically = chronologically, so the max key is the newest backup.
+app.post("/backup/download-url", async (req, res) => {
+  try {
+    const rawKey = (req.body || {}).license_key?.trim();
+    if (!rawKey) return res.status(400).json({ error: "missing_fields", detail: "license_key is required" });
+
+    const license = await lookupLicense(rawKey);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+
+    const r2 = getR2Client();
+    if (!r2) return res.status(503).json({ error: "r2_not_configured", detail: "Backend R2 credentials not set" });
+
+    const { ListObjectsV2Command } = require("@aws-sdk/client-s3");
+    const prefix = `${license.id}/backups/`;
+    const listed = await r2.send(new ListObjectsV2Command({ Bucket: R2_BUCKET, Prefix: prefix }));
+    const dbKeys = (listed.Contents || []).map(o => o.Key).filter(k => k.endsWith(".db.gz")).sort();
+    if (dbKeys.length === 0) {
+      return res.status(404).json({ error: "no_backup", detail: "No DB backup found for this account" });
+    }
+    const latestKey = dbKeys[dbKeys.length - 1];
+    const timestamp = latestKey.slice(prefix.length, -".db.gz".length);
+    const expiresInSeconds = 15 * 60;
+
+    let dbSignedUrl;
+    try { dbSignedUrl = await signR2GetUrl(latestKey, expiresInSeconds); }
+    catch (e) {
+      console.error("[/backup/download-url] signing failed:", e.message);
+      return res.status(500).json({ error: "signing_failed", detail: e.message });
+    }
+
+    const expiresAt = new Date(Date.now() + expiresInSeconds * 1000).toISOString();
+    console.log(`[Backup/DownloadURL] license:${license.id} key:${latestKey} (15m)`);
+    res.json({ db_signed_url: dbSignedUrl, key: latestKey, timestamp, expires_at: expiresAt });
+  } catch (e) {
+    console.error("[/backup/download-url]", e.message);
+    res.status(500).json({ error: "internal", detail: e.message });
+  }
+});
+
 // ── Admin endpoints ───────────────────────────────────────────
 
 app.get("/admin/licenses", requireAdmin, async (req, res) => {
