@@ -452,6 +452,9 @@ async function initDB() {
   // CREATE edit) because station_metadata already exists on Railway — CREATE
   // TABLE IF NOT EXISTS is a no-op there and would never add the column.
   await pool.query(`ALTER TABLE station_metadata ADD COLUMN IF NOT EXISTS stream_url TEXT`);
+  // Ethercast directory category — 'music' | 'talk' | 'sports' | null. Drives the
+  // hub's Music/Talk/Sports tabs. Operator sets it in the station settings.
+  await pool.query(`ALTER TABLE station_metadata ADD COLUMN IF NOT EXISTS category TEXT`);
 
   // ── Control Center / Multi-Tenant dashboard (Roadmap Item 5, Phase 1) ──────
   // Per-LICENSE human operators that can sign into app.ether-technologies.com.
@@ -3320,7 +3323,7 @@ app.get("/public/stations", async (_req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT m.slug, m.display_name, m.logo_url, m.color_primary, m.color_secondary,
-              m.description,
+              m.description, m.category,
               n.title, n.artist, n.art_url,
               (n.playing = true AND n.updated_at > NOW() - INTERVAL '5 minutes') AS live
        FROM station_metadata m
@@ -3337,6 +3340,7 @@ app.get("/public/stations", async (_req, res) => {
         color_primary: r.color_primary || null,
         color_secondary: r.color_secondary || null,
         description: r.description || null,
+        category: r.category || null,
         live: !!r.live,
         now_playing: r.live ? { title: r.title, artist: r.artist, art_url: r.art_url || null } : null,
       })),
@@ -3528,7 +3532,7 @@ app.get("/api/station/:uuid/metadata", async (req, res) => {
       return res.json({
         station_uuid: owned.stationUuid, slug: null, display_name: null, logo_url: null,
         color_primary: null, color_secondary: null, description: null, socials: {},
-        stream_url: null, public_enabled: false,
+        stream_url: null, category: null, public_enabled: false,
       });
     }
     res.json(rows[0]);
@@ -3574,17 +3578,20 @@ app.post("/api/station/:uuid/metadata", async (req, res) => {
     }
 
     const socials = (b.socials && typeof b.socials === "object" && !Array.isArray(b.socials)) ? b.socials : {};
+    // Ethercast category: only the known tabs, else null (no category).
+    const CATEGORIES = ["music", "talk", "sports"];
+    const category = CATEGORIES.includes(String(b.category)) ? String(b.category) : null;
     const { rows } = await pool.query(
       `INSERT INTO station_metadata
-         (station_uuid, slug, display_name, logo_url, color_primary, color_secondary, description, socials, public_enabled, stream_url, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, NOW())
+         (station_uuid, slug, display_name, logo_url, color_primary, color_secondary, description, socials, public_enabled, stream_url, category, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, NOW())
        ON CONFLICT (station_uuid) DO UPDATE SET
          slug=$2, display_name=$3, logo_url=$4, color_primary=$5, color_secondary=$6,
-         description=$7, socials=$8, public_enabled=$9, stream_url=$10, updated_at=NOW()
+         description=$7, socials=$8, public_enabled=$9, stream_url=$10, category=$11, updated_at=NOW()
        RETURNING *`,
       [uuid, slug, b.display_name ?? null, b.logo_url ?? null, b.color_primary ?? null,
        b.color_secondary ?? null, b.description ?? null, JSON.stringify(socials), !!b.public_enabled,
-       b.stream_url ?? null]
+       b.stream_url ?? null, category]
     );
     res.json(rows[0]);
   } catch (e) {
