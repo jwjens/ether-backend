@@ -933,20 +933,33 @@ app.delete("/api/platform/accounts/:id", requirePlatform, async (req, res) => {
   } finally { client.release(); }
 });
 
-// Reset a desktop account's password by email — platform-owner only. Recovery path
-// ("in case something happens"): set the password directly so the operator can sign into the
-// desktop with it, no email round-trip. 404 if no account exists for that address.
+// Reset the password of the login account associated with a license (or by email) — platform-owner
+// only. Recovery path ("in case something happens"). The login lives in `users`, tied to a license by
+// license_key_id; we resolve the user by accountId (the license) FIRST, then by the license's email,
+// then by a directly-supplied email, so clicking the account in the dashboard always finds its login.
 app.post("/api/platform/users/reset-password", requirePlatform, async (req, res) => {
   try {
-    const email = String(req.body?.email || "").trim().toLowerCase();
     const password = String(req.body?.password || "");
-    if (!EMAIL_RE.test(email)) return res.status(400).json({ error: "invalid_email" });
-    if (password.length < 8)   return res.status(400).json({ error: "weak_password" });
-    const u = (await pool.query(`SELECT id FROM users WHERE email = $1`, [email])).rows[0];
-    if (!u) return res.status(404).json({ error: "account_not_found" });
+    if (password.length < 8) return res.status(400).json({ error: "weak_password" });
+    const accountId = parseInt(req.body?.accountId, 10) || null;
+    const email = String(req.body?.email || "").trim().toLowerCase();
+
+    let u = null;
+    if (accountId) {
+      // The login account linked to this license.
+      u = (await pool.query(`SELECT id, email FROM users WHERE license_key_id = $1 ORDER BY id LIMIT 1`, [accountId])).rows[0] || null;
+      // Else a user whose email matches the license's email.
+      if (!u) {
+        const lic = (await pool.query(`SELECT email FROM licenses WHERE id = $1`, [accountId])).rows[0];
+        if (lic?.email) u = (await pool.query(`SELECT id, email FROM users WHERE email = $1`, [String(lic.email).trim().toLowerCase()])).rows[0] || null;
+      }
+    }
+    if (!u && email) u = (await pool.query(`SELECT id, email FROM users WHERE email = $1`, [email])).rows[0] || null;
+
+    if (!u) return res.status(404).json({ error: "no_login_account" });
     const hash = await bcrypt.hash(password, 12);
     await pool.query(`UPDATE users SET password_hash = $1, reset_token = NULL, reset_expires = NULL WHERE id = $2`, [hash, u.id]);
-    res.json({ ok: true, email });
+    res.json({ ok: true, email: u.email });
   } catch (e) { console.error("[platform/reset-password]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
