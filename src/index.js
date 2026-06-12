@@ -930,6 +930,28 @@ app.delete("/api/platform/accounts/:id", requirePlatform, async (req, res) => {
   } finally { client.release(); }
 });
 
+// Delete a single station and everything under it — platform-owner only. The stations row delete
+// cascades all station_* data via FK ON DELETE CASCADE; we also purge that station's mutation-log
+// rows so a stale desktop re-sync can't resurrect it.
+app.delete("/api/platform/stations/:uuid", requirePlatform, async (req, res) => {
+  const uuid = String(req.params.uuid || "");
+  if (!uuid) return res.status(400).json({ error: "bad_uuid" });
+  const client = await pool.connect();
+  try {
+    const { rows } = await client.query(`SELECT name FROM stations WHERE uuid = $1`, [uuid]);
+    if (!rows.length) { client.release(); return res.status(404).json({ error: "station_not_found" }); }
+    await client.query("BEGIN");
+    await client.query(`DELETE FROM mutations WHERE station_id = $1 OR (table_name = 'stations' AND row_id = $1)`, [uuid]);
+    const del = await client.query(`DELETE FROM stations WHERE uuid = $1`, [uuid]); // cascades station_* data
+    await client.query("COMMIT");
+    res.json({ ok: true, deleted: del.rowCount, name: rows[0].name });
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("[platform/delete-station]", e.message);
+    res.status(500).json({ error: "server_error", detail: e.message });
+  } finally { client.release(); }
+});
+
 // ── License management (platform owner) — mint comp/promo keys + assign a tier, no payment ──
 const LICENSE_TIERS = ["free", "pro", "pro_lifetime", "station", "station_lifetime", "operator"];
 app.get("/api/platform/licenses", requirePlatform, async (_req, res) => {
@@ -1493,6 +1515,29 @@ app.get("/api/account/stations", requireAuth, async (req, res) => {
     console.error("[account/stations]", e.message);
     return res.status(500).json({ error: "server_error" });
   }
+});
+
+// Delete one of the caller's OWN stations — account admin only, scoped to the caller's license so an
+// operator can never reach another account's station. Cascades station_* data + purges its mutation log.
+app.delete("/api/account/stations/:uuid", requireAuthAdmin, async (req, res) => {
+  const uuid = String(req.params.uuid || "");
+  if (!uuid) return res.status(400).json({ error: "bad_uuid" });
+  const client = await pool.connect();
+  try {
+    const { rows } = await client.query(
+      `SELECT name FROM stations WHERE uuid = $1 AND license_key_id = $2`, [uuid, req.auth.lk]
+    );
+    if (!rows.length) { client.release(); return res.status(404).json({ error: "station_not_found" }); }
+    await client.query("BEGIN");
+    await client.query(`DELETE FROM mutations WHERE station_id = $1 OR (table_name = 'stations' AND row_id = $1)`, [uuid]);
+    const del = await client.query(`DELETE FROM stations WHERE uuid = $1 AND license_key_id = $2`, [uuid, req.auth.lk]);
+    await client.query("COMMIT");
+    res.json({ ok: true, deleted: del.rowCount, name: rows[0].name });
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("[account/delete-station]", e.message);
+    res.status(500).json({ error: "server_error", detail: e.message });
+  } finally { client.release(); }
 });
 
 // ── User management (admin only) — Phase 1: list / create / reset-PIN ─────────
