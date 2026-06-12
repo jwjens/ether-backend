@@ -933,6 +933,23 @@ app.delete("/api/platform/accounts/:id", requirePlatform, async (req, res) => {
   } finally { client.release(); }
 });
 
+// Reset a desktop account's password by email — platform-owner only. Recovery path
+// ("in case something happens"): set the password directly so the operator can sign into the
+// desktop with it, no email round-trip. 404 if no account exists for that address.
+app.post("/api/platform/users/reset-password", requirePlatform, async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const password = String(req.body?.password || "");
+    if (!EMAIL_RE.test(email)) return res.status(400).json({ error: "invalid_email" });
+    if (password.length < 8)   return res.status(400).json({ error: "weak_password" });
+    const u = (await pool.query(`SELECT id FROM users WHERE email = $1`, [email])).rows[0];
+    if (!u) return res.status(404).json({ error: "account_not_found" });
+    const hash = await bcrypt.hash(password, 12);
+    await pool.query(`UPDATE users SET password_hash = $1, reset_token = NULL, reset_expires = NULL WHERE id = $2`, [hash, u.id]);
+    res.json({ ok: true, email });
+  } catch (e) { console.error("[platform/reset-password]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
 // Delete a single station and everything under it — platform-owner only. The stations row delete
 // cascades all station_* data via FK ON DELETE CASCADE; we also purge that station's mutation-log
 // rows so a stale desktop re-sync can't resurrect it.
