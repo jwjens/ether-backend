@@ -233,7 +233,10 @@ const upload = multer
 // Per-plan machine activation limits — used by legacy /validate.
 // A single license can be active on this many machines simultaneously.
 // Users can deactivate machines to free up slots.
-const PLAN_MACHINE_LIMITS = { free: 1, pro: 2, station: 5 };
+// Machine (seat) cap. Policy: free = 1, every PAYING plan = 5. Only free is listed; every other
+// plan (pro, station, operator, lifetimes, network, enterprise, …) gets 5 via the `?? 5` fallback,
+// so a paid/owner tier is never wrongly capped at 1.
+const PLAN_MACHINE_LIMITS = { free: 1 };
 
 // Seat limit for the onboarding flow (onboarding-spec-v1.md "Core concepts").
 // Uniform across tiers — Stripe is the gate for whether a license exists at
@@ -1367,7 +1370,7 @@ app.post("/api/user/desktop-activate", authLimiter, async (req, res) => {
 
     // Register this machine as a seat (mirrors /validate). Trial keys store a plaintext license_key.
     const activationKey = license.license_key || `lic-${license.id}`;
-    const limit = PLAN_MACHINE_LIMITS[license.plan] ?? 1;
+    const limit = PLAN_MACHINE_LIMITS[license.plan] ?? 5;
     const mid = String(req.body.machine_id || "").trim() || `acct-${u.id}`;
     const ip = (req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress || "").trim();
     const existing = await pool.query(
@@ -2159,7 +2162,7 @@ app.post("/validate", async (req, res) => {
     // Activation rows key on the plaintext key for legacy licenses; bcrypt licenses have none, so
     // use a stable per-license token instead (license.id is the PK → guaranteed unique).
     const activationKey = license.license_key || `lic-${license.id}`;
-    const limit = PLAN_MACHINE_LIMITS[license.plan] ?? 1;
+    const limit = PLAN_MACHINE_LIMITS[license.plan] ?? 5;
     const ip = (req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress || "").trim();
 
     // 2. Check if this machine is already activated for this license.
@@ -2249,7 +2252,7 @@ app.get("/licenses/:key/activations", async (req, res) => {
       "SELECT machine_id, machine_name, os, ip_address, activated_at, last_seen FROM license_activations WHERE license_key=$1 AND deauthorized_at IS NULL ORDER BY last_seen DESC",
       [key]
     );
-    const limit = PLAN_MACHINE_LIMITS[lic[0].plan] ?? 1;
+    const limit = PLAN_MACHINE_LIMITS[lic[0].plan] ?? 5;
     res.json({ plan: lic[0].plan, limit, activations });
   } catch (e) {
     console.error("[/licenses/:key/activations]", e.message);
@@ -3110,7 +3113,7 @@ app.post("/account/devices", async (req, res) => {
         WHERE license_key = $1 AND deauthorized_at IS NULL
         ORDER BY last_seen DESC`, [activationKey]
     );
-    const limit = PLAN_MACHINE_LIMITS[license.plan] ?? 1;
+    const limit = PLAN_MACHINE_LIMITS[license.plan] ?? 5;
     res.json({ devices: rows, limit, plan: license.plan });
   } catch (e) {
     console.error("[/account/devices]", e.message);
