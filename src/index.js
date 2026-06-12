@@ -3323,7 +3323,7 @@ app.get("/public/stations", async (_req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT m.slug, m.display_name, m.logo_url, m.color_primary, m.color_secondary,
-              m.description, m.category,
+              m.description, m.category, m.stream_url,
               n.title, n.artist, n.art_url,
               (n.playing = true AND n.updated_at > NOW() - INTERVAL '5 minutes') AS live
        FROM station_metadata m
@@ -3341,6 +3341,7 @@ app.get("/public/stations", async (_req, res) => {
         color_secondary: r.color_secondary || null,
         description: r.description || null,
         category: r.category || null,
+        stream_url: r.stream_url || null,
         live: !!r.live,
         now_playing: r.live ? { title: r.title, artist: r.artist, art_url: r.art_url || null } : null,
       })),
