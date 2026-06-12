@@ -946,20 +946,32 @@ app.post("/api/platform/users/reset-password", requirePlatform, async (req, res)
 
     let u = null;
     if (accountId) {
-      // The login account linked to this license.
       u = (await pool.query(`SELECT id, email FROM users WHERE license_key_id = $1 ORDER BY id LIMIT 1`, [accountId])).rows[0] || null;
-      // Else a user whose email matches the license's email.
-      if (!u) {
+      if (!email) {
         const lic = (await pool.query(`SELECT email FROM licenses WHERE id = $1`, [accountId])).rows[0];
-        if (lic?.email) u = (await pool.query(`SELECT id, email FROM users WHERE email = $1`, [String(lic.email).trim().toLowerCase()])).rows[0] || null;
+        if (lic?.email) email = String(lic.email).trim().toLowerCase();
       }
     }
     if (!u && email) u = (await pool.query(`SELECT id, email FROM users WHERE email = $1`, [email])).rows[0] || null;
 
-    if (!u) return res.status(404).json({ error: "no_login_account" });
     const hash = await bcrypt.hash(password, 12);
-    await pool.query(`UPDATE users SET password_hash = $1, reset_token = NULL, reset_expires = NULL WHERE id = $2`, [hash, u.id]);
-    res.json({ ok: true, email: u.email });
+    if (u) {
+      // Existing login → reset its password.
+      await pool.query(`UPDATE users SET password_hash = $1, reset_token = NULL, reset_expires = NULL WHERE id = $2`, [hash, u.id]);
+      return res.json({ ok: true, email: u.email, created: false });
+    }
+    // No login exists yet → CREATE it (owner-provisioned), linked to the license. This is the one
+    // universal account used on web + desktop. email_verified=true since the owner set it directly.
+    if (!EMAIL_RE.test(email)) return res.status(400).json({ error: "invalid_email" });
+    const unsub = crypto.randomBytes(18).toString("base64url");
+    const { rows } = await pool.query(
+      `INSERT INTO users (email, password_hash, email_verified, license_key_id, unsubscribe_token)
+       VALUES ($1, $2, true, $3, $4)
+       ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, reset_token = NULL, reset_expires = NULL
+       RETURNING email`,
+      [email, hash, accountId, unsub]
+    );
+    res.json({ ok: true, email: rows[0].email, created: true });
   } catch (e) { console.error("[platform/reset-password]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
