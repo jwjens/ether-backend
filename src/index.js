@@ -3311,6 +3311,42 @@ function broadcastNowPlaying(slug, payload) {
   for (const res of clients) { if (!res.writableEnded) res.write(frame); }
 }
 
+// Public directory — every published station across ALL accounts, for the
+// SiriusXM-style discovery page + player. `live` = pushing now-playing within
+// the last 5 min (a stale row means the station stopped). Live stations sort
+// first. Unauthenticated; a station appears here the moment its public page is
+// enabled and it goes on air.
+app.get("/public/stations", async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT m.slug, m.display_name, m.logo_url, m.color_primary, m.color_secondary,
+              m.description,
+              n.title, n.artist, n.art_url,
+              (n.playing = true AND n.updated_at > NOW() - INTERVAL '5 minutes') AS live
+       FROM station_metadata m
+       LEFT JOIN station_now_playing n ON n.station_uuid = m.station_uuid
+       WHERE m.public_enabled = true AND m.slug IS NOT NULL
+       ORDER BY (n.playing = true AND n.updated_at > NOW() - INTERVAL '5 minutes') DESC,
+                COALESCE(m.display_name, m.slug) ASC`
+    );
+    res.json({
+      stations: rows.map(r => ({
+        slug: r.slug,
+        display_name: r.display_name || r.slug,
+        logo_url: r.logo_url || null,
+        color_primary: r.color_primary || null,
+        color_secondary: r.color_secondary || null,
+        description: r.description || null,
+        live: !!r.live,
+        now_playing: r.live ? { title: r.title, artist: r.artist, art_url: r.art_url || null } : null,
+      })),
+    });
+  } catch (e) {
+    console.error("[public/stations]", e.message);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
 // Combined metadata + now-playing for a public station. 404 if the slug is
 // unknown or the page isn't published; 301 to the current slug if it's an old
 // (renamed) slug that now points at a published station.
