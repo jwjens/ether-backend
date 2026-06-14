@@ -3397,6 +3397,52 @@ app.get("/public/stations", async (_req, res) => {
   }
 });
 
+// Sibling stations — the other published stations owned by the SAME account as :slug
+// (grouped by stations.license_key_id). Lets the listener show an operator's whole
+// lineup (e.g. their seasonal Christmas/Halloween stations) and switch between them,
+// without ever exposing the account key. Same card shape as /public/stations; includes
+// the requested station itself so the UI can highlight "current". Empty list if the slug
+// is unknown/unpublished or the account has only one public station.
+app.get("/public/station/:slug/siblings", async (req, res) => {
+  const slug = String(req.params.slug || "").toLowerCase();
+  try {
+    const owner = (await pool.query(
+      `SELECT s.license_key_id
+         FROM station_metadata m JOIN stations s ON s.uuid = m.station_uuid
+        WHERE m.slug = $1 AND m.public_enabled = true`, [slug])).rows[0];
+    if (!owner || owner.license_key_id == null) return res.json({ stations: [] });
+    const { rows } = await pool.query(
+      `SELECT m.slug, m.display_name, m.logo_url, m.color_primary, m.color_secondary,
+              m.description, m.category, m.stream_url,
+              n.title, n.artist, n.art_url,
+              (n.playing = true AND n.updated_at > NOW() - INTERVAL '5 minutes') AS live
+         FROM stations s
+         JOIN station_metadata m ON m.station_uuid = s.uuid
+         LEFT JOIN station_now_playing n ON n.station_uuid = m.station_uuid
+        WHERE s.license_key_id = $1 AND m.public_enabled = true AND m.slug IS NOT NULL
+        ORDER BY (n.playing = true AND n.updated_at > NOW() - INTERVAL '5 minutes') DESC,
+                 COALESCE(m.display_name, m.slug) ASC`,
+      [owner.license_key_id]);
+    res.json({
+      stations: rows.map(r => ({
+        slug: r.slug,
+        display_name: r.display_name || r.slug,
+        logo_url: r.logo_url || null,
+        color_primary: r.color_primary || null,
+        color_secondary: r.color_secondary || null,
+        description: r.description || null,
+        category: r.category || null,
+        stream_url: r.stream_url || null,
+        live: !!r.live,
+        now_playing: r.live ? { title: r.title, artist: r.artist, art_url: r.art_url || null } : null,
+      })),
+    });
+  } catch (e) {
+    console.error("[public/station/siblings]", e.message);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
 // Combined metadata + now-playing for a public station. 404 if the slug is
 // unknown or the page isn't published; 301 to the current slug if it's an old
 // (renamed) slug that now points at a published station.
