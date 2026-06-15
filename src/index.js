@@ -1041,8 +1041,14 @@ app.post("/api/platform/licenses", requirePlatform, async (req, res) => {
       `INSERT INTO licenses (email, plan, key_prefix, key_hash) VALUES ($1,$2,$3,$4) RETURNING id`,
       [email, plan, key.slice(0, 12), await bcrypt.hash(key, 12)]
     );
-    if (req.body?.send_email) { try { await sendLicenseEmail(email, key, plan); } catch (e) { console.error("[Email]", e.message); } }
-    res.json({ ok: true, id: rows[0].id, license_key: key, plan, email });
+    // Surface the email outcome instead of swallowing it — a failed send must not
+    // look like success (the key is still returned, shown once in the UI).
+    let email_sent = false, email_error = null;
+    if (req.body?.send_email) {
+      try { await sendLicenseEmail(email, key, plan); email_sent = true; }
+      catch (e) { email_error = e.message; console.error("[Email]", e.message); }
+    }
+    res.json({ ok: true, id: rows[0].id, license_key: key, plan, email, email_sent, email_error });
   } catch (e) { console.error("[platform/licenses:create]", e.message); res.status(500).json({ error: "server_error", detail: e.message }); }
 });
 
