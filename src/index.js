@@ -387,6 +387,7 @@ async function initDB() {
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_licenses_account_slug ON licenses(lower(account_slug)) WHERE account_slug IS NOT NULL`);
   // Handle-change cooldown + history (so promoted links don't rot and freed handles can't be squatted).
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS account_slug_changed_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS account_logo_url TEXT`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS account_slug_history (
       old_slug       TEXT NOT NULL,
@@ -1328,8 +1329,8 @@ app.get("/public/account/check-slug", async (req, res) => {
 // Current handle + display name for the signed-in account.
 app.get("/api/user/account-slug", requireAuth, async (req, res) => {
   try {
-    const row = (await pool.query(`SELECT account_slug, account_name FROM licenses WHERE id = $1`, [req.auth.lk])).rows[0];
-    res.json({ slug: row?.account_slug || null, name: row?.account_name || null });
+    const row = (await pool.query(`SELECT account_slug, account_name, account_logo_url FROM licenses WHERE id = $1`, [req.auth.lk])).rows[0];
+    res.json({ slug: row?.account_slug || null, name: row?.account_name || null, logo_url: row?.account_logo_url || null });
   } catch (e) { console.error("[user/account-slug get]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
@@ -1349,6 +1350,8 @@ app.post("/api/user/account-slug", requireAuth, async (req, res) => {
     const slugChanging = slug !== currentSlug;
     const hasName = typeof req.body?.name === "string";
     const name = hasName ? req.body.name.trim().slice(0, 80) : null;
+    const hasLogo = typeof req.body?.logo_url === "string";
+    const logo = hasLogo ? req.body.logo_url.trim().slice(0, 500) : null;
 
     if (slugChanging) {
       // Cooldown — only once a handle has been set (first claim is free).
@@ -1375,16 +1378,30 @@ app.post("/api/user/account-slug", requireAuth, async (req, res) => {
       }
       // Reclaiming our own old handle clears its history row.
       await pool.query(`DELETE FROM account_slug_history WHERE lower(old_slug) = $1 AND license_key_id = $2`, [slug, req.auth.lk]);
-
-      await pool.query(
-        `UPDATE licenses SET account_slug = $1, account_slug_changed_at = NOW()${hasName ? ", account_name = $3" : ""} WHERE id = $2`,
-        hasName ? [slug, req.auth.lk, name || null] : [slug, req.auth.lk]);
-    } else if (hasName) {
-      // Name-only change — no cooldown.
-      await pool.query(`UPDATE licenses SET account_name = $1 WHERE id = $2`, [name || null, req.auth.lk]);
+      await pool.query(`UPDATE licenses SET account_slug = $1, account_slug_changed_at = NOW() WHERE id = $2`, [slug, req.auth.lk]);
     }
-    res.json({ ok: true, slug, name: hasName ? (name || null) : undefined });
+    // Name + logo change any time (no cooldown).
+    if (hasName) await pool.query(`UPDATE licenses SET account_name = $1 WHERE id = $2`, [name || null, req.auth.lk]);
+    if (hasLogo) await pool.query(`UPDATE licenses SET account_logo_url = $1 WHERE id = $2`, [logo || null, req.auth.lk]);
+
+    res.json({ ok: true, slug, name: hasName ? (name || null) : undefined, logo_url: hasLogo ? (logo || null) : undefined });
   } catch (e) { console.error("[user/account-slug set]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+// Sign an R2 PUT for the account hub logo → PUBLIC bucket. Authed as the user; keyed by
+// license id so it's stable/cacheable. Returns the public_url to save via account-slug.
+app.post("/api/user/account-logo-upload-url", requireAuth, async (req, res) => {
+  if (!logoStorageReady()) return res.status(503).json({ error: "logo_storage_unconfigured" });
+  const ext = String(req.body?.ext || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (!["png", "jpg", "jpeg", "webp"].includes(ext)) return res.status(400).json({ error: "bad_image_type" });
+  const key = `account-logos/${req.auth.lk}.${ext}`;
+  try {
+    const signed_url = await signLogoPutUrl(key);
+    res.json({ signed_url, public_url: `${R2_PUBLIC_BASE_URL}/${key}`, expires_at: Date.now() + 900_000 });
+  } catch (e) {
+    console.error("[account-logo-upload-url] signing failed:", e.message);
+    res.status(500).json({ error: "signing_failed", detail: e.message });
+  }
 });
 
 app.post("/api/user/forgot", authLimiter, async (req, res) => {
@@ -3472,14 +3489,14 @@ app.get("/public/account/:slug/channels", async (req, res) => {
   try {
     const slug = String(req.params.slug || "").trim().toLowerCase();
     let lic = (await pool.query(
-      `SELECT id, account_name, account_slug FROM licenses WHERE lower(account_slug) = $1`, [slug])).rows[0];
+      `SELECT id, account_name, account_slug, account_logo_url FROM licenses WHERE lower(account_slug) = $1`, [slug])).rows[0];
     let redirect = null;
     if (!lic) {
       // Old handle? Resolve via history so promoted links keep working, and tell the client to swap the URL.
       const hist = (await pool.query(
         `SELECT license_key_id FROM account_slug_history WHERE lower(old_slug) = $1`, [slug])).rows[0];
       if (hist) {
-        lic = (await pool.query(`SELECT id, account_name, account_slug FROM licenses WHERE id = $1`, [hist.license_key_id])).rows[0];
+        lic = (await pool.query(`SELECT id, account_name, account_slug, account_logo_url FROM licenses WHERE id = $1`, [hist.license_key_id])).rows[0];
         if (lic?.account_slug) redirect = lic.account_slug.toLowerCase();
       }
     }
@@ -3497,7 +3514,7 @@ app.get("/public/account/:slug/channels", async (req, res) => {
                  COALESCE(m.display_name, m.slug) ASC`,
       [lic.id]);
     res.json({
-      account: { slug: lic.account_slug || slug, name: lic.account_name || null },
+      account: { slug: lic.account_slug || slug, name: lic.account_name || null, logo_url: lic.account_logo_url || null },
       redirect,
       channels: rows.map(r => ({
         slug: r.slug,
@@ -3561,7 +3578,7 @@ app.get("/public/station/:slug/siblings", async (req, res) => {
   const slug = String(req.params.slug || "").toLowerCase();
   try {
     const owner = (await pool.query(
-      `SELECT s.license_key_id, l.account_name, l.account_slug
+      `SELECT s.license_key_id, l.account_name, l.account_slug, l.account_logo_url
          FROM station_metadata m JOIN stations s ON s.uuid = m.station_uuid
          JOIN licenses l ON l.id = s.license_key_id
         WHERE m.slug = $1 AND m.public_enabled = true`, [slug])).rows[0];
@@ -3579,7 +3596,7 @@ app.get("/public/station/:slug/siblings", async (req, res) => {
                  COALESCE(m.display_name, m.slug) ASC`,
       [owner.license_key_id]);
     res.json({
-      account: { name: owner.account_name || null, slug: owner.account_slug || null },
+      account: { name: owner.account_name || null, slug: owner.account_slug || null, logo_url: owner.account_logo_url || null },
       stations: rows.map(r => ({
         slug: r.slug,
         display_name: r.display_name || r.slug,
