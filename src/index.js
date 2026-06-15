@@ -1315,15 +1315,15 @@ app.get("/public/account/check-slug", async (req, res) => {
   } catch (e) { console.error("[account/check-slug]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
-// Current handle for the signed-in account.
+// Current handle + display name for the signed-in account.
 app.get("/api/user/account-slug", requireAuth, async (req, res) => {
   try {
-    const row = (await pool.query(`SELECT account_slug FROM licenses WHERE id = $1`, [req.auth.lk])).rows[0];
-    res.json({ slug: row?.account_slug || null });
+    const row = (await pool.query(`SELECT account_slug, account_name FROM licenses WHERE id = $1`, [req.auth.lk])).rows[0];
+    res.json({ slug: row?.account_slug || null, name: row?.account_name || null });
   } catch (e) { console.error("[user/account-slug get]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
-// Claim/update the handle for the signed-in account.
+// Claim/update the handle (and optional display name) for the signed-in account.
 app.post("/api/user/account-slug", requireAuth, async (req, res) => {
   try {
     const slug = normalizeSlug(req.body?.slug);
@@ -1332,8 +1332,15 @@ app.post("/api/user/account-slug", requireAuth, async (req, res) => {
     const taken = (await pool.query(
       `SELECT 1 FROM licenses WHERE lower(account_slug) = $1 AND id <> $2 LIMIT 1`, [slug, req.auth.lk])).rows[0];
     if (taken) return res.status(409).json({ error: "taken" });
-    await pool.query(`UPDATE licenses SET account_slug = $1 WHERE id = $2`, [slug, req.auth.lk]);
-    res.json({ ok: true, slug });
+    // Display name is optional; only update it when provided (trimmed; empty string clears it).
+    const hasName = typeof req.body?.name === "string";
+    const name = hasName ? req.body.name.trim().slice(0, 80) : null;
+    if (hasName) {
+      await pool.query(`UPDATE licenses SET account_slug = $1, account_name = $2 WHERE id = $3`, [slug, name || null, req.auth.lk]);
+    } else {
+      await pool.query(`UPDATE licenses SET account_slug = $1 WHERE id = $2`, [slug, req.auth.lk]);
+    }
+    res.json({ ok: true, slug, name: hasName ? (name || null) : undefined });
   } catch (e) { console.error("[user/account-slug set]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
@@ -3500,10 +3507,11 @@ app.get("/public/station/:slug/siblings", async (req, res) => {
   const slug = String(req.params.slug || "").toLowerCase();
   try {
     const owner = (await pool.query(
-      `SELECT s.license_key_id
+      `SELECT s.license_key_id, l.account_name, l.account_slug
          FROM station_metadata m JOIN stations s ON s.uuid = m.station_uuid
+         JOIN licenses l ON l.id = s.license_key_id
         WHERE m.slug = $1 AND m.public_enabled = true`, [slug])).rows[0];
-    if (!owner || owner.license_key_id == null) return res.json({ stations: [] });
+    if (!owner || owner.license_key_id == null) return res.json({ account: null, stations: [] });
     const { rows } = await pool.query(
       `SELECT m.slug, m.display_name, m.logo_url, m.color_primary, m.color_secondary,
               m.description, m.category, m.stream_url,
@@ -3517,6 +3525,7 @@ app.get("/public/station/:slug/siblings", async (req, res) => {
                  COALESCE(m.display_name, m.slug) ASC`,
       [owner.license_key_id]);
     res.json({
+      account: { name: owner.account_name || null, slug: owner.account_slug || null },
       stations: rows.map(r => ({
         slug: r.slug,
         display_name: r.display_name || r.slug,
