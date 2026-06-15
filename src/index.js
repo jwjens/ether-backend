@@ -381,6 +381,10 @@ async function initDB() {
   // into licenses, seat info collapses into license_activations, stations stays.
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS account_name TEXT`);
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS onboarded_at TIMESTAMPTZ`);
+  // Account handle — the public hub address (listen.ether-technologies.com/@<slug>) that
+  // lists all of an account's published stations as channels (SiriusXM-style).
+  await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS account_slug TEXT`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_licenses_account_slug ON licenses(lower(account_slug)) WHERE account_slug IS NOT NULL`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS stations (
@@ -1284,6 +1288,53 @@ app.post("/api/user/verify", async (req, res) => {
     if (!r.rowCount) return res.status(400).json({ error: "invalid_token" });
     res.json({ ok: true });
   } catch (e) { console.error("[user/verify]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+// ── Account handle (public hub address) ────────────────────────────────────
+// Normalize + validate a handle: lowercase letters/numbers/hyphens, 3–32 chars,
+// no leading/trailing/double hyphen, not a reserved word.
+const RESERVED_SLUGS = new Set(["embed","api","public","admin","platform","app","listen","ether","ethercast","account","station","stations","channel","channels","www","assets","static"]);
+function normalizeSlug(raw) {
+  return String(raw || "").trim().toLowerCase();
+}
+function slugError(slug) {
+  if (!/^[a-z0-9]([a-z0-9-]{1,30})[a-z0-9]$/.test(slug)) return "invalid_format";
+  if (slug.includes("--")) return "invalid_format";
+  if (RESERVED_SLUGS.has(slug)) return "reserved";
+  return null;
+}
+
+// Availability check (public — used by the onboarding live check).
+app.get("/public/account/check-slug", async (req, res) => {
+  try {
+    const slug = normalizeSlug(req.query.slug);
+    const err = slugError(slug);
+    if (err) return res.json({ valid: false, available: false, error: err });
+    const taken = (await pool.query(`SELECT 1 FROM licenses WHERE lower(account_slug) = $1 LIMIT 1`, [slug])).rows[0];
+    res.json({ valid: true, available: !taken });
+  } catch (e) { console.error("[account/check-slug]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+// Current handle for the signed-in account.
+app.get("/api/user/account-slug", requireAuth, async (req, res) => {
+  try {
+    const row = (await pool.query(`SELECT account_slug FROM licenses WHERE id = $1`, [req.auth.lk])).rows[0];
+    res.json({ slug: row?.account_slug || null });
+  } catch (e) { console.error("[user/account-slug get]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+// Claim/update the handle for the signed-in account.
+app.post("/api/user/account-slug", requireAuth, async (req, res) => {
+  try {
+    const slug = normalizeSlug(req.body?.slug);
+    const err = slugError(slug);
+    if (err) return res.status(400).json({ error: err });
+    const taken = (await pool.query(
+      `SELECT 1 FROM licenses WHERE lower(account_slug) = $1 AND id <> $2 LIMIT 1`, [slug, req.auth.lk])).rows[0];
+    if (taken) return res.status(409).json({ error: "taken" });
+    await pool.query(`UPDATE licenses SET account_slug = $1 WHERE id = $2`, [slug, req.auth.lk]);
+    res.json({ ok: true, slug });
+  } catch (e) { console.error("[user/account-slug set]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
 app.post("/api/user/forgot", authLimiter, async (req, res) => {
@@ -3364,6 +3415,48 @@ function broadcastNowPlaying(slug, payload) {
 // the last 5 min (a stale row means the station stopped). Live stations sort
 // first. Unauthenticated; a station appears here the moment its public page is
 // enabled and it goes on air.
+// An account's public hub: all published stations (channels) for the account behind
+// :slug, plus the account name. Powers listen.ether-technologies.com/@<slug> (SiriusXM-style).
+// 404 if the handle is unknown. Same channel card shape as /public/stations.
+app.get("/public/account/:slug/channels", async (req, res) => {
+  try {
+    const slug = String(req.params.slug || "").trim().toLowerCase();
+    const lic = (await pool.query(
+      `SELECT id, account_name FROM licenses WHERE lower(account_slug) = $1`, [slug])).rows[0];
+    if (!lic) return res.status(404).json({ error: "not_found" });
+    const { rows } = await pool.query(
+      `SELECT m.slug, m.display_name, m.logo_url, m.color_primary, m.color_secondary,
+              m.description, m.category, m.stream_url,
+              n.title, n.artist, n.art_url,
+              (n.playing = true AND n.updated_at > NOW() - INTERVAL '5 minutes') AS live
+         FROM stations s
+         JOIN station_metadata m ON m.station_uuid = s.uuid
+         LEFT JOIN station_now_playing n ON n.station_uuid = m.station_uuid
+        WHERE s.license_key_id = $1 AND m.public_enabled = true AND m.slug IS NOT NULL
+        ORDER BY (n.playing = true AND n.updated_at > NOW() - INTERVAL '5 minutes') DESC,
+                 COALESCE(m.display_name, m.slug) ASC`,
+      [lic.id]);
+    res.json({
+      account: { slug, name: lic.account_name || null },
+      channels: rows.map(r => ({
+        slug: r.slug,
+        display_name: r.display_name || r.slug,
+        logo_url: r.logo_url || null,
+        color_primary: r.color_primary || null,
+        color_secondary: r.color_secondary || null,
+        description: r.description || null,
+        category: r.category || null,
+        stream_url: r.stream_url || null,
+        live: !!r.live,
+        now_playing: r.live ? { title: r.title, artist: r.artist, art_url: r.art_url || null } : null,
+      })),
+    });
+  } catch (e) {
+    console.error("[public/account/channels]", e.message);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
 app.get("/public/stations", async (_req, res) => {
   try {
     const { rows } = await pool.query(
