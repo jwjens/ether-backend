@@ -385,6 +385,16 @@ async function initDB() {
   // lists all of an account's published stations as channels (SiriusXM-style).
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS account_slug TEXT`);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_licenses_account_slug ON licenses(lower(account_slug)) WHERE account_slug IS NOT NULL`);
+  // Handle-change cooldown + history (so promoted links don't rot and freed handles can't be squatted).
+  await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS account_slug_changed_at TIMESTAMPTZ`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS account_slug_history (
+      old_slug       TEXT NOT NULL,
+      license_key_id INTEGER NOT NULL REFERENCES licenses(id),
+      changed_at     TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_slug_history_old ON account_slug_history(lower(old_slug))`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS stations (
@@ -1324,21 +1334,54 @@ app.get("/api/user/account-slug", requireAuth, async (req, res) => {
 });
 
 // Claim/update the handle (and optional display name) for the signed-in account.
+// Handle changes have a 30-day cooldown and leave a redirect breadcrumb; the display
+// name can be changed any time.
+const SLUG_COOLDOWN_DAYS = 30;
 app.post("/api/user/account-slug", requireAuth, async (req, res) => {
   try {
     const slug = normalizeSlug(req.body?.slug);
     const err = slugError(slug);
     if (err) return res.status(400).json({ error: err });
-    const taken = (await pool.query(
-      `SELECT 1 FROM licenses WHERE lower(account_slug) = $1 AND id <> $2 LIMIT 1`, [slug, req.auth.lk])).rows[0];
-    if (taken) return res.status(409).json({ error: "taken" });
-    // Display name is optional; only update it when provided (trimmed; empty string clears it).
+
+    const cur = (await pool.query(
+      `SELECT account_slug, account_slug_changed_at FROM licenses WHERE id = $1`, [req.auth.lk])).rows[0] || {};
+    const currentSlug = (cur.account_slug || "").toLowerCase();
+    const slugChanging = slug !== currentSlug;
     const hasName = typeof req.body?.name === "string";
     const name = hasName ? req.body.name.trim().slice(0, 80) : null;
-    if (hasName) {
-      await pool.query(`UPDATE licenses SET account_slug = $1, account_name = $2 WHERE id = $3`, [slug, name || null, req.auth.lk]);
-    } else {
-      await pool.query(`UPDATE licenses SET account_slug = $1 WHERE id = $2`, [slug, req.auth.lk]);
+
+    if (slugChanging) {
+      // Cooldown — only once a handle has been set (first claim is free).
+      if (currentSlug && cur.account_slug_changed_at) {
+        const days = (Date.now() - new Date(cur.account_slug_changed_at).getTime()) / 86400000;
+        if (days < SLUG_COOLDOWN_DAYS) {
+          return res.status(429).json({ error: "cooldown", days_remaining: Math.ceil(SLUG_COOLDOWN_DAYS - days) });
+        }
+      }
+      // Not in use by another account, and not a handle someone else recently vacated (anti-squat).
+      const taken = (await pool.query(
+        `SELECT 1 FROM licenses WHERE lower(account_slug) = $1 AND id <> $2 LIMIT 1`, [slug, req.auth.lk])).rows[0];
+      if (taken) return res.status(409).json({ error: "taken" });
+      const reserved = (await pool.query(
+        `SELECT 1 FROM account_slug_history WHERE lower(old_slug) = $1 AND license_key_id <> $2 LIMIT 1`, [slug, req.auth.lk])).rows[0];
+      if (reserved) return res.status(409).json({ error: "taken" });
+
+      // Breadcrumb the old handle so its promoted links redirect to the new one.
+      if (currentSlug) {
+        await pool.query(
+          `INSERT INTO account_slug_history (old_slug, license_key_id) VALUES ($1, $2)
+           ON CONFLICT (lower(old_slug)) DO UPDATE SET license_key_id = EXCLUDED.license_key_id, changed_at = NOW()`,
+          [currentSlug, req.auth.lk]);
+      }
+      // Reclaiming our own old handle clears its history row.
+      await pool.query(`DELETE FROM account_slug_history WHERE lower(old_slug) = $1 AND license_key_id = $2`, [slug, req.auth.lk]);
+
+      await pool.query(
+        `UPDATE licenses SET account_slug = $1, account_slug_changed_at = NOW()${hasName ? ", account_name = $3" : ""} WHERE id = $2`,
+        hasName ? [slug, req.auth.lk, name || null] : [slug, req.auth.lk]);
+    } else if (hasName) {
+      // Name-only change — no cooldown.
+      await pool.query(`UPDATE licenses SET account_name = $1 WHERE id = $2`, [name || null, req.auth.lk]);
     }
     res.json({ ok: true, slug, name: hasName ? (name || null) : undefined });
   } catch (e) { console.error("[user/account-slug set]", e.message); res.status(500).json({ error: "server_error" }); }
@@ -3428,8 +3471,18 @@ function broadcastNowPlaying(slug, payload) {
 app.get("/public/account/:slug/channels", async (req, res) => {
   try {
     const slug = String(req.params.slug || "").trim().toLowerCase();
-    const lic = (await pool.query(
-      `SELECT id, account_name FROM licenses WHERE lower(account_slug) = $1`, [slug])).rows[0];
+    let lic = (await pool.query(
+      `SELECT id, account_name, account_slug FROM licenses WHERE lower(account_slug) = $1`, [slug])).rows[0];
+    let redirect = null;
+    if (!lic) {
+      // Old handle? Resolve via history so promoted links keep working, and tell the client to swap the URL.
+      const hist = (await pool.query(
+        `SELECT license_key_id FROM account_slug_history WHERE lower(old_slug) = $1`, [slug])).rows[0];
+      if (hist) {
+        lic = (await pool.query(`SELECT id, account_name, account_slug FROM licenses WHERE id = $1`, [hist.license_key_id])).rows[0];
+        if (lic?.account_slug) redirect = lic.account_slug.toLowerCase();
+      }
+    }
     if (!lic) return res.status(404).json({ error: "not_found" });
     const { rows } = await pool.query(
       `SELECT m.slug, m.display_name, m.logo_url, m.color_primary, m.color_secondary,
@@ -3444,7 +3497,8 @@ app.get("/public/account/:slug/channels", async (req, res) => {
                  COALESCE(m.display_name, m.slug) ASC`,
       [lic.id]);
     res.json({
-      account: { slug, name: lic.account_name || null },
+      account: { slug: lic.account_slug || slug, name: lic.account_name || null },
+      redirect,
       channels: rows.map(r => ({
         slug: r.slug,
         display_name: r.display_name || r.slug,
