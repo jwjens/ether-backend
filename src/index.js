@@ -1649,7 +1649,9 @@ app.post("/api/auth/owner-login", authLimiter, async (req, res) => {
     if (!u.license_key_id) return res.status(403).json({ error: "no_license" });
     await pool.query(`UPDATE users SET last_login_at = NOW() WHERE id = $1`, [u.id]).catch(() => {});
     const token = jwt.sign(
-      { uid: u.id, lk: u.license_key_id, role: "admin", username: u.email },
+      // typ:"owner" marks this uid as a 'users' (signup) id, not an account_users id —
+      // /api/auth/me branches on it so whoami resolves correctly.
+      { uid: u.id, lk: u.license_key_id, role: "admin", username: u.email, typ: "owner" },
       JWT_SECRET, { expiresIn: JWT_TTL }
     );
     return res.json({ token, user: { id: u.id, username: u.email, display_name: u.name || u.email, role: "admin" } });
@@ -1662,6 +1664,21 @@ app.post("/api/auth/owner-login", authLimiter, async (req, res) => {
 // Whoami — current operator + license summary (dashboard header).
 app.get("/api/auth/me", requireAuth, async (req, res) => {
   try {
+    // Owner session (email/password login): uid is a 'users' id — resolve from there.
+    if (req.auth.typ === "owner") {
+      const { rows } = await pool.query(
+        `SELECT u.id, u.email, u.name, l.account_name, l.plan, l.email AS license_email
+         FROM users u JOIN licenses l ON l.id = u.license_key_id
+         WHERE u.id = $1`,
+        [req.auth.uid]
+      );
+      const u = rows[0];
+      if (!u) return res.status(401).json({ error: "invalid_token" });
+      return res.json({
+        user: { id: u.id, username: u.email, display_name: u.name || u.email, role: "admin" },
+        account: { name: u.account_name, plan: u.plan, email: u.license_email },
+      });
+    }
     const { rows } = await pool.query(
       `SELECT au.*, l.account_name, l.plan, l.email
        FROM account_users au JOIN licenses l ON l.id = au.license_key_id
