@@ -1689,6 +1689,65 @@ app.get("/api/account/stations", requireAuth, async (req, res) => {
   }
 });
 
+// Create a station for the signed-in account (admin) — CLOUD-FIRST. Inserts the stations row AND
+// an install-scoped ('station_id' = NULL) 'stations' insert mutation into the peer-sync log, so
+// every desktop on the account pulls it on its next ~5s sync cycle — no live install required at
+// creation time. The mutation payload deliberately OMITS the integer 'id' so each desktop
+// auto-assigns its own local id and keys future syncs on 'uuid' (avoids an INSERT-OR-REPLACE id
+// collision that could clobber another station). schema_version tracks the current desktop synced
+// schema (bump alongside it).
+const SYNC_SCHEMA_VERSION = 22;
+app.post("/api/account/stations", requireAuthAdmin, async (req, res) => {
+  const name = String(req.body?.name || "").trim();
+  if (!name) return res.status(400).json({ error: "name_required" });
+  const nickname     = req.body?.nickname     ? String(req.body.nickname).trim()     : null;
+  const frequency    = req.body?.frequency    ? String(req.body.frequency).trim()    : null;
+  const call_letters = req.body?.call_letters ? String(req.body.call_letters).trim() : null;
+
+  const uuid    = crypto.randomUUID();
+  const nowIso  = new Date().toISOString();
+  const nowSec  = Math.floor(Date.now() / 1000);
+  const client  = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO stations (uuid, license_key_id, name, nickname, frequency, call_letters)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [uuid, req.auth.lk, name, nickname, frequency, call_letters]
+    );
+
+    // Peer-sync mutation the desktops will pull. Shape matches the desktop 'stations' table
+    // (callsign, not call_letters; no id; sensitive icecast_password is local-only and omitted).
+    const payloadAfter = {
+      name, callsign: call_letters, frequency,
+      city: null, state: null, country: "US", website: null,
+      is_active: 0, created_at: nowSec,
+      icecast_server_url: "127.0.0.1", icecast_mount: "/live",
+      icecast_bitrate: 128, icecast_format: "mp3", icecast_port: null,
+      audio_device_output: null, mic_device: null,
+      uuid, updated_at: nowIso, deleted_at: null,
+    };
+    const webClientId = "web-dashboard"; // synthetic origin; desktops dedupe by mutation id
+    await client.query(
+      `INSERT INTO mutations (id, client_id, station_id, operator_id, license_key_id,
+         table_name, row_id, op, payload_before, payload_after,
+         created_at, hlc, parent_mutation_id, schema_version, conflict_resolution)
+       VALUES ($1,$2,NULL,NULL,$3,'stations',$4,'insert',NULL,$5,$6,$7,NULL,$8,NULL)`,
+      [crypto.randomUUID(), webClientId, req.auth.lk, uuid, JSON.stringify(payloadAfter),
+       nowIso, `${Date.now()}:0:${webClientId}`, SYNC_SCHEMA_VERSION]
+    );
+    await client.query("COMMIT");
+    console.log(`[account/create-station] license:${req.auth.lk} station:${uuid.slice(0, 8)} (${name})`);
+    res.json({ ok: true, uuid, name, nickname, frequency, call_letters });
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("[account/create-station]", e.message);
+    res.status(500).json({ error: "server_error", detail: e.message });
+  } finally {
+    client.release();
+  }
+});
+
 // Delete one of the caller's OWN stations — account admin only, scoped to the caller's license so an
 // operator can never reach another account's station. Cascades station_* data + purges its mutation log.
 app.delete("/api/account/stations/:uuid", requireAuthAdmin, async (req, res) => {
