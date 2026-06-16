@@ -869,6 +869,81 @@ app.get("/api/platform/diag", requirePlatform, async (_req, res) => {
   res.json(out);
 });
 
+// ── Mutation-log retention ────────────────────────────────────────────────────
+// The mutations table is otherwise append-forever (N-119). When sync was re-enabled
+// for the Lifetime/Enterprise tiers the backlog filled the Postgres volume. We keep
+// the LATEST mutation per (table_name,row_id) forever — that's the current state a
+// fresh device needs — and drop superseded history older than a recent buffer, so
+// active clients still have their recent log. row_id is a UUID, so (table,row) is
+// globally unique and this never crosses accounts.
+async function pruneSupersededMutations(bufferDays = 2) {
+  const r = await pool.query(
+    `DELETE FROM mutations m
+       WHERE EXISTS (
+         SELECT 1 FROM mutations m2
+          WHERE m2.table_name = m.table_name
+            AND m2.row_id     = m.row_id
+            AND m2.server_seq > m.server_seq)
+         AND m.received_at < NOW() - ($1::int * INTERVAL '1 day')`,
+    [bufferDays],
+  );
+  return r.rowCount;
+}
+
+// What's actually using the volume — top tables by total (heap+toast+index) size.
+app.get("/api/platform/db-stats", requirePlatform, async (_req, res) => {
+  try {
+    const db = await pool.query(`SELECT pg_size_pretty(pg_database_size(current_database())) AS db_size,
+                                        pg_database_size(current_database()) AS db_bytes`);
+    const tables = await pool.query(
+      `SELECT c.relname AS table,
+              pg_size_pretty(pg_total_relation_size(c.oid)) AS total,
+              pg_total_relation_size(c.oid) AS total_bytes,
+              pg_size_pretty(pg_relation_size(c.oid))        AS heap,
+              c.reltuples::bigint AS approx_rows
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relkind = 'r'
+        ORDER BY pg_total_relation_size(c.oid) DESC LIMIT 15`);
+    const mut = await pool.query(
+      `SELECT COUNT(*)::bigint AS total,
+              COUNT(*) FILTER (WHERE EXISTS (
+                SELECT 1 FROM mutations m2
+                 WHERE m2.table_name = m.table_name AND m2.row_id = m.row_id
+                   AND m2.server_seq > m.server_seq))::bigint AS superseded
+         FROM mutations m`);
+    res.json({ ...db.rows[0], mutations: mut.rows[0], tables: tables.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Prune superseded mutations, then optionally VACUUM FULL to actually shrink the file
+// on disk (regular VACUUM only returns space to the freelist — the volume usage won't drop).
+app.post("/api/platform/prune-mutations", requirePlatform, async (req, res) => {
+  try {
+    const bufferDays = Number.isFinite(+req.body?.buffer_days) ? +req.body.buffer_days : 2;
+    if (req.body?.dry_run) {
+      const c = await pool.query(
+        `SELECT COUNT(*)::bigint AS would_delete FROM mutations m
+           WHERE EXISTS (SELECT 1 FROM mutations m2
+                          WHERE m2.table_name = m.table_name AND m2.row_id = m.row_id
+                            AND m2.server_seq > m.server_seq)
+             AND m.received_at < NOW() - ($1::int * INTERVAL '1 day')`, [bufferDays]);
+      return res.json({ dry_run: true, buffer_days: bufferDays, would_delete: c.rows[0].would_delete });
+    }
+    const deleted = await pruneSupersededMutations(bufferDays);
+    let vacuumed = false;
+    if (req.body?.vacuum_full) { await pool.query(`VACUUM (FULL, ANALYZE) mutations`); vacuumed = true; }
+    else { await pool.query(`VACUUM (ANALYZE) mutations`).catch(() => {}); }
+    res.json({ ok: true, deleted, buffer_days: bufferDays, vacuum_full: vacuumed });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Daily auto-prune so the log can't grow unbounded again.
+setInterval(() => {
+  pruneSupersededMutations(2)
+    .then((n) => n && console.log(`[retention] pruned ${n} superseded mutations`))
+    .catch((e) => console.error("[retention] prune failed:", e.message));
+}, 24 * 60 * 60 * 1000);
+
 // One-click "download the latest Ether installer" — resolves the newest GitHub release asset for
 // the OS and 302-redirects to it, so the link is always current (filenames are versioned).
 // os = mac | windows | linux. Cached 5 min to respect GitHub's unauthenticated rate limit.
