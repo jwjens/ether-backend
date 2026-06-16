@@ -1492,6 +1492,19 @@ app.post("/api/user/desktop-activate", authLimiter, async (req, res) => {
       await pool.query(`UPDATE users SET license_key_id = $1 WHERE id = $2`, [license.id, u.id]);
     }
 
+    // Admin/bcrypt-issued licenses (created in the platform Licenses screen) store only a hash —
+    // no plaintext key to hand back, so the desktop got "No license returned". Mint a real key on
+    // first desktop activation and persist it (plaintext + prefix + hash, like a trial key), so the
+    // desktop can authenticate with it. Invisible to the operator (they sign in with email/password).
+    if (license && !license.license_key) {
+      const rawKey = generateLicenseKey(license.plan || "station");
+      await pool.query(
+        `UPDATE licenses SET license_key = $1, key_prefix = $2, key_hash = $3 WHERE id = $4`,
+        [rawKey, rawKey.slice(0, 12), await bcrypt.hash(rawKey, 12), license.id]
+      );
+      license.license_key = rawKey;
+    }
+
     // Register this machine as a seat (mirrors /validate). Trial keys store a plaintext license_key.
     const activationKey = license.license_key || `lic-${license.id}`;
     const limit = PLAN_MACHINE_LIMITS[license.plan] ?? 5;
