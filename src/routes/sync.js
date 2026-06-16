@@ -50,7 +50,11 @@ const VALID_OPS = new Set(['insert', 'update', 'delete', 'checkpoint']);
 // Tables the backend refuses to store, regardless of what the client sends.
 // These should never appear in push payloads (filtered client-side), but this
 // is a second line of defense [N-101].
-const BACKEND_EXCLUDED = new Set(['install_secrets_kv', 'monitor_routing']);
+// generated_schedule is DERIVED, regenerable playout data — each day's generation
+// emits thousands of rows. Peer-syncing it flooded the table (167k rows / ~140MB in
+// one day) and filled the volume. Each install regenerates it locally from the synced
+// clocks + rules, so it must never travel over peer-sync [N-120].
+const BACKEND_EXCLUDED = new Set(['install_secrets_kv', 'monitor_routing', 'generated_schedule']);
 
 /**
  * @param {import('pg').Pool} pool
