@@ -877,14 +877,16 @@ app.get("/api/platform/diag", requirePlatform, async (_req, res) => {
 // active clients still have their recent log. row_id is a UUID, so (table,row) is
 // globally unique and this never crosses accounts.
 async function pruneSupersededMutations(bufferDays = 2) {
+  // Hash-join against the latest server_seq per (table,row) — far faster than a
+  // correlated EXISTS, which scans the whole table per row with no covering index.
   const r = await pool.query(
     `DELETE FROM mutations m
-       WHERE EXISTS (
-         SELECT 1 FROM mutations m2
-          WHERE m2.table_name = m.table_name
-            AND m2.row_id     = m.row_id
-            AND m2.server_seq > m.server_seq)
-         AND m.received_at < NOW() - ($1::int * INTERVAL '1 day')`,
+       USING (SELECT table_name, row_id, MAX(server_seq) AS keep
+                FROM mutations GROUP BY table_name, row_id) g
+      WHERE m.table_name = g.table_name
+        AND m.row_id     = g.row_id
+        AND m.server_seq < g.keep
+        AND m.received_at < NOW() - ($1::int * INTERVAL '1 day')`,
     [bufferDays],
   );
   return r.rowCount;
@@ -904,13 +906,11 @@ app.get("/api/platform/db-stats", requirePlatform, async (_req, res) => {
          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = 'public' AND c.relkind = 'r'
         ORDER BY pg_total_relation_size(c.oid) DESC LIMIT 15`);
+    // superseded = every row that isn't the latest for its (table,row) group — one pass, fast.
     const mut = await pool.query(
       `SELECT COUNT(*)::bigint AS total,
-              COUNT(*) FILTER (WHERE EXISTS (
-                SELECT 1 FROM mutations m2
-                 WHERE m2.table_name = m.table_name AND m2.row_id = m.row_id
-                   AND m2.server_seq > m.server_seq))::bigint AS superseded
-         FROM mutations m`);
+              (COUNT(*) - COUNT(DISTINCT (table_name, row_id)))::bigint AS superseded
+         FROM mutations`);
     res.json({ ...db.rows[0], mutations: mut.rows[0], tables: tables.rows });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -922,11 +922,13 @@ app.post("/api/platform/prune-mutations", requirePlatform, async (req, res) => {
     const bufferDays = Number.isFinite(+req.body?.buffer_days) ? +req.body.buffer_days : 2;
     if (req.body?.dry_run) {
       const c = await pool.query(
-        `SELECT COUNT(*)::bigint AS would_delete FROM mutations m
-           WHERE EXISTS (SELECT 1 FROM mutations m2
-                          WHERE m2.table_name = m.table_name AND m2.row_id = m.row_id
-                            AND m2.server_seq > m.server_seq)
-             AND m.received_at < NOW() - ($1::int * INTERVAL '1 day')`, [bufferDays]);
+        `SELECT COUNT(*)::bigint AS would_delete
+           FROM mutations m
+           JOIN (SELECT table_name, row_id, MAX(server_seq) AS keep
+                   FROM mutations GROUP BY table_name, row_id) g
+             ON m.table_name = g.table_name AND m.row_id = g.row_id
+          WHERE m.server_seq < g.keep
+            AND m.received_at < NOW() - ($1::int * INTERVAL '1 day')`, [bufferDays]);
       return res.json({ dry_run: true, buffer_days: bufferDays, would_delete: c.rows[0].would_delete });
     }
     const deleted = await pruneSupersededMutations(bufferDays);
