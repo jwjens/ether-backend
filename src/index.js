@@ -639,6 +639,11 @@ const PLAN_STATION_LIMITS = {
   operator:        -1,
 };
 
+// Plans entitled to cloud sync + remote-control features (Studio and up, INCLUDING the lifetime
+// variants and Enterprise/operator). The *_lifetime and operator tiers were historically missing
+// from these gates — which 403'd paying Lifetime/Enterprise customers out of sync. Keep complete.
+const PAID_PLANS = new Set(["pro", "pro_lifetime", "station", "station_lifetime", "operator"]);
+
 function generateLicenseKey(plan) {
   const prefix = (plan === "station" || plan === "station_lifetime") ? "ETH-STN"
                : plan === "operator" ? "ETH-ENT"
@@ -754,7 +759,7 @@ async function requireLicense(req, res, next) {
   if (!key) return res.status(401).json({ error: "Missing x-license-key header" });
   const license = await lookupLicense(key).catch(() => null);
   if (!license) return res.status(401).json({ error: "invalid_license_key" });
-  if (!["pro", "station"].includes(license.plan))
+  if (!PAID_PLANS.has(license.plan))
     return res.status(403).json({ error: "Studio or Network plan required" });
   req.license = license;
   next();
@@ -4074,7 +4079,7 @@ app.post("/api/cmd", async (req, res) => {
     const rawKey = req.headers["x-license-key"];
     const license = rawKey ? await lookupLicense(rawKey).catch(() => null) : null;
     if (!license) return res.status(401).json({ error: "invalid_license_key" });
-    if (!["pro", "station"].includes(license.plan)) return res.status(403).json({ error: "plan_required" });
+    if (!PAID_PLANS.has(license.plan)) return res.status(403).json({ error: "plan_required" });
     licenseId = String(license.id);
   }
   // Dashboard callers must be admin to issue commands (desktop x-license-key is trusted).
@@ -4106,7 +4111,7 @@ app.get("/api/cmd-stream", async (req, res) => {
   if (!rawKey) return res.status(401).json({ error: "Missing x-license-key header or ?key= param" });
   const license = await lookupLicense(rawKey).catch(() => null);
   if (!license) return res.status(401).json({ error: "invalid_license_key" });
-  if (!["pro","station"].includes(license.plan))
+  if (!PAID_PLANS.has(license.plan))
     return res.status(403).json({ error: "Studio or Network plan required" });
 
   res.set({
