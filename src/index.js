@@ -1160,11 +1160,28 @@ app.get("/api/platform/licenses/:id/emails", requirePlatform, async (req, res) =
     if (!id) return res.status(400).json({ error: "bad_id" });
     const lic = (await pool.query(`SELECT id, email FROM licenses WHERE id = $1`, [id])).rows[0];
     if (!lic) return res.status(404).json({ error: "not_found" });
-    const { rows } = await pool.query(
-      `SELECT id, email, email_verified FROM users WHERE license_key_id = $1 ORDER BY id`, [id]
+    const { rows: users } = await pool.query(
+      `SELECT id, email, email_verified, license_key_id FROM users WHERE license_key_id = $1 ORDER BY id`, [id]
     );
+    // Resolve the stations each login can actually reach via its OWN login-license
+    // (users.license_key_id → that license's stations). Surfaced as "Access to: …" in the
+    // modal so an email's real access is visible — not the (possibly empty) license it merely owns.
+    const lkids = [...new Set(users.map(u => u.license_key_id).filter(v => v != null))];
+    const stationsByLkid = {};
+    if (lkids.length) {
+      const { rows: st } = await pool.query(
+        `SELECT license_key_id, name FROM stations WHERE license_key_id = ANY($1::int[]) ORDER BY name`,
+        [lkids]
+      );
+      for (const s of st) (stationsByLkid[s.license_key_id] ||= []).push(s.name);
+    }
+    const emails = users.map(u => ({
+      id: u.id, email: u.email, email_verified: u.email_verified,
+      license_key_id: u.license_key_id,
+      stations: stationsByLkid[u.license_key_id] || [],
+    }));
     // owner_email lets the UI flag/disable the purchaser login (can't be removed).
-    res.json({ owner_email: lic.email ? String(lic.email).trim().toLowerCase() : null, emails: rows });
+    res.json({ owner_email: lic.email ? String(lic.email).trim().toLowerCase() : null, emails });
   } catch (e) { console.error("[platform/licenses/emails:list]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
