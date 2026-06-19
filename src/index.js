@@ -1104,6 +1104,8 @@ app.get("/api/platform/licenses", requirePlatform, async (_req, res) => {
     const { rows } = await pool.query(
       `SELECT l.id, l.email, l.plan, l.active, l.created_at, l.key_prefix, l.last_validated,
               (SELECT COUNT(*)::int FROM stations s WHERE s.license_key_id = l.id) AS stations,
+              (SELECT COALESCE(array_agg(s.name ORDER BY s.name), '{}')
+                 FROM stations s WHERE s.license_key_id = l.id) AS station_names,
               (SELECT COUNT(*)::int FROM license_activations a
                  WHERE (a.license_key = l.license_key OR a.license_key = 'lic-' || l.id) AND a.deauthorized_at IS NULL) AS activations
          FROM licenses l ORDER BY l.created_at DESC`
