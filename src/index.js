@@ -1148,6 +1148,75 @@ app.patch("/api/platform/licenses/:id", requirePlatform, async (req, res) => {
   } catch (e) { console.error("[platform/licenses:update]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
+// ── Authorized emails per license ─────────────────────────────────────────────
+// Manage which email logins (users rows) are attached to a license. The data model already
+// supports many emails → one license (users.license_key_id); these endpoints expose add/remove
+// from the platform console. All platform-owner gated.
+
+// List the logins linked to a license.
+app.get("/api/platform/licenses/:id/emails", requirePlatform, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ error: "bad_id" });
+    const lic = (await pool.query(`SELECT id, email FROM licenses WHERE id = $1`, [id])).rows[0];
+    if (!lic) return res.status(404).json({ error: "not_found" });
+    const { rows } = await pool.query(
+      `SELECT id, email, email_verified FROM users WHERE license_key_id = $1 ORDER BY id`, [id]
+    );
+    // owner_email lets the UI flag/disable the purchaser login (can't be removed).
+    res.json({ owner_email: lic.email ? String(lic.email).trim().toLowerCase() : null, emails: rows });
+  } catch (e) { console.error("[platform/licenses/emails:list]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+// Add/authorize an email on a license — upsert that ALWAYS sets license_key_id to :id, so an email
+// that already has an account elsewhere is RELINKED here (the gap reset-password leaves open).
+app.post("/api/platform/licenses/:id/emails", requirePlatform, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ error: "bad_id" });
+    const lic = (await pool.query(`SELECT id FROM licenses WHERE id = $1`, [id])).rows[0];
+    if (!lic) return res.status(404).json({ error: "not_found" });
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const password = String(req.body?.password || "");
+    if (!EMAIL_RE.test(email)) return res.status(400).json({ error: "invalid_email" });
+    if (password.length < 8) return res.status(400).json({ error: "weak_password" });
+    const hash = await bcrypt.hash(password, 12);
+    const unsub = crypto.randomBytes(18).toString("base64url");
+    const { rows } = await pool.query(
+      `INSERT INTO users (email, password_hash, email_verified, license_key_id, unsubscribe_token)
+       VALUES ($1, $2, true, $3, $4)
+       ON CONFLICT (email) DO UPDATE SET
+         license_key_id = EXCLUDED.license_key_id,
+         password_hash  = EXCLUDED.password_hash,
+         email_verified = true
+       RETURNING id, email, email_verified`,
+      [email, hash, id, unsub]
+    );
+    res.json({ ok: true, user: rows[0] });
+  } catch (e) { console.error("[platform/licenses/emails:add]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+// Remove (unlink, not delete) an email from a license. Guards: never remove the purchaser/owner
+// email, and never leave the license with zero logins (lockout protection).
+app.delete("/api/platform/licenses/:id/emails/:email", requirePlatform, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const email = String(req.params.email || "").trim().toLowerCase();
+    if (!id || !email) return res.status(400).json({ error: "bad_request" });
+    const lic = (await pool.query(`SELECT id, email FROM licenses WHERE id = $1`, [id])).rows[0];
+    if (!lic) return res.status(404).json({ error: "not_found" });
+    if (lic.email && String(lic.email).trim().toLowerCase() === email)
+      return res.status(409).json({ error: "cannot_remove_owner_email" });
+    const { rows: linked } = await pool.query(`SELECT email FROM users WHERE license_key_id = $1`, [id]);
+    if (!linked.some(u => String(u.email).trim().toLowerCase() === email))
+      return res.status(404).json({ error: "email_not_linked" });
+    if (linked.length <= 1)
+      return res.status(409).json({ error: "cannot_remove_last_email" });
+    await pool.query(`UPDATE users SET license_key_id = NULL WHERE email = $1 AND license_key_id = $2`, [email, id]);
+    res.json({ ok: true, unlinked: 1 });
+  } catch (e) { console.error("[platform/licenses/emails:remove]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
 // Network analytics rollup across ALL stations for a custom date range (the report you submit
 // to ASCAP / BMI / SoundExchange — it's just the aggregated analytics). from/to = YYYY-MM-DD,
 // inclusive of the `to` day. Listening hours (ATH) from listener_sessions; performances (plays)

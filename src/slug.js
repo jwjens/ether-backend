@@ -3,9 +3,9 @@
 // metadata + slug-check endpoints and unit-tested in slug.test.js. Keeping this
 // pure (no DB, no express) means the endpoints can't drift from the validation.
 
-// 3–32 chars, lowercase letters/digits/hyphens, no leading/trailing hyphen.
-// Double-hyphens are rejected separately in validateSlug for cleaner URLs.
-const STATION_SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])?$/;
+// 2–32 chars, lowercase letters/digits/hyphens, no leading/trailing hyphen.
+// (Allows 2-letter station codes like "ov"/"kj"; double-hyphens rejected below.)
+const STATION_SLUG_RE = /^[a-z0-9][a-z0-9-]{0,30}[a-z0-9]$/;
 
 // Reserved — route names, infra words, and anything that would collide with a
 // path on listen.ether-technologies.com or be confusing/abusable.

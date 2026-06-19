@@ -4,13 +4,13 @@ const assert = require("node:assert");
 const { validateSlug, slugify } = require("./slug");
 
 test("valid slugs pass", () => {
-  for (const s of ["rock1029", "kjazz", "wxyz-fm", "abc", "a1b2c3", "my-cool-station"]) {
+  for (const s of ["ab", "rock1029", "kjazz", "wxyz-fm", "abc", "a1b2c3", "my-cool-station"]) {
     assert.deepEqual(validateSlug(s), { ok: true }, s);
   }
 });
 
 test("too short / too long rejected as invalid", () => {
-  assert.deepEqual(validateSlug("ab"), { ok: false, reason: "invalid" });
+  assert.deepEqual(validateSlug("a"), { ok: false, reason: "invalid" });   // 1 char (min is now 2)
   assert.deepEqual(validateSlug("a".repeat(33)), { ok: false, reason: "invalid" });
 });
 
