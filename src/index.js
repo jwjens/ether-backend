@@ -1278,6 +1278,71 @@ app.delete("/api/platform/licenses/:id/emails/:email", requirePlatform, async (r
   } catch (e) { console.error("[platform/licenses/emails:remove]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
+// ── Library grants per license (master-catalog cross-license read access) ─────────
+// Manage which OTHER licenses may READ this license's music library (songs/artists/albums +
+// R2 audio). Read-only and revocable; honored by GET /sync/mutations (table-whitelisted UNION)
+// and the /audio/* prefix resolver. All platform-owner gated.
+
+// List active grants where :id is the OWNER (i.e. who may read THIS license's library).
+app.get("/api/platform/licenses/:id/library-grants", requirePlatform, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ error: "bad_id" });
+    const owner = (await pool.query(`SELECT id, email FROM licenses WHERE id = $1`, [id])).rows[0];
+    if (!owner) return res.status(404).json({ error: "not_found" });
+    const { rows } = await pool.query(
+      `SELECT g.grantee_license_id, g.created_at, l.email AS grantee_email, l.plan AS grantee_plan
+         FROM library_grants g
+         JOIN licenses l ON l.id = g.grantee_license_id
+        WHERE g.owner_license_id = $1 AND g.revoked_at IS NULL
+        ORDER BY g.created_at ASC`,
+      [id]
+    );
+    res.json({ owner_email: owner.email, grants: rows });
+  } catch (e) { console.error("[platform/library-grants:list]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+// Grant this license's library to another license (read-only). Re-granting a previously revoked
+// pair un-revokes it. Guards: grantee must exist and differ from the owner.
+app.post("/api/platform/licenses/:id/library-grants", requirePlatform, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const granteeId = parseInt(req.body?.grantee_license_id, 10);
+    if (!id || !granteeId) return res.status(400).json({ error: "bad_request" });
+    if (id === granteeId) return res.status(400).json({ error: "cannot_grant_to_self" });
+    const owner   = (await pool.query(`SELECT id FROM licenses WHERE id = $1`, [id])).rows[0];
+    const grantee = (await pool.query(`SELECT id, email FROM licenses WHERE id = $1`, [granteeId])).rows[0];
+    if (!owner)   return res.status(404).json({ error: "owner_not_found" });
+    if (!grantee) return res.status(404).json({ error: "grantee_not_found" });
+    const { rows } = await pool.query(
+      `INSERT INTO library_grants (owner_license_id, grantee_license_id)
+       VALUES ($1, $2)
+       ON CONFLICT (owner_license_id, grantee_license_id)
+         DO UPDATE SET revoked_at = NULL, created_at = NOW()
+       RETURNING grantee_license_id, created_at`,
+      [id, granteeId]
+    );
+    res.json({ ok: true, grant: { ...rows[0], grantee_email: grantee.email } });
+  } catch (e) { console.error("[platform/library-grants:add]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+// Revoke a grant (soft — sets revoked_at). The grantee loses library read access on its next
+// sync pull / audio fetch.
+app.delete("/api/platform/licenses/:id/library-grants/:granteeId", requirePlatform, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const granteeId = parseInt(req.params.granteeId, 10);
+    if (!id || !granteeId) return res.status(400).json({ error: "bad_request" });
+    const r = await pool.query(
+      `UPDATE library_grants SET revoked_at = NOW()
+        WHERE owner_license_id = $1 AND grantee_license_id = $2 AND revoked_at IS NULL`,
+      [id, granteeId]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: "grant_not_found" });
+    res.json({ ok: true, revoked: 1 });
+  } catch (e) { console.error("[platform/library-grants:revoke]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
 // Network analytics rollup across ALL stations for a custom date range (the report you submit
 // to ASCAP / BMI / SoundExchange — it's just the aggregated analytics). from/to = YYYY-MM-DD,
 // inclusive of the `to` day. Listening hours (ATH) from listener_sessions; performances (plays)
