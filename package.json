@@ -23,7 +23,8 @@
     "stripe": "^14.21.0"
   },
   "devDependencies": {
-    "nodemon": "^3.0.2"
+    "nodemon": "^3.0.2",
+    "pg-mem": "^3.0.14"
   },
   "engines": {
     "node": ">=18.0.0"

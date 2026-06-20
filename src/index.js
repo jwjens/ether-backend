@@ -208,6 +208,25 @@ async function listR2ObjectsForPrefix(prefix) {
   return keys;
 }
 
+// HeadObject existence probe — lets the cross-license grant resolver discover which prefix a
+// file_key actually lives under. Returns true if the key exists in R2_BUCKET, false on 404 /
+// NotFound. Caller null-checks getR2Client() first; any other SDK error propagates.
+async function r2ObjectExists(key) {
+  const { HeadObjectCommand } = require("@aws-sdk/client-s3");
+  try {
+    await getR2Client().send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: key }));
+    return true;
+  } catch (e) {
+    const status = e?.$metadata?.httpStatusCode;
+    if (status === 404 || e?.name === "NotFound" || e?.name === "NoSuchKey") return false;
+    throw e;
+  }
+}
+
+// Cross-license library grants (master catalog): a grantee may READ a granted owner's R2 audio
+// under ${owner.id}/. Shared with the sync pull — see src/lib/libraryGrants.js.
+const { grantedOwnerLicenseIds, resolveAudioPrefixId } = require("./lib/libraryGrants");
+
 // ── In-memory state ───────────────────────────────────────────
 const pendingCmds = new Map();   // licenseId(string) → array of queued cmds (per-license; drained on cmd-stream connect)
 const sseClients  = new Map();   // licenseId(string) → Set<res> for cmd-stream subscribers
@@ -504,6 +523,29 @@ async function initDB() {
   // desktop install's local console users). The install push only ever touches its
   // own 'install' rows, so it can never clobber a dashboard-managed user.
   await pool.query(`ALTER TABLE account_users ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'dashboard'`);
+
+  // ── Library grants (master-catalog cross-license read access) ──────────────
+  // A grant lets the GRANTEE license READ the OWNER license's install-scope music
+  // catalog (songs/artists/albums) — one master library referenced by many licenses,
+  // no audio duplication. Read-only: a grant NEVER conveys write/push rights. Honored by
+  // GET /sync/mutations (table-whitelisted UNION) and, later, the /audio/* prefix resolver.
+  // revoked_at soft-revokes; the sync/audio gates ignore revoked rows.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS library_grants (
+      id                 SERIAL PRIMARY KEY,
+      owner_license_id   INTEGER NOT NULL REFERENCES licenses(id) ON DELETE CASCADE,
+      grantee_license_id INTEGER NOT NULL REFERENCES licenses(id) ON DELETE CASCADE,
+      created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      revoked_at         TIMESTAMPTZ,
+      CONSTRAINT library_grants_no_self CHECK (owner_license_id <> grantee_license_id),
+      UNIQUE (owner_license_id, grantee_license_id)
+    )
+  `);
+  // Hot path: "which owners may this grantee read?" runs on every sync pull.
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_library_grants_grantee
+    ON library_grants (grantee_license_id) WHERE revoked_at IS NULL
+  `);
 
   // ── Control Center data mirror (Roadmap Item 5, Phase 2) ───────────────────
   // Generic per-station row mirror so the dashboard can VIEW install-owned data
@@ -3295,7 +3337,20 @@ app.post("/audio/download-url", async (req, res) => {
       });
     }
 
-    const r2Key            = `${license.id}/${sanitized.value}`;
+    // Resolve which prefix holds the file. Common case (no grants): the caller's own prefix,
+    // no HeadObject probe — unchanged fast path. If the caller has read grants, the file may
+    // live under a granted OWNER's prefix; probe caller-first, then granted owners, and sign
+    // against the first hit. Found nowhere → fall back to the caller's own prefix (the GET then
+    // 404s at R2, exactly as before for a missing file). An ungranted caller has no owner ids,
+    // so it can ONLY ever resolve its own prefix — never another license's objects.
+    let prefixId = license.id;
+    const grantedOwnerIds = await grantedOwnerLicenseIds(pool, license.id);
+    if (grantedOwnerIds.length > 0) {
+      const resolved = await resolveAudioPrefixId(r2ObjectExists, license.id, grantedOwnerIds, sanitized.value);
+      if (resolved != null) prefixId = resolved;
+    }
+
+    const r2Key            = `${prefixId}/${sanitized.value}`;
     const expiresInSeconds = 15 * 60;
 
     let signedUrl;
@@ -3307,7 +3362,7 @@ app.post("/audio/download-url", async (req, res) => {
     }
 
     const expiresAt = new Date(Date.now() + expiresInSeconds * 1000).toISOString();
-    console.log(`[Audio/DownloadURL] license:${license.id} key:${sanitized.value} (15m)`);
+    console.log(`[Audio/DownloadURL] license:${license.id} prefix:${prefixId} key:${sanitized.value} (15m)`);
     res.json({ signed_url: signedUrl, expires_at: expiresAt });
   } catch (e) {
     console.error("[/audio/download-url]", e.message);
@@ -3348,24 +3403,26 @@ app.get("/audio/list", async (req, res) => {
       });
     }
 
-    const prefix = `${license.id}/`;
-    let allKeys;
+    // List the caller's own prefix PLUS any granted owners' prefixes (master-catalog read
+    // access). Common case (no grants): just the caller's prefix — unchanged. Keys are stripped
+    // of their license prefix so customers never see internal license ids; a basename present
+    // under both the caller and a granted owner is de-duplicated (the caller's own copy wins at
+    // download time via resolveAudioPrefixId's caller-first probe).
+    const grantedOwnerIds = await grantedOwnerLicenseIds(pool, license.id);
+    const prefixes = [license.id, ...grantedOwnerIds].map(id => `${id}/`);
+    const keySet = new Set();
     try {
-      allKeys = await listR2ObjectsForPrefix(prefix);
+      for (const prefix of prefixes) {
+        const full = await listR2ObjectsForPrefix(prefix);
+        for (const k of full) if (k.startsWith(prefix)) keySet.add(k.slice(prefix.length));
+      }
     } catch (e) {
       console.error("[/audio/list] listing failed:", e.message);
       return res.status(500).json({ error: "listing_failed", detail: e.message });
     }
+    const keys = [...keySet];
 
-    // Strip the license prefix so customers never see their internal
-    // license_key_id. R2 enforces Prefix on ListObjectsV2, so every key
-    // returned should already start with `${license.id}/` — the defensive
-    // startsWith check costs nothing and surfaces a clear bug if it doesn't.
-    const keys = allKeys
-      .filter(k => k.startsWith(prefix))
-      .map(k => k.slice(prefix.length));
-
-    console.log(`[Audio/List] license:${license.id} keys:${keys.length}`);
+    console.log(`[Audio/List] license:${license.id} prefixes:${prefixes.length} keys:${keys.length}`);
     res.json({ keys });
   } catch (e) {
     console.error("[/audio/list]", e.message);

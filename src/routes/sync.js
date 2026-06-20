@@ -12,6 +12,7 @@
 // Defense-in-depth: excluded tables rejected even if client sends them [N-101].
 
 const express = require('express');
+const { grantedOwnerLicenseIds } = require('../lib/libraryGrants');
 
 // ── Server HLC identity ────────────────────────────────────────────────────────
 //
@@ -55,6 +56,18 @@ const VALID_OPS = new Set(['insert', 'update', 'delete', 'checkpoint']);
 // one day) and filled the volume. Each install regenerates it locally from the synced
 // clocks + rules, so it must never travel over peer-sync [N-120].
 const BACKEND_EXCLUDED = new Set(['install_secrets_kv', 'monitor_routing', 'generated_schedule']);
+
+// ── Library grants (master-catalog cross-license read access) ──────────────────
+// GRANTABLE_LIBRARY_TABLES is THE ISOLATION BOUNDARY for cross-license library sharing:
+// the ONLY install-scope tables a grantee may inherit from a granted owner. songs/artists/
+// albums = the music catalog; nothing else crosses the license line — not install_config_kv,
+// not secrets, not station-scoped programming. Do NOT widen without re-proving the boundary
+// (scripts/prove-library-grant-isolation.js).
+const GRANTABLE_LIBRARY_TABLES = ['songs', 'artists', 'albums'];
+
+// grantedOwnerLicenseIds() lives in ../lib/libraryGrants (shared with the /audio/* endpoints)
+// so the grant rule has exactly one definition. Returns [] when there are no active grants →
+// the sync UNION below matches nothing, so non-grantees are unaffected.
 
 /**
  * @param {import('pg').Pool} pool
@@ -154,12 +167,21 @@ function makeSyncRouter(pool) {
       const sinceSeq = parseInt(since_seq, 10) || 0;
       const sid      = station_id || null;
 
+      // Library grants: owner licenses whose music catalog THIS license may READ (master-
+      // catalog cross-license access). Empty for the vast majority of installs → the UNION
+      // branch below matches nothing and behavior is unchanged. The ONLY install-scope rows
+      // that cross the license line are GRANTABLE_LIBRARY_TABLES — never config, secrets, or
+      // station-scoped rows. This UNION is the isolation boundary; the table whitelist is its
+      // sole guard (proven in scripts/prove-library-grant-isolation.js).
+      const ownerIds = await grantedOwnerLicenseIds(pool, req.license.id);
+
       // Return up to 500 mutations the client has not yet seen, scoped to this
       // license [tenant isolation]. Own-client mutations are included — the
       // client deduplicates by id locally (idempotency check, Step 1 of §19).
       // Scope filter:
       //   - if station_id provided: return station-scoped + install-scoped (station_id IS NULL)
       //   - if station_id absent:   return install-scoped only
+      // PLUS (UNION): granted owners' install-scope LIBRARY rows only (table-whitelisted).
       let rows;
       if (sid) {
         const result = await pool.query(`
@@ -173,9 +195,21 @@ function makeSyncRouter(pool) {
           WHERE server_seq > $1
             AND license_key_id = $2
             AND (station_id = $3 OR station_id IS NULL)
+          UNION ALL
+          SELECT
+            server_seq, id, client_id, station_id, operator_id,
+            table_name, row_id, op,
+            payload_before, payload_after,
+            created_at, hlc, parent_mutation_id,
+            schema_version, conflict_resolution
+          FROM mutations
+          WHERE server_seq > $1
+            AND license_key_id = ANY($4::int[])
+            AND station_id IS NULL
+            AND table_name = ANY($5::text[])
           ORDER BY server_seq ASC
           LIMIT 500
-        `, [sinceSeq, req.license.id, sid]);
+        `, [sinceSeq, req.license.id, sid, ownerIds, GRANTABLE_LIBRARY_TABLES]);
         rows = result.rows;
       } else {
         const result = await pool.query(`
@@ -189,9 +223,21 @@ function makeSyncRouter(pool) {
           WHERE server_seq > $1
             AND license_key_id = $2
             AND station_id IS NULL
+          UNION ALL
+          SELECT
+            server_seq, id, client_id, station_id, operator_id,
+            table_name, row_id, op,
+            payload_before, payload_after,
+            created_at, hlc, parent_mutation_id,
+            schema_version, conflict_resolution
+          FROM mutations
+          WHERE server_seq > $1
+            AND license_key_id = ANY($3::int[])
+            AND station_id IS NULL
+            AND table_name = ANY($4::text[])
           ORDER BY server_seq ASC
           LIMIT 500
-        `, [sinceSeq, req.license.id]);
+        `, [sinceSeq, req.license.id, ownerIds, GRANTABLE_LIBRARY_TABLES]);
         rows = result.rows;
       }
 
