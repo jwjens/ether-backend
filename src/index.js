@@ -2480,6 +2480,37 @@ app.post("/api/account/station/:uuid/staged/clone-categories", requireAuth, asyn
   } catch (e) { console.error("[staged:clone-categories]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
+// Dashboard: the BORROWED library — the granted owner's songs, surfaced for a grantee station so
+// you can see and program against them with no running install. Read from the owner's mutation
+// stream (same source as clone-categories). Audio files materialize on the grantee's install at
+// play time (fetchR2Track under the owner's R2 prefix); this is the metadata list.
+app.get("/api/account/station/:uuid/borrowed-library", requireAuth, async (req, res) => {
+  try {
+    const stationUuid = req.params.uuid;
+    const { rows: own } = await pool.query(`SELECT 1 FROM stations WHERE uuid=$1 AND license_key_id=$2`, [stationUuid, req.auth.lk]);
+    if (own.length === 0) return res.status(404).json({ error: "station_not_found" });
+    const grant = (await pool.query(
+      `SELECT owner_license_id FROM library_grants WHERE grantee_license_id=$1 AND revoked_at IS NULL ORDER BY created_at ASC LIMIT 1`,
+      [req.auth.lk])).rows[0];
+    if (!grant) return res.json({ songs: [], borrowed_from: null });
+    const owner = grant.owner_license_id;
+    const latest = async (table) => (await pool.query(
+      `SELECT DISTINCT ON (row_id) payload_after AS p, op FROM mutations WHERE license_key_id=$1 AND table_name=$2 ORDER BY row_id, server_seq DESC`,
+      [owner, table])).rows.filter((r) => r.op !== "delete" && r.p).map((r) => r.p);
+    const artistName = {};
+    for (const a of await latest("artists")) if (a.id != null) artistName[a.id] = a.name;
+    const songs = (await latest("songs")).map((p) => ({
+      uuid: p.uuid, song_id: p.id, title: p.title,
+      artist: p.artist_id != null ? (artistName[p.artist_id] || null) : null,
+      category_id: p.category_id != null ? Number(p.category_id) : null,
+      file_key: p.file_key || null,
+      duration_ms: p.duration_ms != null ? Number(p.duration_ms) : null,
+      borrowed: true,
+    }));
+    res.json({ songs, borrowed_from: owner });
+  } catch (e) { console.error("[borrowed-library]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
 // Dashboard (JWT-admin) gets a signed PUT URL to upload a NEW song's audio to R2.
 // Keyed identically to the desktop's /audio/upload-url (`${license.id}/<file_key>`) so
 // the install's fetchR2Track resolves it at play time. The backend mints a unique
