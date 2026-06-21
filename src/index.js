@@ -2480,6 +2480,83 @@ app.post("/api/account/station/:uuid/staged/clone-categories", requireAuth, asyn
   } catch (e) { console.error("[staged:clone-categories]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
+// Dashboard: clone the GRANTED owner's FULL programming (categories + clocks + shows + clock_slots)
+// into THIS station's staging, so a fresh install syncs down a complete, ready-to-run program that
+// fills from the borrowed library. Read from the owner's authoritative mutation stream (same source
+// as clone-categories — the CC mirror may be empty). Idempotent: re-clone updates in place by uuid.
+//  - categories: id-passthrough (preserve owner id + uuid) so borrowed songs' category_id aligns.
+//  - clocks/shows/clock_slots: NO id-passthrough — the install resolves them by uuid. Cross-row FKs
+//    are rewritten to PARENT UUIDS (clock_uuid, category_uuid); importStagedProgramming resolves
+//    those to local integer ids in dependency order.
+app.post("/api/account/station/:uuid/staged/clone-programming", requireAuth, async (req, res) => {
+  try {
+    const stationUuid = req.params.uuid;
+    const { rows: own } = await pool.query(`SELECT 1 FROM stations WHERE uuid=$1 AND license_key_id=$2`, [stationUuid, req.auth.lk]);
+    if (own.length === 0) return res.status(404).json({ error: "station_not_found" });
+    const grant = (await pool.query(
+      `SELECT owner_license_id FROM library_grants WHERE grantee_license_id=$1 AND revoked_at IS NULL ORDER BY created_at ASC LIMIT 1`,
+      [req.auth.lk])).rows[0];
+    if (!grant) return res.status(400).json({ error: "no_grant" });
+    const owner = grant.owner_license_id;
+
+    // Latest non-deleted payload per row from the owner's mutation stream.
+    const latest = async (table) => (await pool.query(
+      `SELECT DISTINCT ON (row_id) payload_after AS p, op FROM mutations
+        WHERE license_key_id=$1 AND table_name=$2 ORDER BY row_id, server_seq DESC`, [owner, table]
+    )).rows.filter((r) => r.op !== "delete" && r.p).map((r) => r.p);
+
+    const stage = (table, rowUuid, payload) => pool.query(
+      `INSERT INTO staged_programming (station_uuid, table_name, row_uuid, payload, deleted_at, imported_at, updated_at)
+       VALUES ($1,$2,$3,$4,NULL,NULL,NOW())
+       ON CONFLICT (station_uuid, table_name, row_uuid) DO UPDATE SET payload=EXCLUDED.payload, deleted_at=NULL, imported_at=NULL, updated_at=NOW()`,
+      [stationUuid, table, String(rowUuid), JSON.stringify(payload)]);
+
+    const cloned = { categories: 0, clocks: 0, shows: 0, clock_slots: 0 };
+
+    // categories — id-passthrough; build owner category_id -> uuid for clock_slots FK rewrite.
+    const catIdToUuid = {};
+    for (const c of await latest("categories")) {
+      if (c == null || c.id == null || !c.uuid) continue;   // null id can't id-passthrough; skip (test rows)
+      catIdToUuid[c.id] = c.uuid;
+      await stage("categories", c.uuid, { id: c.id, code: c.code, name: c.name, color: c.color, spins_per_hour: c.spins_per_hour, priority: c.priority });
+      cloned.categories++;
+    }
+
+    // clocks — resolved by uuid on import; build owner clock_id -> uuid for shows/slots FK rewrite.
+    const clockIdToUuid = {};
+    for (const k of await latest("clocks")) {
+      if (k == null || !k.uuid) continue;
+      clockIdToUuid[k.id] = k.uuid;
+      await stage("clocks", k.uuid, { name: k.name, color: k.color, description: k.description });
+      cloned.clocks++;
+    }
+
+    // shows — clock_id -> clock_uuid (importer resolves to local clock id).
+    for (const s of await latest("shows")) {
+      if (s == null || !s.uuid) continue;
+      await stage("shows", s.uuid, {
+        name: s.name, days: s.days, color: s.color, start_hour: s.start_hour, end_hour: s.end_hour,
+        is_active: s.is_active, description: s.description,
+        clock_uuid: s.clock_id != null ? (clockIdToUuid[s.clock_id] ?? null) : null,
+      });
+      cloned.shows++;
+    }
+
+    // clock_slots — clock_id -> clock_uuid, category_id -> category_uuid.
+    for (const sl of await latest("clock_slots")) {
+      if (sl == null || !sl.uuid) continue;
+      await stage("clock_slots", sl.uuid, {
+        label: sl.label, position: sl.position, slot_type: sl.slot_type, duration_min: sl.duration_min,
+        clock_uuid: sl.clock_id != null ? (clockIdToUuid[sl.clock_id] ?? null) : null,
+        category_uuid: sl.category_id != null ? (catIdToUuid[sl.category_id] ?? null) : null,
+      });
+      cloned.clock_slots++;
+    }
+
+    res.json({ ok: true, cloned });
+  } catch (e) { console.error("[staged:clone-programming]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
 // Dashboard: the BORROWED library — the granted owner's songs, surfaced for a grantee station so
 // you can see and program against them with no running install. Read from the owner's mutation
 // stream (same source as clone-categories). Audio files materialize on the grantee's install at
