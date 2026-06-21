@@ -565,6 +565,25 @@ async function initDB() {
     )
   `);
 
+  // Cloud-first STAGED programming: dashboard-authored categories/clocks/clock_slots/shows that
+  // exist in the cloud with NO running install, then sync DOWN when the install signs in. Keyed
+  // by station_uuid (never a local integer id). Parent refs in clock_slots/shows are by UUID; the
+  // install resolves uuid -> its local id on import. imported_at is set once an install applies a
+  // row so re-import is a no-op. Distinct from station_cc_data (install-pushed live mirror).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS staged_programming (
+      station_uuid TEXT NOT NULL REFERENCES stations(uuid) ON DELETE CASCADE,
+      table_name   TEXT NOT NULL,
+      row_uuid     TEXT NOT NULL,
+      payload      JSONB NOT NULL,
+      deleted_at   TIMESTAMPTZ,
+      imported_at  TIMESTAMPTZ,
+      updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (station_uuid, table_name, row_uuid)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_staged_pending ON staged_programming(station_uuid) WHERE deleted_at IS NULL AND imported_at IS NULL`);
+
   // Append-only play history for cross-install analytics (Phase 3a). The install pushes
   // new play_log rows incrementally; rows are never updated (ON CONFLICT DO NOTHING).
   // Distinct from station_cc_data (which tombstones) because history only grows.
@@ -2316,6 +2335,149 @@ app.get("/api/account/station/:uuid/data", requireAuth, async (req, res) => {
     console.error("[account/data:get]", e.message);
     return res.status(500).json({ error: "server_error" });
   }
+});
+
+// ── Cloud-first STAGED programming (no running install) ────────────────────────────────────
+// Dashboard authors categories/clocks/clock_slots/shows into staged_programming (parents referenced
+// by UUID); the install imports them on sign-in. Dashboard endpoints are JWT (requireAuth); the
+// install pull/ack use x-license-key (same auth as /account/data/sync).
+const STAGEABLE_TABLES = new Set(["categories", "clocks", "clock_slots", "shows"]);
+
+// Dashboard: list staged rows for one table of one of its stations.
+app.get("/api/account/station/:uuid/staged", requireAuth, async (req, res) => {
+  try {
+    const stationUuid = req.params.uuid;
+    const table = String(req.query.table || "");
+    if (!table) return res.status(400).json({ error: "missing_table" });
+    const { rows: own } = await pool.query(`SELECT 1 FROM stations WHERE uuid=$1 AND license_key_id=$2`, [stationUuid, req.auth.lk]);
+    if (own.length === 0) return res.status(404).json({ error: "station_not_found" });
+    const { rows } = await pool.query(
+      `SELECT row_uuid, payload, imported_at FROM staged_programming
+        WHERE station_uuid=$1 AND table_name=$2 AND deleted_at IS NULL ORDER BY updated_at ASC`,
+      [stationUuid, table]
+    );
+    res.json({ rows: rows.map((r) => ({ ...r.payload, row_uuid: r.row_uuid, imported_at: r.imported_at })) });
+  } catch (e) { console.error("[staged:list]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+// Dashboard: upsert one staged row. row_uuid is stable (generated if absent); editing clears imported_at.
+app.post("/api/account/station/:uuid/staged", requireAuth, async (req, res) => {
+  try {
+    const stationUuid = req.params.uuid;
+    const table = String(req.body?.table || "");
+    const rowUuid = String(req.body?.row_uuid || crypto.randomUUID());
+    const payload = req.body?.payload;
+    if (!table || !payload || typeof payload !== "object") return res.status(400).json({ error: "missing_fields" });
+    if (!STAGEABLE_TABLES.has(table)) return res.status(400).json({ error: "bad_table" });
+    const { rows: own } = await pool.query(`SELECT 1 FROM stations WHERE uuid=$1 AND license_key_id=$2`, [stationUuid, req.auth.lk]);
+    if (own.length === 0) return res.status(404).json({ error: "station_not_found" });
+    await pool.query(
+      // Shallow-MERGE on edit (existing || new): a cloned category keeps its preserved `id` even
+      // when the edit form only sends code/name/color/etc — so a rename/retune doesn't drop the
+      // DJ-aligned id and silently break the borrowed-library match on import.
+      `INSERT INTO staged_programming (station_uuid, table_name, row_uuid, payload, deleted_at, imported_at, updated_at)
+       VALUES ($1,$2,$3,$4,NULL,NULL,NOW())
+       ON CONFLICT (station_uuid, table_name, row_uuid)
+         DO UPDATE SET payload = staged_programming.payload || EXCLUDED.payload, deleted_at=NULL, imported_at=NULL, updated_at=NOW()`,
+      [stationUuid, table, rowUuid, JSON.stringify(payload)]
+    );
+    res.json({ ok: true, row_uuid: rowUuid });
+  } catch (e) { console.error("[staged:upsert]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+// Dashboard: soft-delete a staged row.
+app.delete("/api/account/station/:uuid/staged/:table/:rowUuid", requireAuth, async (req, res) => {
+  try {
+    const { uuid: stationUuid, table, rowUuid } = req.params;
+    const { rows: own } = await pool.query(`SELECT 1 FROM stations WHERE uuid=$1 AND license_key_id=$2`, [stationUuid, req.auth.lk]);
+    if (own.length === 0) return res.status(404).json({ error: "station_not_found" });
+    const r = await pool.query(
+      `UPDATE staged_programming SET deleted_at=NOW(), updated_at=NOW()
+        WHERE station_uuid=$1 AND table_name=$2 AND row_uuid=$3 AND deleted_at IS NULL`,
+      [stationUuid, table, rowUuid]
+    );
+    res.json({ ok: true, deleted: r.rowCount });
+  } catch (e) { console.error("[staged:delete]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+// Install: pull pending (non-deleted, non-imported) staged rows, DEPENDENCY-ORDERED
+// (categories -> clocks -> shows -> clock_slots) so parents exist before children resolve.
+app.get("/api/account/station/:uuid/staged/pending", async (req, res) => {
+  try {
+    const key = req.headers["x-license-key"];
+    if (!key) return res.status(401).json({ error: "missing_license_key" });
+    const license = await lookupLicense(key);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+    const stationUuid = req.params.uuid;
+    const { rows: own } = await pool.query(`SELECT 1 FROM stations WHERE uuid=$1 AND license_key_id=$2`, [stationUuid, license.id]);
+    if (own.length === 0) return res.status(404).json({ error: "station_not_found" });
+    const { rows } = await pool.query(
+      `SELECT table_name, row_uuid, payload FROM staged_programming
+        WHERE station_uuid=$1 AND deleted_at IS NULL AND imported_at IS NULL
+        ORDER BY CASE table_name WHEN 'categories' THEN 0 WHEN 'clocks' THEN 1 WHEN 'shows' THEN 2 WHEN 'clock_slots' THEN 3 ELSE 9 END, updated_at ASC`,
+      [stationUuid]
+    );
+    res.json({ rows });
+  } catch (e) { console.error("[staged:pending]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+// Install: mark rows imported (idempotency — not re-delivered on the next sign-in).
+app.post("/api/account/station/:uuid/staged/mark-imported", async (req, res) => {
+  try {
+    const key = req.headers["x-license-key"];
+    if (!key) return res.status(401).json({ error: "missing_license_key" });
+    const license = await lookupLicense(key);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+    const stationUuid = req.params.uuid;
+    const rowUuids = Array.isArray(req.body?.row_uuids) ? req.body.row_uuids.map(String) : [];
+    const { rows: own } = await pool.query(`SELECT 1 FROM stations WHERE uuid=$1 AND license_key_id=$2`, [stationUuid, license.id]);
+    if (own.length === 0) return res.status(404).json({ error: "station_not_found" });
+    if (rowUuids.length === 0) return res.json({ ok: true, marked: 0 });
+    const r = await pool.query(
+      `UPDATE staged_programming SET imported_at=NOW(), updated_at=NOW()
+        WHERE station_uuid=$1 AND row_uuid = ANY($2::text[]) AND imported_at IS NULL`,
+      [stationUuid, rowUuids]
+    );
+    res.json({ ok: true, marked: r.rowCount });
+  } catch (e) { console.error("[staged:mark-imported]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+// Dashboard: clone the GRANTED owner's category scheme into THIS station's staging, preserving the
+// owner's category id + uuid. After the install imports them (id-passthrough), the borrowed
+// library's songs — which carry the owner's category_id — match this station's clocks and fill
+// rotation. Requires an active library grant; reads the owner's categories from their CC mirror.
+app.post("/api/account/station/:uuid/staged/clone-categories", requireAuth, async (req, res) => {
+  try {
+    const stationUuid = req.params.uuid;
+    const { rows: own } = await pool.query(`SELECT 1 FROM stations WHERE uuid=$1 AND license_key_id=$2`, [stationUuid, req.auth.lk]);
+    if (own.length === 0) return res.status(404).json({ error: "station_not_found" });
+    const grant = (await pool.query(
+      `SELECT owner_license_id FROM library_grants WHERE grantee_license_id=$1 AND revoked_at IS NULL ORDER BY created_at ASC LIMIT 1`,
+      [req.auth.lk])).rows[0];
+    if (!grant) return res.status(400).json({ error: "no_grant" });
+    // Read the owner's categories from the authoritative SYNC stream (mutations) — the install may
+    // never have pushed categories to the CC mirror (verified: DJ's mirror is empty, but his 19
+    // categories are in the mutation log). Latest non-deleted row per id, with a real integer id.
+    const cats = (await pool.query(
+      `SELECT DISTINCT ON (row_id) payload_after AS payload, op
+         FROM mutations WHERE license_key_id=$1 AND table_name='categories'
+        ORDER BY row_id, server_seq DESC`, [grant.owner_license_id])).rows
+      .filter((r) => r.op !== 'delete' && r.payload && r.payload.id != null)
+      .map((r) => r.payload);
+    let cloned = 0;
+    for (const c of cats) {
+      if (c == null || c.id == null) continue;
+      const rowUuid = String(c.uuid || crypto.randomUUID());
+      const payload = { id: c.id, code: c.code, name: c.name, color: c.color, spins_per_hour: c.spins_per_hour, priority: c.priority };
+      await pool.query(
+        `INSERT INTO staged_programming (station_uuid, table_name, row_uuid, payload, deleted_at, imported_at, updated_at)
+         VALUES ($1,'categories',$2,$3,NULL,NULL,NOW())
+         ON CONFLICT (station_uuid, table_name, row_uuid) DO UPDATE SET payload=EXCLUDED.payload, deleted_at=NULL, imported_at=NULL, updated_at=NOW()`,
+        [stationUuid, rowUuid, JSON.stringify(payload)]);
+      cloned++;
+    }
+    res.json({ ok: true, cloned });
+  } catch (e) { console.error("[staged:clone-categories]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
 // Dashboard (JWT-admin) gets a signed PUT URL to upload a NEW song's audio to R2.
