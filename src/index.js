@@ -547,6 +547,91 @@ async function initDB() {
     ON library_grants (grantee_license_id) WHERE revoked_at IS NULL
   `);
 
+  // ── Account members + roles (RBAC) — Phase A (expand) ──────────────────────
+  // The account (= license today) holds MULTIPLE people. `users` (email logins) are the
+  // account-level people; `memberships` is the authoritative join of "which accounts a
+  // person belongs to and in what position". `account_users` (PIN operators) stay SEPARATE
+  // — station-level operators, not pulled in here. Phase A is additive only; the single-
+  // account coupling users.license_key_id is dropped later in Phase B, once the API reads
+  // memberships. Full design: docs/account-users-rbac.md.
+
+  // Positions: the role taxonomy. account_id NULL = system default (seeded below); set =
+  // a per-account custom position. `rank` is the hierarchy — a member may only manage or
+  // assign positions of LOWER rank than their own (delegated-admin ceiling).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS positions (
+      id          SERIAL PRIMARY KEY,
+      account_id  INTEGER REFERENCES licenses(id) ON DELETE CASCADE,
+      key         TEXT NOT NULL,
+      label       TEXT NOT NULL,
+      rank        INTEGER NOT NULL,
+      permissions JSONB NOT NULL DEFAULT '{}',
+      is_system   BOOLEAN NOT NULL DEFAULT false,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      deleted_at  TIMESTAMPTZ
+    )
+  `);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS positions_system_key  ON positions (key)             WHERE account_id IS NULL AND deleted_at IS NULL`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS positions_account_key ON positions (account_id, key) WHERE account_id IS NOT NULL AND deleted_at IS NULL`);
+
+  // Memberships: authoritative "which accounts + what position" for an email-person.
+  // all_stations=true = account-wide access (Owner/President); otherwise the member is
+  // scoped to specific stations via membership_station_access. added_by = delegated audit.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS memberships (
+      id           SERIAL PRIMARY KEY,
+      user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      account_id   INTEGER NOT NULL REFERENCES licenses(id) ON DELETE CASCADE,
+      position_id  INTEGER NOT NULL REFERENCES positions(id),
+      all_stations BOOLEAN NOT NULL DEFAULT false,
+      status       TEXT NOT NULL DEFAULT 'active',
+      added_by     INTEGER REFERENCES users(id),
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      deleted_at   TIMESTAMPTZ
+    )
+  `);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS memberships_user_account ON memberships (user_id, account_id) WHERE deleted_at IS NULL`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS memberships_account ON memberships (account_id) WHERE deleted_at IS NULL`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS memberships_user    ON memberships (user_id)    WHERE deleted_at IS NULL`);
+
+  // Per-station access: scopes a membership to specific stations when all_stations=false.
+  // NOTE: this table does NOT constrain a station to the membership's own account — the
+  // API enforces stations.license_key_id == memberships.account_id on the grant path so a
+  // delegated admin cannot grant cross-account stations (and the resolve path joins through
+  // memberships.account_id as defense in depth).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS membership_station_access (
+      id            SERIAL PRIMARY KEY,
+      membership_id INTEGER NOT NULL REFERENCES memberships(id) ON DELETE CASCADE,
+      station_uuid  TEXT NOT NULL REFERENCES stations(uuid) ON DELETE CASCADE,
+      can_edit      BOOLEAN NOT NULL DEFAULT true,
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS msa_membership_station ON membership_station_access (membership_id, station_uuid)`);
+
+  // Seed the system positions (idempotent). Permission flags are sensible defaults, tunable.
+  await pool.query(`
+    INSERT INTO positions (account_id, key, label, rank, permissions, is_system)
+    SELECT NULL, v.key, v.label, v.rank, v.permissions::jsonb, true
+    FROM (VALUES
+      ('owner','Owner',100,'{"manage_users":true,"manage_account":true,"manage_stations":true,"edit_programming":true,"go_on_air":true,"view_analytics":true}'),
+      ('president','President',90,'{"manage_users":true,"manage_account":true,"manage_stations":true,"edit_programming":true,"go_on_air":true,"view_analytics":true}'),
+      ('pd','Program Director',70,'{"manage_users":true,"manage_account":false,"manage_stations":true,"edit_programming":true,"go_on_air":true,"view_analytics":true}'),
+      ('engineer','Engineer',60,'{"manage_users":false,"manage_account":false,"manage_stations":true,"edit_programming":false,"go_on_air":true,"view_analytics":true}'),
+      ('md','Music Director',50,'{"manage_users":false,"manage_account":false,"manage_stations":false,"edit_programming":true,"go_on_air":true,"view_analytics":true}'),
+      ('jock','Jock',20,'{"manage_users":false,"manage_account":false,"manage_stations":false,"edit_programming":false,"go_on_air":true,"view_analytics":false}')
+    ) AS v(key,label,rank,permissions)
+    WHERE NOT EXISTS (SELECT 1 FROM positions p WHERE p.key = v.key AND p.account_id IS NULL AND p.deleted_at IS NULL)
+  `);
+
+  // NO auto-backfill of memberships from existing users rows. A new account starts with
+  // ZERO memberships; its first Owner and all authorized emails are added DELIBERATELY
+  // through the RBAC provisioning flow (platform-driven, or a guarded owner-bootstrap) so
+  // customer accounts never inherit stray/dev identities. See docs/account-users-rbac.md.
+
   // ── Control Center data mirror (Roadmap Item 5, Phase 2) ───────────────────
   // Generic per-station row mirror so the dashboard can VIEW install-owned data
   // (categories, clocks, library, …) without the full sync engine. The desktop
