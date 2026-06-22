@@ -80,10 +80,14 @@ function makeSyncRouter(pool) {
 
   router.post('/mutations', async (req, res) => {
     try {
-      // Plan A read-only half: members may PULL but never PUSH. Member writes are a separate,
-      // explicitly-gated path (not built until confirmed). x-license-key installs are unaffected.
-      if (req.isMember) return res.status(403).json({ error: 'member_write_disabled' });
-
+      // Plan A — one pipeline: a member authorized at the gate (active membership + edit permission
+      // + whole-account scope) PUSHES through the IDENTICAL path the account's own install uses.
+      // req.license.id is the account. Owner+member edits across machines converge ONLY because
+      // station programming is keyed by station UUID (Tier-2 UUID-identity, sync_uuid_identity), which
+      // remaps each install's local ids — proven in scripts/prove-dj-bidirectional.js and
+      // prove-editable-refs.js. (Note: scripts/prove-member-convergence.js proves the LEGACY path does
+      // NOT converge — it is the red baseline, not evidence of convergence.) No separate member-write
+      // branch. x-license-key installs are unaffected.
       const { client_id, station_id = null, batch } = req.body;
 
       if (!client_id || typeof client_id !== 'string')

@@ -991,9 +991,13 @@ async function memberStationScope(m) {
 // operators/shift/PIN (JWT typ != owner|user) are never in this path.
 const RBAC_SHADOW  = process.env.RBAC_MEMBERSHIP_SHADOW  === "1";
 const RBAC_ENFORCE = process.env.RBAC_MEMBERSHIP_ENFORCE === "1";
-// Plan A (read-only half), off by default: when on, the /sync gate ALSO accepts a member JWT for
-// PULL (read), scoped to the member's account. The x-license-key path is unchanged. Member WRITES
-// (push) stay disabled until separately confirmed/built.
+// Plan A — one pipeline, login as the gate (off by default). When on, the /sync gate ALSO accepts a
+// member JWT and authorizes it for the member's account, so PULL and PUSH run through the IDENTICAL
+// pipeline the account's own install uses. The x-license-key path is unchanged. Member access
+// requires EDIT permission (desktop access == edit access) and whole-account scope. Cross-machine
+// owner+member convergence depends on Tier-2 UUID-identity scoping (sync_uuid_identity) — proven in
+// scripts/prove-dj-bidirectional.js / prove-editable-refs.js. (scripts/prove-member-convergence.js is
+// the RED baseline showing the legacy local-integer path does NOT converge — not a convergence proof.)
 const RBAC_MEMBERSHIP_SYNC = process.env.RBAC_MEMBERSHIP_SYNC === "1";
 
 // Returns the Set of station uuids the requester may see in `accountId` under membership rules,
@@ -1013,13 +1017,16 @@ async function membershipStationFilter(req, accountId) {
   return RBAC_ENFORCE ? allowed : null;                                 // shadow: log only, keep legacy result
 }
 
-// ── Plan A read-only half: the /sync gate ─────────────────────────────────────
+// ── Plan A — the /sync gate (one pipeline, login as the gate) ─────────────────
 // Wraps requireLicense. The x-license-key path is IDENTICAL to today (this just delegates). When
-// RBAC_MEMBERSHIP_SYNC is on AND there's no license key but a member Bearer JWT, scope sync to the
-// member's account so they can PULL its data. Guards: (1) active membership required; (2) refuse a
-// partial-account scope — if the account has any station outside the member's scope, deny (the
-// mutation stream keys on local station_id, not uuid, so a subset can't be cleanly filtered);
-// (3) member WRITES are refused in the POST handler. Flag off / key present = today's behavior.
+// RBAC_MEMBERSHIP_SYNC is on AND there's no license key but a member Bearer JWT, the member is
+// authorized for their account and then PULL and PUSH run through the SAME pipeline the account's
+// own install uses — there is NO separate member-write path. Guards:
+// (1) active membership; (2) EDIT permission required — desktop access == edit access, read+write
+// travel together; (3) whole-account scope only — refuse a partial-account scope. (With Tier-2 the
+// pull keys on station_uuid, so a subset is now technically filterable; whole-account is kept here as
+// a conservative default, not a technical necessity.) Flag off / key present = today's behavior.
+// Cross-machine convergence relies on Tier-2 UUID-identity (sync_uuid_identity), not this gate.
 async function requireLicenseOrMember(req, res, next) {
   if (req.headers["x-license-key"]) return requireLicense(req, res, next);   // unchanged path
   if (RBAC_MEMBERSHIP_SYNC) {
@@ -1030,6 +1037,7 @@ async function requireLicenseOrMember(req, res, next) {
         if ((p.typ === "owner" || p.typ === "user") && p.lk) {
           const m = await getMembership(p.uid, p.lk);
           if (m && m.status === "active") {
+            if (!memberCan(m, "edit_programming")) return res.status(403).json({ error: "member_edit_required" });
             if (!m.all_stations) {
               const scope = await memberStationScope(m);   // Set of accessible station uuids
               const acct = (await pool.query(`SELECT uuid FROM stations WHERE license_key_id = $1`, [p.lk])).rows.map(r => r.uuid);
