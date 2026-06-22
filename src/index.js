@@ -1014,7 +1014,8 @@ function requireMember(perm) {
       const accountId = Number(req.params.accountId);
       if (!accountId) return res.status(400).json({ error: "bad_account" });
       const m = await getMembership(req.auth.uid, accountId);
-      if (!memberCan(m, perm)) return res.status(403).json({ error: "forbidden", need: perm });
+      if (!m || m.status !== "active") return res.status(403).json({ error: "not_a_member" });
+      if (perm && !memberCan(m, perm)) return res.status(403).json({ error: "forbidden", need: perm });
       req.member = m; req.accountId = accountId; next();
     } catch (e) { console.error("[requireMember]", e.message); res.status(500).json({ error: "server_error" }); }
   });
@@ -2553,6 +2554,45 @@ app.get("/api/me/memberships", requireAuth, async (req, res) => {
     }
     res.json({ user_id: req.auth.uid, memberships: rows });
   } catch (e) { console.error("[me:memberships]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+// Stations the member can access IN a chosen account — account-context (keyed by :accountId),
+// gated by active membership, scoped to the membership's stations. This is what the web console
+// calls after the user picks an account from /api/me/memberships. Membership-native: no
+// license_key_id fallback (you must be a member of the account to read it). Same row shape as
+// the legacy GET /api/account/stations.
+app.get("/api/accounts/:accountId/stations", requireMember(), async (req, res) => {
+  try {
+    const scope = await memberStationScope(req.member); // null = all stations in the account
+    const { rows } = await pool.query(
+      `SELECT s.uuid, s.name, s.nickname, s.frequency, s.call_letters, s.created_at,
+              m.slug, m.display_name, m.logo_url, m.color_primary, m.color_secondary,
+              m.description, m.public_enabled, m.stream_url,
+              n.playing, n.title, n.artist, n.deck, n.decks, n.started_at, n.duration_sec, n.queue,
+              n.updated_at AS now_playing_updated_at
+         FROM stations s
+         LEFT JOIN station_metadata    m ON m.station_uuid = s.uuid
+         LEFT JOIN station_now_playing n ON n.station_uuid = s.uuid
+        WHERE s.license_key_id = $1
+        ORDER BY s.created_at ASC`,
+      [req.accountId]);
+    const visible = scope === null ? rows : rows.filter(r => scope.has(r.uuid));
+    const stations = visible.map(r => ({
+      uuid: r.uuid, name: r.name, nickname: r.nickname, frequency: r.frequency,
+      call_letters: r.call_letters, created_at: r.created_at,
+      metadata: {
+        slug: r.slug, display_name: r.display_name, logo_url: r.logo_url,
+        color_primary: r.color_primary, color_secondary: r.color_secondary,
+        description: r.description, public_enabled: !!r.public_enabled, stream_url: r.stream_url,
+      },
+      now_playing: r.now_playing_updated_at ? {
+        playing: r.playing, title: r.title, artist: r.artist, deck: r.deck, decks: r.decks || null,
+        started_at: r.started_at, duration_sec: r.duration_sec, queue: r.queue || [],
+        updated_at: r.now_playing_updated_at,
+      } : null,
+    }));
+    res.json({ account_id: req.accountId, position: req.member.position, can_edit: !!(req.member.permissions && req.member.permissions.edit_programming), stations });
+  } catch (e) { console.error("[accounts:stations]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
 // ── Control Center data mirror (Phase 2) ──────────────────────────────────────
