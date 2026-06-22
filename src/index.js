@@ -954,6 +954,38 @@ function requireAuthAdmin(req, res, next) {
   });
 }
 
+// ── Account membership (RBAC) — Phase B ────────────────────────────────────
+// A logged-in EMAIL person (users.id) holds a MEMBERSHIP in an account: a position
+// (permission set + rank) and a station scope. account_users (PIN operators) are a
+// SEPARATE principal with no membership. See docs/account-users-rbac.md.
+async function getMembership(userId, accountId) {
+  const { rows } = await pool.query(
+    `SELECT m.id, m.account_id, m.position_id, m.all_stations, m.status,
+            p.key AS position, p.rank, p.permissions
+       FROM memberships m JOIN positions p ON p.id = m.position_id
+      WHERE m.user_id = $1 AND m.account_id = $2 AND m.deleted_at IS NULL`,
+    [userId, accountId]);
+  return rows[0] || null;
+}
+function memberCan(m, perm) { return !!(m && m.status === "active" && m.permissions && m.permissions[perm] === true); }
+
+// requireMember(perm): requester must be an EMAIL login (JWT typ owner|user) holding an
+// active membership in the path account (:accountId) that carries `perm`. Sets req.member
+// + req.accountId. PIN-operator (account_users) logins have no membership → 403.
+function requireMember(perm) {
+  return (req, res, next) => requireAuth(req, res, async () => {
+    try {
+      if (req.auth.typ !== "owner" && req.auth.typ !== "user")
+        return res.status(403).json({ error: "member_login_required" });
+      const accountId = Number(req.params.accountId);
+      if (!accountId) return res.status(400).json({ error: "bad_account" });
+      const m = await getMembership(req.auth.uid, accountId);
+      if (!memberCan(m, perm)) return res.status(403).json({ error: "forbidden", need: perm });
+      req.member = m; req.accountId = accountId; next();
+    } catch (e) { console.error("[requireMember]", e.message); res.status(500).json({ error: "server_error" }); }
+  });
+}
+
 // ── Platform owner (Ether Technologies) ───────────────────────────────────
 // A single platform-operator login that sees ALL accounts/stations — for the company's
 // own cross-account analytics + BMI/ASCAP/SoundExchange listening-hour reporting. Gated by
@@ -2331,6 +2363,88 @@ app.post("/api/account/users/sync", async (req, res) => {
     console.error("[account/users:sync]", e.message);
     return res.status(500).json({ error: "server_error" });
   }
+});
+
+// ── Account members (RBAC) — Phase B: list / add / remove ─────────────────────
+// Manage the PEOPLE on an account (memberships): email + position + per-station scope.
+// Gated by requireMember("manage_users") in the path account. Distinct from the PIN
+// operators (/api/account/users). See docs/account-users-rbac.md.
+
+// List members with their position + station scope.
+app.get("/api/accounts/:accountId/members", requireMember("manage_users"), async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT m.id, u.email, p.key AS position, p.rank, p.label, m.all_stations, m.status,
+              COALESCE((SELECT json_agg(json_build_object('station_uuid', msa.station_uuid, 'can_edit', msa.can_edit))
+                        FROM membership_station_access msa WHERE msa.membership_id = m.id), '[]') AS stations
+         FROM memberships m
+         JOIN users u ON u.id = m.user_id
+         JOIN positions p ON p.id = m.position_id
+        WHERE m.account_id = $1 AND m.deleted_at IS NULL
+        ORDER BY p.rank DESC, u.email`, [req.accountId]);
+    res.json({ members: rows });
+  } catch (e) { console.error("[members:list]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+// Add or update a member: { email, position, stations: "all" | [uuid,...] }.
+// Delegation ceiling: you may only assign a position of LOWER rank than your own. Scoped
+// stations must belong to THIS account (no cross-account grant). Resolve-or-create the user.
+app.post("/api/accounts/:accountId/members", requireMember("manage_users"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const positionKey = String(req.body?.position || "").trim();
+    const stations = req.body?.stations;
+    if (!email || !positionKey) return res.status(400).json({ error: "email_and_position_required" });
+
+    const pos = (await pool.query(
+      `SELECT id, rank FROM positions WHERE key=$1 AND (account_id IS NULL OR account_id=$2) AND deleted_at IS NULL
+        ORDER BY account_id NULLS LAST LIMIT 1`, [positionKey, req.accountId])).rows[0];
+    if (!pos) return res.status(400).json({ error: "unknown_position" });
+    if (pos.rank >= req.member.rank) return res.status(403).json({ error: "cannot_assign_at_or_above_your_rank" });
+
+    const all = stations === "all";
+    const uuids = Array.isArray(stations) ? stations : [];
+    if (!all && uuids.length === 0) return res.status(400).json({ error: "stations_required" });
+
+    await client.query("BEGIN");
+    let u = (await client.query(`SELECT id FROM users WHERE lower(email)=lower($1)`, [email])).rows[0];
+    if (!u) u = (await client.query(`INSERT INTO users (email, password_hash, email_verified) VALUES ($1,'',false) RETURNING id`, [email])).rows[0];
+    const m = (await client.query(
+      `INSERT INTO memberships (user_id, account_id, position_id, all_stations, status, added_by)
+       VALUES ($1,$2,$3,$4,'active',$5)
+       ON CONFLICT (user_id, account_id) WHERE deleted_at IS NULL
+       DO UPDATE SET position_id=EXCLUDED.position_id, all_stations=EXCLUDED.all_stations, status='active', updated_at=NOW()
+       RETURNING id`, [u.id, req.accountId, pos.id, all, req.auth.uid])).rows[0];
+    await client.query(`DELETE FROM membership_station_access WHERE membership_id=$1`, [m.id]);
+    if (!all) for (const su of uuids) {
+      const ok = (await client.query(`SELECT 1 FROM stations WHERE uuid=$1 AND license_key_id=$2`, [su, req.accountId])).rows.length;
+      if (!ok) { await client.query("ROLLBACK"); return res.status(400).json({ error: "cross_account_station", station: su }); }
+      await client.query(`INSERT INTO membership_station_access (membership_id, station_uuid) VALUES ($1,$2) ON CONFLICT (membership_id, station_uuid) DO NOTHING`, [m.id, su]);
+    }
+    await client.query("COMMIT");
+    res.json({ ok: true, membership_id: m.id });
+  } catch (e) { await client.query("ROLLBACK").catch(()=>{}); console.error("[members:add]", e.message); res.status(500).json({ error: "server_error" }); }
+  finally { client.release(); }
+});
+
+// Remove a member (soft-delete). Cannot remove someone at/above your rank, nor the last Owner.
+app.delete("/api/accounts/:accountId/members/:membershipId", requireMember("manage_users"), async (req, res) => {
+  try {
+    const target = (await pool.query(
+      `SELECT m.id, p.rank, p.key AS position FROM memberships m JOIN positions p ON p.id=m.position_id
+        WHERE m.id=$1 AND m.account_id=$2 AND m.deleted_at IS NULL`, [req.params.membershipId, req.accountId])).rows[0];
+    if (!target) return res.status(404).json({ error: "not_found" });
+    if (target.rank >= req.member.rank) return res.status(403).json({ error: "cannot_remove_at_or_above_your_rank" });
+    if (target.position === "owner") {
+      const owners = (await pool.query(
+        `SELECT COUNT(*) n FROM memberships m JOIN positions p ON p.id=m.position_id
+          WHERE m.account_id=$1 AND p.key='owner' AND m.deleted_at IS NULL`, [req.accountId])).rows[0].n;
+      if (Number(owners) <= 1) return res.status(400).json({ error: "cannot_remove_last_owner" });
+    }
+    await pool.query(`UPDATE memberships SET deleted_at=NOW(), updated_at=NOW() WHERE id=$1`, [req.params.membershipId]);
+    res.json({ ok: true });
+  } catch (e) { console.error("[members:remove]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
 // ── Control Center data mirror (Phase 2) ──────────────────────────────────────
