@@ -80,6 +80,10 @@ function makeSyncRouter(pool) {
 
   router.post('/mutations', async (req, res) => {
     try {
+      // Plan A read-only half: members may PULL but never PUSH. Member writes are a separate,
+      // explicitly-gated path (not built until confirmed). x-license-key installs are unaffected.
+      if (req.isMember) return res.status(403).json({ error: 'member_write_disabled' });
+
       const { client_id, station_id = null, batch } = req.body;
 
       if (!client_id || typeof client_id !== 'string')

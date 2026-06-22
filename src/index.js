@@ -985,6 +985,10 @@ async function memberStationScope(m) {
 // operators/shift/PIN (JWT typ != owner|user) are never in this path.
 const RBAC_SHADOW  = process.env.RBAC_MEMBERSHIP_SHADOW  === "1";
 const RBAC_ENFORCE = process.env.RBAC_MEMBERSHIP_ENFORCE === "1";
+// Plan A (read-only half), off by default: when on, the /sync gate ALSO accepts a member JWT for
+// PULL (read), scoped to the member's account. The x-license-key path is unchanged. Member WRITES
+// (push) stay disabled until separately confirmed/built.
+const RBAC_MEMBERSHIP_SYNC = process.env.RBAC_MEMBERSHIP_SYNC === "1";
 
 // Returns the Set of station uuids the requester may see in `accountId` under membership rules,
 // or null = "no restriction, use the legacy license_key_id result". Logs a divergence-denial
@@ -1001,6 +1005,41 @@ async function membershipStationFilter(req, accountId) {
   const hidden = legacy.filter(u => !allowed.has(u));
   if (hidden.length) console.warn(`[rbac:divergence-denial] user=${req.auth.uid} account=${accountId} mode=${RBAC_ENFORCE ? "enforce" : "shadow"} would_hide=${hidden.length}:[${hidden.join(",")}]`);
   return RBAC_ENFORCE ? allowed : null;                                 // shadow: log only, keep legacy result
+}
+
+// ── Plan A read-only half: the /sync gate ─────────────────────────────────────
+// Wraps requireLicense. The x-license-key path is IDENTICAL to today (this just delegates). When
+// RBAC_MEMBERSHIP_SYNC is on AND there's no license key but a member Bearer JWT, scope sync to the
+// member's account so they can PULL its data. Guards: (1) active membership required; (2) refuse a
+// partial-account scope — if the account has any station outside the member's scope, deny (the
+// mutation stream keys on local station_id, not uuid, so a subset can't be cleanly filtered);
+// (3) member WRITES are refused in the POST handler. Flag off / key present = today's behavior.
+async function requireLicenseOrMember(req, res, next) {
+  if (req.headers["x-license-key"]) return requireLicense(req, res, next);   // unchanged path
+  if (RBAC_MEMBERSHIP_SYNC) {
+    const h = req.headers["authorization"] || "";
+    if (h.startsWith("Bearer ")) {
+      try {
+        const p = jwt.verify(h.slice(7), JWT_SECRET);
+        if ((p.typ === "owner" || p.typ === "user") && p.lk) {
+          const m = await getMembership(p.uid, p.lk);
+          if (m && m.status === "active") {
+            if (!m.all_stations) {
+              const scope = await memberStationScope(m);   // Set of accessible station uuids
+              const acct = (await pool.query(`SELECT uuid FROM stations WHERE license_key_id = $1`, [p.lk])).rows.map(r => r.uuid);
+              if (acct.some(u => !scope.has(u)))
+                return res.status(403).json({ error: "member_partial_scope_unsupported" });
+            }
+            req.license = { id: p.lk };
+            req.isMember = true;
+            req.member = m;
+            return next();
+          }
+        }
+      } catch { /* not a valid member token — fall through to the license error */ }
+    }
+  }
+  return requireLicense(req, res, next);   // no key, no valid member → same 401 as today
 }
 
 // requireMember(perm): requester must be an EMAIL login (JWT typ owner|user) holding an
@@ -5280,7 +5319,7 @@ app.post("/invite/send", async (req, res) => {
 // ── Sync ──────────────────────────────────────────────────────
 
 const syncRouter = require('./routes/sync')(pool);
-app.use('/sync', requireLicense, syncRouter);
+app.use('/sync', requireLicenseOrMember, syncRouter);
 
 // ── Start ─────────────────────────────────────────────────────
 
