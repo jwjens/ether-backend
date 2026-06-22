@@ -173,6 +173,7 @@ const pass = (label, ok, detail) => { checks.push({ label, ok: !!ok }); console.
       server_seq BIGSERIAL PRIMARY KEY, id TEXT, client_id TEXT, station_id TEXT, operator_id TEXT,
       license_key_id INTEGER, table_name TEXT, row_id TEXT, op TEXT, payload_before JSONB, payload_after JSONB,
       created_at TIMESTAMPTZ, hlc TEXT, parent_mutation_id TEXT, schema_version INTEGER, conflict_resolution JSONB,
+      station_uuid TEXT, ref_uuids JSONB,
       CONSTRAINT mutations_lic_id UNIQUE (license_key_id, id))`);
   pg.public.none(`CREATE TABLE library_grants (id SERIAL PRIMARY KEY, owner_license_id INTEGER NOT NULL, grantee_license_id INTEGER NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW(), revoked_at TIMESTAMPTZ)`);
   const { Pool } = pg.adapters.createPg();

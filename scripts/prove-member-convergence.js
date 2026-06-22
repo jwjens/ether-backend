@@ -143,6 +143,7 @@ function makeEdit({ install, clientId, name, hlc, mutId }) {
       license_key_id INTEGER, table_name TEXT, row_id TEXT, op TEXT,
       payload_before JSONB, payload_after JSONB, created_at TIMESTAMPTZ,
       hlc TEXT, parent_mutation_id TEXT, schema_version INTEGER, conflict_resolution JSONB,
+      station_uuid TEXT, ref_uuids JSONB,
       CONSTRAINT mutations_lic_id UNIQUE (license_key_id, id)
     )`);
   pg.public.none(`

@@ -390,6 +390,12 @@ async function initDB() {
   // on Railway, so CREATE TABLE IF NOT EXISTS is a no-op there).
   await pool.query(`ALTER TABLE mutations ADD COLUMN IF NOT EXISTS operator_id    TEXT`);
   await pool.query(`ALTER TABLE mutations ADD COLUMN IF NOT EXISTS license_key_id INTEGER REFERENCES licenses(id)`);
+  // UUID-identity (Tier-2): scope station-scoped rows by a STABLE station_uuid instead of the
+  // sender's per-machine local integer station_id, and carry parent FK uuids (ref_uuids) so the
+  // receiver remaps to its OWN local ids. Both NULL for legacy clients → behavior unchanged.
+  await pool.query(`ALTER TABLE mutations ADD COLUMN IF NOT EXISTS station_uuid   TEXT`);
+  await pool.query(`ALTER TABLE mutations ADD COLUMN IF NOT EXISTS ref_uuids      JSONB`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_mutations_suid_seq ON mutations(station_uuid, server_seq)`);
   // Backing index for ON CONFLICT (license_key_id, id) DO NOTHING in sync.js.
   // CREATE UNIQUE INDEX IF NOT EXISTS is the idempotent form; no equivalent
   // "ADD CONSTRAINT IF NOT EXISTS" exists in Postgres for unique constraints.

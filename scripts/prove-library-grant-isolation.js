@@ -25,7 +25,8 @@ db.public.none(`
     id TEXT, client_id TEXT, station_id TEXT, operator_id TEXT,
     license_key_id INTEGER, table_name TEXT, row_id TEXT, op TEXT,
     payload_before JSONB, payload_after JSONB, created_at TIMESTAMPTZ,
-    hlc TEXT, parent_mutation_id TEXT, schema_version INTEGER, conflict_resolution JSONB
+    hlc TEXT, parent_mutation_id TEXT, schema_version INTEGER, conflict_resolution JSONB,
+    station_uuid TEXT, ref_uuids JSONB
   )`);
 db.public.none(`
   CREATE TABLE library_grants (

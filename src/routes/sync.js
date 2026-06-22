@@ -121,8 +121,9 @@ function makeSyncRouter(pool) {
               table_name, row_id, op,
               payload_before, payload_after,
               created_at, hlc, parent_mutation_id,
-              schema_version, conflict_resolution
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+              schema_version, conflict_resolution,
+              station_uuid, ref_uuids
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
             ON CONFLICT (license_key_id, id) DO NOTHING
           `, [
             m.id,
@@ -140,6 +141,11 @@ function makeSyncRouter(pool) {
             m.parent_mutation_id ?? null,
             m.schema_version,
             m.conflict_resolution != null ? JSON.stringify(m.conflict_resolution) : null,
+            // UUID-identity (Tier-2): station_uuid scopes station-scoped rows by stable station
+            // identity instead of the sender's local integer; ref_uuids carries parent FK uuids so
+            // the receiver can remap to its OWN local ids. Both null for legacy clients (unchanged).
+            m.station_uuid ?? null,
+            m.ref_uuids != null ? JSON.stringify(m.ref_uuids) : null,
           ]);
           accepted.push(m.id);
         } catch (e) {
@@ -163,13 +169,14 @@ function makeSyncRouter(pool) {
 
   router.get('/mutations', async (req, res) => {
     try {
-      const { client_id, station_id = null, since_seq = '0' } = req.query;
+      const { client_id, station_id = null, station_uuid = null, since_seq = '0' } = req.query;
 
       if (!client_id || typeof client_id !== 'string')
         return res.status(400).json({ error: 'Missing client_id' });
 
       const sinceSeq = parseInt(since_seq, 10) || 0;
       const sid      = station_id || null;
+      const suid     = station_uuid || null;   // UUID-identity opt-in (Tier-2): scope by stable station UUID
 
       // Library grants: owner licenses whose music catalog THIS license may READ (master-
       // catalog cross-license access). Empty for the vast majority of installs → the UNION
@@ -179,68 +186,56 @@ function makeSyncRouter(pool) {
       // sole guard (proven in scripts/prove-library-grant-isolation.js).
       const ownerIds = await grantedOwnerLicenseIds(pool, req.license.id);
 
+      const COLS = `server_seq, id, client_id, station_id, operator_id,
+            table_name, row_id, op, payload_before, payload_after,
+            created_at, hlc, parent_mutation_id, schema_version, conflict_resolution,
+            station_uuid, ref_uuids`;
+
       // Return up to 500 mutations the client has not yet seen, scoped to this
       // license [tenant isolation]. Own-client mutations are included — the
       // client deduplicates by id locally (idempotency check, Step 1 of §19).
       // Scope filter:
-      //   - if station_id provided: return station-scoped + install-scoped (station_id IS NULL)
-      //   - if station_id absent:   return install-scoped only
+      //   - station_uuid provided (UUID-identity): station rows by STABLE station_uuid + install-scope
+      //     (BOTH station_id and station_uuid NULL). Legacy station-scoped rows (station_id set,
+      //     station_uuid NULL) are NOT delivered here — they predate station_uuid and are corrected by
+      //     the one-time re-baseline, never leaked as install-scope.
+      //   - else station_id provided (legacy): station-scoped + install-scoped (station_id IS NULL)
+      //   - else: install-scoped only
       // PLUS (UNION): granted owners' install-scope LIBRARY rows only (table-whitelisted).
       let rows;
-      if (sid) {
+      if (suid) {
         const result = await pool.query(`
-          SELECT
-            server_seq, id, client_id, station_id, operator_id,
-            table_name, row_id, op,
-            payload_before, payload_after,
-            created_at, hlc, parent_mutation_id,
-            schema_version, conflict_resolution
-          FROM mutations
-          WHERE server_seq > $1
-            AND license_key_id = $2
+          SELECT ${COLS} FROM mutations
+          WHERE server_seq > $1 AND license_key_id = $2
+            AND (station_uuid = $3 OR (station_uuid IS NULL AND station_id IS NULL))
+          UNION ALL
+          SELECT ${COLS} FROM mutations
+          WHERE server_seq > $1 AND license_key_id = ANY($4::int[])
+            AND station_id IS NULL AND table_name = ANY($5::text[])
+          ORDER BY server_seq ASC LIMIT 500
+        `, [sinceSeq, req.license.id, suid, ownerIds, GRANTABLE_LIBRARY_TABLES]);
+        rows = result.rows;
+      } else if (sid) {
+        const result = await pool.query(`
+          SELECT ${COLS} FROM mutations
+          WHERE server_seq > $1 AND license_key_id = $2
             AND (station_id = $3 OR station_id IS NULL)
           UNION ALL
-          SELECT
-            server_seq, id, client_id, station_id, operator_id,
-            table_name, row_id, op,
-            payload_before, payload_after,
-            created_at, hlc, parent_mutation_id,
-            schema_version, conflict_resolution
-          FROM mutations
-          WHERE server_seq > $1
-            AND license_key_id = ANY($4::int[])
-            AND station_id IS NULL
-            AND table_name = ANY($5::text[])
-          ORDER BY server_seq ASC
-          LIMIT 500
+          SELECT ${COLS} FROM mutations
+          WHERE server_seq > $1 AND license_key_id = ANY($4::int[])
+            AND station_id IS NULL AND table_name = ANY($5::text[])
+          ORDER BY server_seq ASC LIMIT 500
         `, [sinceSeq, req.license.id, sid, ownerIds, GRANTABLE_LIBRARY_TABLES]);
         rows = result.rows;
       } else {
         const result = await pool.query(`
-          SELECT
-            server_seq, id, client_id, station_id, operator_id,
-            table_name, row_id, op,
-            payload_before, payload_after,
-            created_at, hlc, parent_mutation_id,
-            schema_version, conflict_resolution
-          FROM mutations
-          WHERE server_seq > $1
-            AND license_key_id = $2
-            AND station_id IS NULL
+          SELECT ${COLS} FROM mutations
+          WHERE server_seq > $1 AND license_key_id = $2 AND station_id IS NULL
           UNION ALL
-          SELECT
-            server_seq, id, client_id, station_id, operator_id,
-            table_name, row_id, op,
-            payload_before, payload_after,
-            created_at, hlc, parent_mutation_id,
-            schema_version, conflict_resolution
-          FROM mutations
-          WHERE server_seq > $1
-            AND license_key_id = ANY($3::int[])
-            AND station_id IS NULL
-            AND table_name = ANY($4::text[])
-          ORDER BY server_seq ASC
-          LIMIT 500
+          SELECT ${COLS} FROM mutations
+          WHERE server_seq > $1 AND license_key_id = ANY($3::int[])
+            AND station_id IS NULL AND table_name = ANY($4::text[])
+          ORDER BY server_seq ASC LIMIT 500
         `, [sinceSeq, req.license.id, ownerIds, GRANTABLE_LIBRARY_TABLES]);
         rows = result.rows;
       }
@@ -260,6 +255,8 @@ function makeSyncRouter(pool) {
         parent_mutation_id:  r.parent_mutation_id,
         schema_version:      r.schema_version,
         conflict_resolution: r.conflict_resolution,
+        station_uuid:        r.station_uuid ?? null,
+        ref_uuids:           r.ref_uuids ?? null,
       }));
 
       const maxSeq = rows.length > 0
