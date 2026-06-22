@@ -976,6 +976,33 @@ async function memberStationScope(m) {
   return new Set(rows.map(r => r.station_uuid));
 }
 
+// ── #2b entitlement enforcement (flagged, off by default) ──────────────────────
+//   RBAC_MEMBERSHIP_SHADOW=1  : compute the membership decision and LOG divergence, but
+//                               still return the legacy result (watch-only, zero risk).
+//   RBAC_MEMBERSHIP_ENFORCE=1 : membership-first access, with fallback to legacy.
+// Both off (default) = today's behavior, untouched. license_key_id stays as the fallback;
+// the column is NOT dropped until this has run safely in prod. ONLY the email/account tier —
+// operators/shift/PIN (JWT typ != owner|user) are never in this path.
+const RBAC_SHADOW  = process.env.RBAC_MEMBERSHIP_SHADOW  === "1";
+const RBAC_ENFORCE = process.env.RBAC_MEMBERSHIP_ENFORCE === "1";
+
+// Returns the Set of station uuids the requester may see in `accountId` under membership rules,
+// or null = "no restriction, use the legacy license_key_id result". Logs a divergence-denial
+// whenever the membership path would HIDE a station the legacy path showed (the silent-lockout
+// signal to watch in prod). In SHADOW mode it logs but returns null (does not enforce).
+async function membershipStationFilter(req, accountId) {
+  if (!RBAC_SHADOW && !RBAC_ENFORCE) return null;                       // flags off: pure legacy
+  if (req.auth.typ !== "owner" && req.auth.typ !== "user") return null; // operator/shift tier: never enforced
+  const m = await getMembership(req.auth.uid, accountId);
+  if (!m) return null;                                                  // no membership: FALLBACK to legacy
+  const scope = await memberStationScope(m);                            // null = all account stations
+  const legacy = (await pool.query(`SELECT uuid FROM stations WHERE license_key_id = $1`, [accountId])).rows.map(r => r.uuid);
+  const allowed = scope === null ? new Set(legacy) : scope;
+  const hidden = legacy.filter(u => !allowed.has(u));
+  if (hidden.length) console.warn(`[rbac:divergence-denial] user=${req.auth.uid} account=${accountId} mode=${RBAC_ENFORCE ? "enforce" : "shadow"} would_hide=${hidden.length}:[${hidden.join(",")}]`);
+  return RBAC_ENFORCE ? allowed : null;                                 // shadow: log only, keep legacy result
+}
+
 // requireMember(perm): requester must be an EMAIL login (JWT typ owner|user) holding an
 // active membership in the path account (:accountId) that carries `perm`. Sets req.member
 // + req.accountId. PIN-operator (account_users) logins have no membership → 403.
@@ -2144,7 +2171,10 @@ app.get("/api/account/stations", requireAuth, async (req, res) => {
        ORDER BY s.created_at ASC`,
       [req.auth.lk]
     );
-    const stations = rows.map(r => ({
+    // #2b: membership-first station scoping (flagged; null = legacy result, unchanged).
+    const filter = await membershipStationFilter(req, req.auth.lk);
+    const visible = filter ? rows.filter(r => filter.has(r.uuid)) : rows;
+    const stations = visible.map(r => ({
       uuid: r.uuid, name: r.name, nickname: r.nickname, frequency: r.frequency,
       call_letters: r.call_letters, created_at: r.created_at,
       metadata: {
