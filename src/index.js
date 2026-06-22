@@ -968,6 +968,13 @@ async function getMembership(userId, accountId) {
   return rows[0] || null;
 }
 function memberCan(m, perm) { return !!(m && m.status === "active" && m.permissions && m.permissions[perm] === true); }
+// A membership's reachable station scope: null = ALL stations in the account (no restriction);
+// otherwise a Set of the specific station uuids it may touch.
+async function memberStationScope(m) {
+  if (m.all_stations) return null;
+  const { rows } = await pool.query(`SELECT station_uuid FROM membership_station_access WHERE membership_id = $1`, [m.id]);
+  return new Set(rows.map(r => r.station_uuid));
+}
 
 // requireMember(perm): requester must be an EMAIL login (JWT typ owner|user) holding an
 // active membership in the path account (:accountId) that carries `perm`. Sets req.member
@@ -2407,6 +2414,15 @@ app.post("/api/accounts/:accountId/members", requireMember("manage_users"), asyn
     const uuids = Array.isArray(stations) ? stations : [];
     if (!all && uuids.length === 0) return res.status(400).json({ error: "stations_required" });
 
+    // Per-station delegation ceiling: you may only grant stations within your OWN scope.
+    // An account-wide member (Owner/President, all_stations) can grant anything in the account;
+    // a station-scoped member (e.g. a PD limited to certain stations) can only grant those.
+    const myScope = await memberStationScope(req.member);
+    if (myScope !== null) {
+      if (all) return res.status(403).json({ error: "cannot_grant_all_stations_beyond_your_scope" });
+      for (const su of uuids) if (!myScope.has(su)) return res.status(403).json({ error: "station_outside_your_scope", station: su });
+    }
+
     await client.query("BEGIN");
     let u = (await client.query(`SELECT id FROM users WHERE lower(email)=lower($1)`, [email])).rows[0];
     if (!u) u = (await client.query(`INSERT INTO users (email, password_hash, email_verified) VALUES ($1,'',false) RETURNING id`, [email])).rows[0];
@@ -2445,6 +2461,44 @@ app.delete("/api/accounts/:accountId/members/:membershipId", requireMember("mana
     await pool.query(`UPDATE memberships SET deleted_at=NOW(), updated_at=NOW() WHERE id=$1`, [req.params.membershipId]);
     res.json({ ok: true });
   } catch (e) { console.error("[members:remove]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+// ── Account positions (RBAC) — list / define ──────────────────────────────────
+// System positions (account_id NULL) are read-only defaults. The account CREATOR/owner
+// defines CUSTOM positions (Operations Director, PD, …) scoped to their account.
+
+// List positions available to this account: system defaults + the account's own.
+app.get("/api/accounts/:accountId/positions", requireMember("manage_users"), async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, key, label, rank, permissions, is_system, (account_id IS NULL) AS system
+         FROM positions WHERE (account_id IS NULL OR account_id = $1) AND deleted_at IS NULL
+        ORDER BY rank DESC`, [req.accountId]);
+    res.json({ positions: rows });
+  } catch (e) { console.error("[positions:list]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+// Create/update a CUSTOM position for this account. Defining the role taxonomy is an
+// account-owner action (manage_account). Guards against privilege escalation: you cannot
+// create a position at/above your own rank, nor one that grants a permission you lack.
+app.post("/api/accounts/:accountId/positions", requireMember("manage_account"), async (req, res) => {
+  try {
+    const key = String(req.body?.key || "").trim().toLowerCase().replace(/[^a-z0-9_]/g, "");
+    const label = String(req.body?.label || "").trim();
+    const rank = Number(req.body?.rank);
+    const permissions = (req.body?.permissions && typeof req.body.permissions === "object") ? req.body.permissions : {};
+    if (!key || !label || !Number.isFinite(rank)) return res.status(400).json({ error: "key_label_rank_required" });
+    if (rank >= req.member.rank) return res.status(403).json({ error: "cannot_create_position_at_or_above_your_rank" });
+    for (const k of Object.keys(permissions)) if (permissions[k] === true && !memberCan(req.member, k))
+      return res.status(403).json({ error: "cannot_grant_permission_you_lack", permission: k });
+    const r = await pool.query(
+      `INSERT INTO positions (account_id, key, label, rank, permissions, is_system)
+       VALUES ($1,$2,$3,$4,$5,false)
+       ON CONFLICT (account_id, key) WHERE account_id IS NOT NULL AND deleted_at IS NULL
+       DO UPDATE SET label=EXCLUDED.label, rank=EXCLUDED.rank, permissions=EXCLUDED.permissions, updated_at=NOW()
+       RETURNING id`, [req.accountId, key, label, rank, JSON.stringify(permissions)]);
+    res.json({ ok: true, position_id: r.rows[0].id });
+  } catch (e) { console.error("[positions:create]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
 // ── Control Center data mirror (Phase 2) ──────────────────────────────────────
