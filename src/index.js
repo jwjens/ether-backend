@@ -1986,6 +1986,9 @@ app.post("/api/user/desktop-activate", authLimiter, async (req, res) => {
       license_key: license.license_key || null,   // trial keys are plaintext; paid bcrypt keys omit it
       trial: ent.status === "trial",
       trial_ends_at: ent.status === "trial" ? u.trial_ends_at : null,
+      // RBAC foundation: a user JWT so the desktop can read /api/me/memberships (the accounts +
+      // accessible stations this person belongs to). Read-only use; existing clients ignore it.
+      token: signUserToken(u),
     });
   } catch (e) { console.error("[user/desktop-activate]", e.message); res.status(500).json({ error: "server_error" }); }
 });
