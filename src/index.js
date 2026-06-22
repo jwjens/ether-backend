@@ -2501,6 +2501,30 @@ app.post("/api/accounts/:accountId/positions", requireMember("manage_account"), 
   } catch (e) { console.error("[positions:create]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
+// What the logged-in EMAIL person can access: their memberships across ALL accounts, each
+// with position, permissions, and reachable stations. Read-side foundation the UI/app call
+// to know "which accounts + stations am I in, and what can I do". ADDITIVE — does not yet
+// replace the existing license_key_id-based access reads (that's the Phase B contract step).
+app.get("/api/me/memberships", requireAuth, async (req, res) => {
+  try {
+    if (req.auth.typ !== "owner" && req.auth.typ !== "user") return res.status(403).json({ error: "member_login_required" });
+    const { rows } = await pool.query(
+      `SELECT m.id AS membership_id, m.account_id, la.account_name, la.email AS account_email,
+              p.key AS position, p.label, p.rank, p.permissions, m.all_stations, m.status
+         FROM memberships m
+         JOIN positions p ON p.id = m.position_id
+         JOIN licenses la ON la.id = m.account_id
+        WHERE m.user_id = $1 AND m.deleted_at IS NULL AND m.status = 'active'
+        ORDER BY m.account_id`, [req.auth.uid]);
+    for (const r of rows) {
+      r.stations = r.all_stations
+        ? (await pool.query(`SELECT uuid, name, true AS can_edit FROM stations WHERE license_key_id = $1`, [r.account_id])).rows
+        : (await pool.query(`SELECT s.uuid, s.name, msa.can_edit FROM membership_station_access msa JOIN stations s ON s.uuid = msa.station_uuid WHERE msa.membership_id = $1`, [r.membership_id])).rows;
+    }
+    res.json({ user_id: req.auth.uid, memberships: rows });
+  } catch (e) { console.error("[me:memberships]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
 // ── Control Center data mirror (Phase 2) ──────────────────────────────────────
 // Install pushes its rows for one table up (x-license-key). Upserts into the mirror
 // and tombstones rows it no longer sees (reconcile, non-empty pushes only).
