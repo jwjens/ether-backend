@@ -2556,6 +2556,28 @@ app.get("/api/me/memberships", requireAuth, async (req, res) => {
   } catch (e) { console.error("[me:memberships]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
+// Switch the active account: re-mint the session token scoped to a DIFFERENT account the email
+// user belongs to. The per-station screens (station list, badge, preferences, broadcast/publish)
+// then operate on the switched account through the existing lk-scoped endpoints — gated here by an
+// active membership, with the position mapped to the legacy admin|user role those endpoints check
+// (manage_stations/manage_users/manage_account -> admin). Account-level surfaces
+// (billing/account-info/users) are unaffected. You can only switch into an account you're in.
+app.post("/api/me/switch-account/:accountId", requireAuth, async (req, res) => {
+  try {
+    if (req.auth.typ !== "owner" && req.auth.typ !== "user") return res.status(403).json({ error: "member_login_required" });
+    const accountId = Number(req.params.accountId);
+    if (!accountId) return res.status(400).json({ error: "bad_account" });
+    const m = await getMembership(req.auth.uid, accountId);
+    if (!m || m.status !== "active") return res.status(403).json({ error: "not_a_member" });
+    const perms = m.permissions || {};
+    const role = (perms.manage_stations || perms.manage_users || perms.manage_account) ? "admin" : "user";
+    const token = jwt.sign(
+      { uid: req.auth.uid, lk: accountId, role, username: req.auth.username || req.auth.email, typ: req.auth.typ, position: m.position },
+      JWT_SECRET, { expiresIn: JWT_TTL });
+    res.json({ token, account_id: accountId, position: m.position, role });
+  } catch (e) { console.error("[me:switch-account]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
 // Stations the member can access IN a chosen account — account-context (keyed by :accountId),
 // gated by active membership, scoped to the membership's stations. This is what the web console
 // calls after the user picks an account from /api/me/memberships. Membership-native: no
