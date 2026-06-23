@@ -4075,20 +4075,36 @@ app.post("/audio/download-url", async (req, res) => {
   try {
     const { license_key, file_key } = req.body || {};
     const rawKey = license_key?.trim();
-    if (!rawKey) {
-      return res.status(400).json({
-        error:  "missing_fields",
-        detail: "license_key is required",
-      });
-    }
 
     const sanitized = sanitizeFileKey(file_key);
     if (sanitized.error) {
       return res.status(400).json({ error: "invalid_file_key", detail: sanitized.error });
     }
 
-    const license = await lookupLicense(rawKey);
-    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+    // Resolve the caller + the prefix to sign against:
+    //  • license_key (own install): the caller's own prefix, plus library-grant resolution below.
+    //  • member Bearer (a PD operating another account's station, RBAC_MEMBERSHIP_SYNC): the
+    //    operated account's prefix — the active membership + edit_programming IS the authorization,
+    //    mirroring the /sync member gate (requireLicenseOrMember). No license key is held.
+    let prefixId = null;
+    let viaMember = false;
+    if (rawKey) {
+      const license = await lookupLicense(rawKey);
+      if (!license) return res.status(401).json({ error: "invalid_license_key" });
+      prefixId = license.id;
+    } else if (RBAC_MEMBERSHIP_SYNC) {
+      const h = req.headers["authorization"] || "";
+      if (h.startsWith("Bearer ")) {
+        try {
+          const p = jwt.verify(h.slice(7), JWT_SECRET);
+          if ((p.typ === "owner" || p.typ === "user") && p.lk) {
+            const m = await getMembership(p.uid, p.lk);
+            if (m && m.status === "active" && memberCan(m, "edit_programming")) { prefixId = p.lk; viaMember = true; }
+          }
+        } catch { /* invalid member token → fall through to 401 */ }
+      }
+    }
+    if (prefixId == null) return res.status(401).json({ error: "invalid_license_key" });
 
     if (!getR2Client()) {
       return res.status(503).json({
@@ -4097,17 +4113,16 @@ app.post("/audio/download-url", async (req, res) => {
       });
     }
 
-    // Resolve which prefix holds the file. Common case (no grants): the caller's own prefix,
-    // no HeadObject probe — unchanged fast path. If the caller has read grants, the file may
-    // live under a granted OWNER's prefix; probe caller-first, then granted owners, and sign
-    // against the first hit. Found nowhere → fall back to the caller's own prefix (the GET then
-    // 404s at R2, exactly as before for a missing file). An ungranted caller has no owner ids,
-    // so it can ONLY ever resolve its own prefix — never another license's objects.
-    let prefixId = license.id;
-    const grantedOwnerIds = await grantedOwnerLicenseIds(pool, license.id);
-    if (grantedOwnerIds.length > 0) {
-      const resolved = await resolveAudioPrefixId(r2ObjectExists, license.id, grantedOwnerIds, sanitized.value);
-      if (resolved != null) prefixId = resolved;
+    // Library grants: a license_key caller may also read a granted OWNER's prefix. Probe caller-first,
+    // then granted owners, and sign against the first hit. Found nowhere → caller's own prefix (the GET
+    // then 404s at R2). An ungranted caller has no owner ids → can ONLY ever resolve its own prefix.
+    // Member callers already resolved to the operated account's prefix (membership = authorization).
+    if (!viaMember) {
+      const grantedOwnerIds = await grantedOwnerLicenseIds(pool, prefixId);
+      if (grantedOwnerIds.length > 0) {
+        const resolved = await resolveAudioPrefixId(r2ObjectExists, prefixId, grantedOwnerIds, sanitized.value);
+        if (resolved != null) prefixId = resolved;
+      }
     }
 
     const r2Key            = `${prefixId}/${sanitized.value}`;
