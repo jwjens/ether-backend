@@ -131,7 +131,9 @@ function sanitizeFileKey(raw) {
   if (!k)                                  return { error: "file_key is empty" };
   if (k.length > 255)                      return { error: "file_key too long (max 255 chars)" };
   if (k.includes("/") || k.includes("\\")) return { error: "file_key must be a basename (no path separators)" };
-  if (k.includes(".."))                    return { error: 'file_key must not contain ".."' };
+  // Path separators are already rejected above, so a basename containing ".." (e.g. a song titled
+  // "...Baby One More Time.mp3") can NOT be a traversal — only an exact "."/".." dot-segment is unsafe.
+  if (k === "." || k === "..")             return { error: "file_key must not be a dot-segment" };
   if (k.includes("\0"))                    return { error: "file_key contains null byte" };
   return { value: k };
 }
