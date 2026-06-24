@@ -3970,6 +3970,43 @@ app.post("/account/register-station", async (req, res) => {
   }
 });
 
+// POST /account/delete-station — authoritative station delete the DESKTOP can call (license-scoped,
+// no admin token, mirrors register-station). Removes the station row + its mutations so the reconcile
+// can't resurrect it. Idempotent: a uuid already gone is success. Can only ever delete a station the
+// caller's own license owns (409 on cross-license) — so a confirmed delete on one device overrides the
+// multi-device sync everywhere instead of being re-registered.
+app.post("/account/delete-station", async (req, res) => {
+  try {
+    const { license_key, uuid } = req.body || {};
+    const rawKey = license_key?.trim();
+    const u = uuid?.trim();
+    if (!rawKey || !u) return res.status(400).json({ error: "missing_fields", detail: "license_key, uuid required" });
+    const license = await lookupLicense(rawKey);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+
+    const existing = await pool.query("SELECT license_key_id FROM stations WHERE uuid=$1", [u]);
+    if (!existing.rows.length) return res.json({ ok: true, uuid: u, already_gone: true });   // idempotent
+    if (existing.rows[0].license_key_id !== license.id) {
+      return res.status(409).json({ error: "uuid_owned_by_other_license" });                 // never delete another account's station
+    }
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("DELETE FROM mutations WHERE station_id = $1 OR (table_name='stations' AND row_id = $1)", [u]);
+      const del = await client.query("DELETE FROM stations WHERE uuid=$1 AND license_key_id=$2", [u, license.id]);
+      await client.query("COMMIT");
+      console.log(`[Account/DeleteStation] license:${license.id} station:${u.slice(0, 8)} deleted:${del.rowCount}`);
+      return res.json({ ok: true, uuid: u, deleted: del.rowCount });
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw e;
+    } finally { client.release(); }
+  } catch (e) {
+    console.error("[/account/delete-station]", e.message);
+    return res.status(500).json({ error: "server_error", detail: e.message });
+  }
+});
+
 // POST /account/deauthorize-seat — soft-delete a seat (Manage Devices).
 // Sets deauthorized_at = NOW() on the matching license_activations row.
 // Idempotent: deauthorizing an already-deauthorized seat or a nonexistent
