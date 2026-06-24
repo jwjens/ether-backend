@@ -4186,7 +4186,7 @@ app.post("/audio/download-url", async (req, res) => {
     }
 
     const expiresAt = new Date(Date.now() + expiresInSeconds * 1000).toISOString();
-    console.log(`[Audio/DownloadURL] license:${license.id} prefix:${prefixId} key:${sanitized.value} (15m)`);
+    console.log(`[Audio/DownloadURL] prefix:${prefixId} key:${sanitized.value} (15m)`);
     res.json({ signed_url: signedUrl, expires_at: expiresAt });
   } catch (e) {
     console.error("[/audio/download-url]", e.message);
