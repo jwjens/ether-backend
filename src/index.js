@@ -3923,6 +3923,53 @@ app.post("/account/add-station", async (req, res) => {
   }
 });
 
+// POST /account/register-station — idempotently register a station the desktop ALREADY created
+// locally (off the +Add-Station path) with the account, PRESERVING its uuid. The desktop's
+// reconcile self-heal calls this for any local station not yet in the account's cloud list, so a
+// station created any way at all becomes owned + publishable on its own — no manual backfill.
+//
+// Unlike /account/add-station this does NOT consume a seat (the install already holds one) and is
+// idempotent: if the uuid already exists under this license it's a no-op; under a DIFFERENT license
+// it's a conflict (never steal another account's station). Plan station cap still enforced for a
+// genuinely new row.
+app.post("/account/register-station", async (req, res) => {
+  try {
+    const { license_key, uuid, name, call_letters } = req.body || {};
+    const rawKey = license_key?.trim();
+    const u = uuid?.trim();
+    if (!rawKey || !u || !name?.trim()) {
+      return res.status(400).json({ error: "missing_fields", detail: "license_key, uuid, name required" });
+    }
+    const license = await lookupLicense(rawKey);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+
+    const existing = await pool.query("SELECT id, license_key_id FROM stations WHERE uuid=$1", [u]);
+    if (existing.rows.length) {
+      if (existing.rows[0].license_key_id !== license.id) {
+        return res.status(409).json({ error: "uuid_owned_by_other_license" });
+      }
+      return res.json({ ok: true, uuid: u, already: true });   // already registered — idempotent
+    }
+
+    const stationCap = PLAN_STATION_LIMITS[license.plan] ?? PLAN_STATION_LIMITS.free;
+    if (stationCap !== -1) {
+      const { rows } = await pool.query("SELECT COUNT(*)::int AS n FROM stations WHERE license_key_id=$1", [license.id]);
+      if (rows[0].n >= stationCap) {
+        return res.status(403).json({ error: "station_limit_reached", stations_used: rows[0].n, stations_max: stationCap, plan: license.plan });
+      }
+    }
+    await pool.query(
+      "INSERT INTO stations (uuid, license_key_id, name, nickname, frequency, call_letters) VALUES ($1,$2,$3,NULL,NULL,$4)",
+      [u, license.id, name.trim(), (call_letters && String(call_letters).trim()) || null]
+    );
+    console.log(`[Account/RegisterStation] license:${license.id} station:${u.slice(0, 8)} (${name.trim()})`);
+    return res.json({ ok: true, uuid: u, registered: true });
+  } catch (e) {
+    console.error("[/account/register-station]", e.message);
+    return res.status(500).json({ error: "server_error", detail: e.message });
+  }
+});
+
 // POST /account/deauthorize-seat — soft-delete a seat (Manage Devices).
 // Sets deauthorized_at = NOW() on the matching license_activations row.
 // Idempotent: deauthorizing an already-deauthorized seat or a nonexistent
