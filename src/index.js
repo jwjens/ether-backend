@@ -49,6 +49,7 @@ const bcrypt     = require('bcrypt');
 const jwt        = require('jsonwebtoken');
 const rateLimit  = require('express-rate-limit');
 const { validateSlug } = require("./slug");
+const { deriveStationState } = require("./station-state"); // honest live/stalled/off/offline (Slice 1)
 
 // JWT signing secret for the Control Center dashboard. MUST be set in production
 // (Railway env). Falls back to a per-boot random secret in dev so tokens simply
@@ -471,6 +472,12 @@ async function initDB() {
   // so consumers (dashboard) can show each song on its REAL deck instead of normalizing the
   // on-air track to "Deck A". JSONB → no integer-strictness issue with fractional positions.
   await pool.query(`ALTER TABLE station_now_playing ADD COLUMN IF NOT EXISTS decks JSONB`);
+  // Honest engine state (Slice 1 truth layer): engine_state ∈ {live,stalled,off}, reported by the
+  // desktop. engine_heartbeat_at is bumped on EVERY report (incl. the keepalive a silent/stalled
+  // station now sends) so freshness — not "did playing change" — decides live vs offline. Both
+  // additive/nullable: a legacy install that omits engine_state falls back to the playing+fresh rule.
+  await pool.query(`ALTER TABLE station_now_playing ADD COLUMN IF NOT EXISTS engine_state TEXT`);
+  await pool.query(`ALTER TABLE station_now_playing ADD COLUMN IF NOT EXISTS engine_heartbeat_at TIMESTAMPTZ`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS station_metadata (
       station_uuid    TEXT PRIMARY KEY REFERENCES stations(uuid) ON DELETE CASCADE,
@@ -2222,6 +2229,7 @@ app.get("/api/account/stations", requireAuth, async (req, res) => {
               m.slug, m.display_name, m.logo_url, m.color_primary, m.color_secondary,
               m.description, m.public_enabled, m.stream_url,
               n.playing, n.title, n.artist, n.deck, n.decks, n.started_at, n.duration_sec, n.queue,
+              n.engine_state, COALESCE(n.engine_heartbeat_at, n.updated_at) AS engine_heartbeat_at,
               n.updated_at AS now_playing_updated_at
        FROM stations s
        LEFT JOIN station_metadata    m ON m.station_uuid = s.uuid
@@ -2245,6 +2253,11 @@ app.get("/api/account/stations", requireAuth, async (req, res) => {
         playing: r.playing, title: r.title, artist: r.artist, deck: r.deck, decks: r.decks || null,
         started_at: r.started_at, duration_sec: r.duration_sec, queue: r.queue || [],
         updated_at: r.now_playing_updated_at,
+        // Honest truth layer: live | stalled | off | offline. A stalled/idle station can never read
+        // "live"; a station that stopped reporting reads "offline" (stale heartbeat), not a frozen "live".
+        engine_state: r.engine_state || null,
+        engine_heartbeat_at: r.engine_heartbeat_at || null,
+        state: deriveStationState(r.engine_state, r.engine_heartbeat_at, r.playing),
       } : null,
     }));
     return res.json({ stations });
@@ -2649,6 +2662,7 @@ app.get("/api/accounts/:accountId/stations", requireMember(), async (req, res) =
               m.slug, m.display_name, m.logo_url, m.color_primary, m.color_secondary,
               m.description, m.public_enabled, m.stream_url,
               n.playing, n.title, n.artist, n.deck, n.decks, n.started_at, n.duration_sec, n.queue,
+              n.engine_state, COALESCE(n.engine_heartbeat_at, n.updated_at) AS engine_heartbeat_at,
               n.updated_at AS now_playing_updated_at
          FROM stations s
          LEFT JOIN station_metadata    m ON m.station_uuid = s.uuid
@@ -2669,6 +2683,9 @@ app.get("/api/accounts/:accountId/stations", requireMember(), async (req, res) =
         playing: r.playing, title: r.title, artist: r.artist, deck: r.deck, decks: r.decks || null,
         started_at: r.started_at, duration_sec: r.duration_sec, queue: r.queue || [],
         updated_at: r.now_playing_updated_at,
+        engine_state: r.engine_state || null,
+        engine_heartbeat_at: r.engine_heartbeat_at || null,
+        state: deriveStationState(r.engine_state, r.engine_heartbeat_at, r.playing),
       } : null,
     }));
     res.json({ account_id: req.accountId, position: req.member.position, can_edit: !!(req.member.permissions && req.member.permissions.edit_programming), stations });
@@ -4617,19 +4634,24 @@ async function upsertStationNowPlaying(rawKey, body) {
   const startedAt = playing ? new Date(Date.now() - position * 1000) : null;
 
   const decksJson = body.decks && typeof body.decks === "object" ? JSON.stringify(body.decks) : null;
+  // Honest engine state from the desktop (live/stalled/off). engine_heartbeat_at is stamped NOW() on
+  // every report — including the keepalive a silent/stalled station now sends — so a stalled station
+  // stays "fresh" (→ reads "stalled", not "offline"). Unknown values are stored null (legacy fallback).
+  const engineState = ["live", "stalled", "off"].includes(body.engine_state) ? body.engine_state : null;
 
   await pool.query(
     `INSERT INTO station_now_playing
-       (station_uuid, playing, title, artist, deck, started_at, position_sec, duration_sec, queue, art_url, decks, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, NOW())
+       (station_uuid, playing, title, artist, deck, started_at, position_sec, duration_sec, queue, art_url, decks, engine_state, engine_heartbeat_at, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, NOW(), NOW())
      ON CONFLICT (station_uuid) DO UPDATE SET
        playing=$2, title=$3, artist=$4, deck=$5, started_at=$6,
-       position_sec=$7, duration_sec=$8, queue=$9, art_url=$10, decks=$11, updated_at=NOW()`,
+       position_sec=$7, duration_sec=$8, queue=$9, art_url=$10, decks=$11,
+       engine_state=$12, engine_heartbeat_at=NOW(), updated_at=NOW()`,
     [
       body.station_uuid, playing, body.title ?? null, body.artist ?? null,
       body.deck ?? null, startedAt, position, duration,
       JSON.stringify(Array.isArray(body.queue) ? body.queue : []),
-      body.art_url ?? null, decksJson,
+      body.art_url ?? null, decksJson, engineState,
     ]
   );
 
@@ -4747,14 +4769,21 @@ app.get("/public/account/:slug/channels", async (req, res) => {
 app.get("/public/stations", async (_req, res) => {
   try {
     const { rows } = await pool.query(
+      // "live" = a deck is genuinely on air AND the report is fresh. Honest truth layer: when the
+      // install sends engine_state, a stalled/idle engine must NOT count as live even though it keeps
+      // a fresh heartbeat — so require engine_state='live' (or NULL, for legacy installs) plus
+      // playing=true. Freshness uses the heartbeat (a stalled station now keeps it fresh, but stays
+      // non-live via engine_state); falls back to updated_at for legacy rows.
       `SELECT m.slug, m.display_name, m.logo_url, m.color_primary, m.color_secondary,
               m.description, m.category, m.stream_url,
               n.title, n.artist, n.art_url,
-              (n.playing = true AND n.updated_at > NOW() - INTERVAL '5 minutes') AS live
+              (n.playing = true AND COALESCE(n.engine_state, 'live') = 'live'
+               AND COALESCE(n.engine_heartbeat_at, n.updated_at) > NOW() - INTERVAL '5 minutes') AS live
        FROM station_metadata m
        LEFT JOIN station_now_playing n ON n.station_uuid = m.station_uuid
        WHERE m.public_enabled = true AND m.slug IS NOT NULL
-       ORDER BY (n.playing = true AND n.updated_at > NOW() - INTERVAL '5 minutes') DESC,
+       ORDER BY (n.playing = true AND COALESCE(n.engine_state, 'live') = 'live'
+                 AND COALESCE(n.engine_heartbeat_at, n.updated_at) > NOW() - INTERVAL '5 minutes') DESC,
                 COALESCE(m.display_name, m.slug) ASC`
     );
     res.json({
