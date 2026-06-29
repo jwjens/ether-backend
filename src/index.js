@@ -4495,6 +4495,29 @@ app.post("/account/devices", async (req, res) => {
   }
 });
 
+// GET /api/account/devices — the machine roster for the signed-in dashboard user (JWT), so the
+// guided broadcast-handoff flow can offer target machines. Same license_activations data as the
+// desktop's POST /account/devices, but JWT-scoped (the dashboard has no raw license key on an
+// owner login). NOTE: last_seen reflects the last activation/login, NOT a live presence heartbeat —
+// the UI must treat a machine as "maybe offline" unless it's currently sourcing a station.
+app.get("/api/account/devices", requireAuth, async (req, res) => {
+  try {
+    const lic = (await pool.query(`SELECT license_key FROM licenses WHERE id = $1`, [req.auth.lk])).rows[0];
+    if (!lic) return res.json({ devices: [] });
+    const activationKey = lic.license_key || `lic-${req.auth.lk}`;
+    const { rows } = await pool.query(
+      `SELECT machine_id, machine_name, os, last_seen
+         FROM license_activations
+        WHERE license_key = $1 AND deauthorized_at IS NULL
+        ORDER BY last_seen DESC`, [activationKey]
+    );
+    res.json({ devices: rows });
+  } catch (e) {
+    console.error("[/api/account/devices]", e.message);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
 // ── Admin endpoints ───────────────────────────────────────────
 
 app.get("/admin/licenses", requireAdmin, async (req, res) => {
