@@ -49,7 +49,7 @@ const bcrypt     = require('bcrypt');
 const jwt        = require('jsonwebtoken');
 const rateLimit  = require('express-rate-limit');
 const { validateSlug } = require("./slug");
-const { deriveStationState } = require("./station-state"); // honest live/stalled/off/offline (Slice 1)
+const { deriveStationState, parseSourceFields, resolveSourceMachineId } = require("./station-state"); // honest state (Slice 1) + source/last_error (Slice 2)
 
 // JWT signing secret for the Control Center dashboard. MUST be set in production
 // (Railway env). Falls back to a per-boot random secret in dev so tokens simply
@@ -478,6 +478,16 @@ async function initDB() {
   // additive/nullable: a legacy install that omits engine_state falls back to the playing+fresh rule.
   await pool.query(`ALTER TABLE station_now_playing ADD COLUMN IF NOT EXISTS engine_state TEXT`);
   await pool.query(`ALTER TABLE station_now_playing ADD COLUMN IF NOT EXISTS engine_heartbeat_at TIMESTAMPTZ`);
+  // Source-machine attribution + last error (Slice 2): which machine is sourcing this station's mount,
+  // and the most recent stream error per station. All additive/nullable. source_machine_id resolves to
+  // a friendly name via license_activations(machine_id→machine_name) in the read endpoints.
+  await pool.query(`ALTER TABLE station_now_playing ADD COLUMN IF NOT EXISTS source_machine_id TEXT`);
+  // source_machine_id_at = when the LIVE source last affirmed its id (the source's own heartbeat). Gates
+  // release of the sticky source_machine_id so a genuinely-gone source is cleared even if another healthy
+  // machine keeps the row's engine_heartbeat_at fresh.
+  await pool.query(`ALTER TABLE station_now_playing ADD COLUMN IF NOT EXISTS source_machine_id_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE station_now_playing ADD COLUMN IF NOT EXISTS last_error TEXT`);
+  await pool.query(`ALTER TABLE station_now_playing ADD COLUMN IF NOT EXISTS last_error_at TIMESTAMPTZ`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS station_metadata (
       station_uuid    TEXT PRIMARY KEY REFERENCES stations(uuid) ON DELETE CASCADE,
@@ -2230,6 +2240,9 @@ app.get("/api/account/stations", requireAuth, async (req, res) => {
               m.description, m.public_enabled, m.stream_url,
               n.playing, n.title, n.artist, n.deck, n.decks, n.started_at, n.duration_sec, n.queue,
               n.engine_state, COALESCE(n.engine_heartbeat_at, n.updated_at) AS engine_heartbeat_at,
+              n.source_machine_id, n.source_machine_id_at, n.last_error, n.last_error_at,
+              (SELECT la.machine_name FROM license_activations la
+                WHERE la.machine_id = n.source_machine_id ORDER BY la.last_seen DESC LIMIT 1) AS source_machine_name,
               n.updated_at AS now_playing_updated_at
        FROM stations s
        LEFT JOIN station_metadata    m ON m.station_uuid = s.uuid
@@ -2258,6 +2271,13 @@ app.get("/api/account/stations", requireAuth, async (req, res) => {
         engine_state: r.engine_state || null,
         engine_heartbeat_at: r.engine_heartbeat_at || null,
         state: deriveStationState(r.engine_state, r.engine_heartbeat_at, r.playing),
+        // Slice 2: which machine is sourcing the mount (+ friendly name) and the last stream error.
+        // resolveSourceMachineId releases a stale claim (source stopped affirming) so the panel never
+        // sticks on a machine that's gone; the friendly name follows the resolved id.
+        source_machine_id: resolveSourceMachineId(r.source_machine_id, r.source_machine_id_at),
+        source_machine_name: resolveSourceMachineId(r.source_machine_id, r.source_machine_id_at) ? (r.source_machine_name || null) : null,
+        last_error: r.last_error || null,
+        last_error_at: r.last_error_at || null,
       } : null,
     }));
     return res.json({ stations });
@@ -2663,6 +2683,9 @@ app.get("/api/accounts/:accountId/stations", requireMember(), async (req, res) =
               m.description, m.public_enabled, m.stream_url,
               n.playing, n.title, n.artist, n.deck, n.decks, n.started_at, n.duration_sec, n.queue,
               n.engine_state, COALESCE(n.engine_heartbeat_at, n.updated_at) AS engine_heartbeat_at,
+              n.source_machine_id, n.source_machine_id_at, n.last_error, n.last_error_at,
+              (SELECT la.machine_name FROM license_activations la
+                WHERE la.machine_id = n.source_machine_id ORDER BY la.last_seen DESC LIMIT 1) AS source_machine_name,
               n.updated_at AS now_playing_updated_at
          FROM stations s
          LEFT JOIN station_metadata    m ON m.station_uuid = s.uuid
@@ -2686,6 +2709,13 @@ app.get("/api/accounts/:accountId/stations", requireMember(), async (req, res) =
         engine_state: r.engine_state || null,
         engine_heartbeat_at: r.engine_heartbeat_at || null,
         state: deriveStationState(r.engine_state, r.engine_heartbeat_at, r.playing),
+        // Slice 2: which machine is sourcing the mount (+ friendly name) and the last stream error.
+        // resolveSourceMachineId releases a stale claim (source stopped affirming) so the panel never
+        // sticks on a machine that's gone; the friendly name follows the resolved id.
+        source_machine_id: resolveSourceMachineId(r.source_machine_id, r.source_machine_id_at),
+        source_machine_name: resolveSourceMachineId(r.source_machine_id, r.source_machine_id_at) ? (r.source_machine_name || null) : null,
+        last_error: r.last_error || null,
+        last_error_at: r.last_error_at || null,
       } : null,
     }));
     res.json({ account_id: req.accountId, position: req.member.position, can_edit: !!(req.member.permissions && req.member.permissions.edit_programming), stations });
@@ -4638,20 +4668,36 @@ async function upsertStationNowPlaying(rawKey, body) {
   // every report — including the keepalive a silent/stalled station now sends — so a stalled station
   // stays "fresh" (→ reads "stalled", not "offline"). Unknown values are stored null (legacy fallback).
   const engineState = ["live", "stalled", "off"].includes(body.engine_state) ? body.engine_state : null;
+  // Slice 2: source-machine attribution + last error, all COALESCE'd so a non-sourcing machine's null
+  // report can't erase another machine's claim/error (no false "no source" flicker). The LIVE source is
+  // the only poster sending a non-null source_machine_id, so:
+  //   - source_machine_id      : COALESCE — a null report keeps the current claim;
+  //   - source_machine_id_at   : stamped NOW() ONLY when a non-null source is written (the source's own
+  //                              heartbeat) → resolveSourceMachineId releases the claim once it goes stale,
+  //                              so a genuinely-gone source is cleared even if other machines keep the row
+  //                              fresh, and a real handoff (M2 writes its id) moves the claim immediately;
+  //   - last_error/_at         : COALESCE — the last error survives a later clean report.
+  const { source_machine_id, last_error, last_error_at } = parseSourceFields(body);
 
   await pool.query(
     `INSERT INTO station_now_playing
-       (station_uuid, playing, title, artist, deck, started_at, position_sec, duration_sec, queue, art_url, decks, engine_state, engine_heartbeat_at, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, NOW(), NOW())
+       (station_uuid, playing, title, artist, deck, started_at, position_sec, duration_sec, queue, art_url, decks, engine_state, engine_heartbeat_at, source_machine_id, source_machine_id_at, last_error, last_error_at, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, NOW(), $13, CASE WHEN $13 IS NOT NULL THEN NOW() ELSE NULL END, $14, $15, NOW())
      ON CONFLICT (station_uuid) DO UPDATE SET
        playing=$2, title=$3, artist=$4, deck=$5, started_at=$6,
        position_sec=$7, duration_sec=$8, queue=$9, art_url=$10, decks=$11,
-       engine_state=$12, engine_heartbeat_at=NOW(), updated_at=NOW()`,
+       engine_state=$12, engine_heartbeat_at=NOW(),
+       source_machine_id=COALESCE($13, station_now_playing.source_machine_id),
+       source_machine_id_at=CASE WHEN $13 IS NOT NULL THEN NOW() ELSE station_now_playing.source_machine_id_at END,
+       last_error=COALESCE($14, station_now_playing.last_error),
+       last_error_at=COALESCE($15, station_now_playing.last_error_at),
+       updated_at=NOW()`,
     [
       body.station_uuid, playing, body.title ?? null, body.artist ?? null,
       body.deck ?? null, startedAt, position, duration,
       JSON.stringify(Array.isArray(body.queue) ? body.queue : []),
       body.art_url ?? null, decksJson, engineState,
+      source_machine_id, last_error, last_error_at,
     ]
   );
 
