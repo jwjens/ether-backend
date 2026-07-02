@@ -758,6 +758,11 @@ async function initDB() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_listener_sessions ON listener_sessions (station_uuid, started_at DESC)`);
 
+  // Ether v2 data architecture (spec §2.2): materialized library state tables. Additive
+  // CREATE TABLE/INDEX IF NOT EXISTS — shared DDL so scratch-proof and prod-apply run identical SQL.
+  const { LIBRARY_V2_DDL } = require("./lib/library-schema");
+  for (const ddl of LIBRARY_V2_DDL) await pool.query(ddl);
+
   console.log("[DB] Schema ready");
 }
 
