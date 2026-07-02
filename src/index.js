@@ -5539,6 +5539,10 @@ app.post("/invite/send", async (req, res) => {
 const syncRouter = require('./routes/sync')(pool);
 app.use('/sync', requireLicenseOrMember, syncRouter);
 
+// Ether v2 library endpoints (spec §3) — snapshot/changes/upsert/delete. Same auth as /sync.
+const libraryRouter = require('./routes/library')(pool);
+app.use('/library', requireLicenseOrMember, libraryRouter);
+
 // ── Start ─────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
