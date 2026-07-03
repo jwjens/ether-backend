@@ -763,6 +763,11 @@ async function initDB() {
   const { LIBRARY_V2_DDL } = require("./lib/library-schema");
   for (const ddl of LIBRARY_V2_DDL) await pool.query(ddl);
 
+  // v2 subscription model: station_attachments (surfaces attach to cloud-defined stations; playout is an
+  // exclusive claim). Additive CREATE TABLE/INDEX IF NOT EXISTS.
+  const { ATTACHMENTS_DDL } = require("./lib/attachments-schema");
+  for (const ddl of ATTACHMENTS_DDL) await pool.query(ddl);
+
   console.log("[DB] Schema ready");
 }
 
@@ -3723,9 +3728,14 @@ app.post("/account/connect", async (req, res) => {
     // plan included so OnboardingFlow can write plan_tier to local KV during onboarding;
     // fixes the gap where freshly-onboarded customers defaulted to free until they later
     // ran the SubscriptionPanel /validate flow.
+    // v2 subscription model: this surface's attachments (which stations THIS machine runs), so sign-in
+    // provisioning materializes exactly those (not every account station). Best-effort; empty on a new surface.
+    let attachments = [];
+    try { attachments = await require('./routes/attachments').attachmentsForSurface(pool, license.id, machine_id); } catch (_) {}
     res.json({
       account_name: license.account_name ?? null,
       stations,
+      attachments,
       seats_used: seatsUsed,
       seats_max:  SEATS_MAX,
       plan:       license.plan ?? "free",
@@ -5542,6 +5552,11 @@ app.use('/sync', requireLicenseOrMember, syncRouter);
 // Ether v2 library endpoints (spec §3) — snapshot/changes/upsert/delete. Same auth as /sync.
 const libraryRouter = require('./routes/library')(pool);
 app.use('/library', requireLicenseOrMember, libraryRouter);
+
+// v2 subscription model: station attach/detach (POST /account/attach, /account/detach). Auth via
+// license_key in body (same as /account/connect), so mounted plainly at /account.
+const attachmentsRouter = require('./routes/attachments')(pool, lookupLicense);
+app.use('/account', attachmentsRouter);
 
 // ── Start ─────────────────────────────────────────────────────
 
