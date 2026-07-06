@@ -4730,15 +4730,15 @@ async function upsertStationNowPlaying(rawKey, body) {
   await pool.query(
     `INSERT INTO station_now_playing
        (station_uuid, playing, title, artist, deck, started_at, position_sec, duration_sec, queue, art_url, decks, engine_state, engine_heartbeat_at, source_machine_id, source_machine_id_at, last_error, last_error_at, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, NOW(), $13, CASE WHEN $13 IS NOT NULL THEN NOW() ELSE NULL END, $14, $15, NOW())
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, NOW(), $13::text, CASE WHEN $13::text IS NOT NULL THEN NOW() ELSE NULL END, $14::text, $15::timestamptz, NOW())
      ON CONFLICT (station_uuid) DO UPDATE SET
        playing=$2, title=$3, artist=$4, deck=$5, started_at=$6,
        position_sec=$7, duration_sec=$8, queue=$9, art_url=$10, decks=$11,
        engine_state=$12, engine_heartbeat_at=NOW(),
-       source_machine_id=COALESCE($13, station_now_playing.source_machine_id),
-       source_machine_id_at=CASE WHEN $13 IS NOT NULL THEN NOW() ELSE station_now_playing.source_machine_id_at END,
-       last_error=COALESCE($14, station_now_playing.last_error),
-       last_error_at=COALESCE($15, station_now_playing.last_error_at),
+       source_machine_id=COALESCE($13::text, station_now_playing.source_machine_id),
+       source_machine_id_at=CASE WHEN $13::text IS NOT NULL THEN NOW() ELSE station_now_playing.source_machine_id_at END,
+       last_error=COALESCE($14::text, station_now_playing.last_error),
+       last_error_at=COALESCE($15::timestamptz, station_now_playing.last_error_at),
        updated_at=NOW()`,
     [
       body.station_uuid, playing, body.title ?? null, body.artist ?? null,
