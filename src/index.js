@@ -5122,6 +5122,26 @@ async function getOwnedStation(req, res) {
   return { licenseId, stationUuid: req.params.uuid, role };
 }
 
+// Purge the edge-cached listener station response (Cloudflare) when metadata changes, so a saved change
+// (new Donate link, unpublish, rename) shows immediately instead of waiting out the 60s edge TTL.
+// Env-gated: without CLOUDFLARE_ZONE_ID + CLOUDFLARE_API_TOKEN it's a no-op (falls back to the TTL).
+// Fire-and-forget; never blocks or fails the save.
+async function purgeStationEdgeCache(slugs) {
+  const zone = process.env.CLOUDFLARE_ZONE_ID, token = process.env.CLOUDFLARE_API_TOKEN;
+  const origin = process.env.LISTENER_ORIGIN || "https://listen.ether-technologies.com";
+  const list = [...new Set((Array.isArray(slugs) ? slugs : [slugs]).filter(Boolean))];
+  if (!zone || !token || list.length === 0) return;
+  const files = list.map(s => `${origin}/api/station/${encodeURIComponent(s)}`);
+  try {
+    const r = await fetch(`https://api.cloudflare.com/client/v4/zones/${zone}/purge_cache`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ files }),
+    });
+    if (!r.ok) console.warn("[edge-purge] non-ok", r.status, await r.text().catch(() => ""));
+  } catch (e) { console.warn("[edge-purge]", e.message); }
+}
+
 app.get("/api/station/:uuid/metadata", async (req, res) => {
   const owned = await getOwnedStation(req, res);
   if (!owned) return;
@@ -5212,6 +5232,8 @@ app.post("/api/station/:uuid/metadata", async (req, res) => {
        b.color_secondary ?? null, b.description ?? null, JSON.stringify(socials), !!b.public_enabled,
        b.stream_url ?? null, category, JSON.stringify(links)]
     );
+    // Invalidate the edge cache immediately (new slug + the old slug on a rename). Fire-and-forget.
+    purgeStationEdgeCache([rows[0]?.slug, oldSlug]);
     res.json(rows[0]);
   } catch (e) {
     console.error("[POST metadata]", e.message);
