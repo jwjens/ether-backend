@@ -5178,10 +5178,24 @@ app.post("/api/station/:uuid/metadata", async (req, res) => {
 
     const socials = (b.socials && typeof b.socials === "object" && !Array.isArray(b.socials)) ? b.socials : {};
     // Named links (e.g. a Donate button) → validated [{label,url}] JSON, capped at 12.
+    // SECURITY: only http(s) URLs are stored. A bare domain defaults to https://; any explicit
+    // non-http(s) scheme (javascript:, data:, vbscript:, …) is REJECTED so a stored URL can never
+    // become clickable XSS on the public listener page.
     const links = Array.isArray(b.links)
-      ? b.links.filter(l => l && typeof l.label === "string" && typeof l.url === "string" && l.label.trim() && l.url.trim())
-               .map(l => ({ label: String(l.label).trim().slice(0, 60), url: String(l.url).trim().slice(0, 500) }))
-               .slice(0, 12)
+      ? b.links
+          .map(l => {
+            if (!l || typeof l.label !== "string" || typeof l.url !== "string") return null;
+            const label = l.label.trim().slice(0, 60);
+            let url = l.url.trim();
+            if (!label || !url) return null;
+            if (!/^https?:\/\//i.test(url)) {
+              if (/^[a-z][a-z0-9+.\-]*:/i.test(url)) return null; // has a scheme, not http(s) → reject
+              url = "https://" + url.replace(/^\/+/, "");           // bare domain → default to https
+            }
+            return { label, url: url.slice(0, 500) };
+          })
+          .filter(l => l && /^https?:\/\//i.test(l.url)) // hard gate — only http(s) survives
+          .slice(0, 12)
       : [];
     // Ethercast category: only the known tabs, else null (no category).
     const CATEGORIES = ["music", "talk", "sports"];
