@@ -9,10 +9,10 @@
 const ATTACHMENTS_DDL = [
   `CREATE TABLE IF NOT EXISTS station_attachments (
      id             BIGSERIAL PRIMARY KEY,
-     license_key_id INT  NOT NULL REFERENCES licenses(id),
+     license_key_id INT  NOT NULL REFERENCES licenses(id) ON DELETE CASCADE,     -- account delete removes attachments
      surface_id     TEXT NOT NULL,                 -- machine/client id (D2: == client_identity.client_id)
      machine_name   TEXT,                          -- denormalized for a clean "held by <name>" message
-     station_uuid   TEXT NOT NULL,                 -- stable station identity (matches stations.uuid)
+     station_uuid   TEXT NOT NULL REFERENCES stations(uuid) ON DELETE CASCADE,   -- station delete removes attachments
      role           TEXT NOT NULL DEFAULT 'playout' CHECK (role IN ('playout','monitor')),
      created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
      updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),

@@ -8,7 +8,7 @@
 const LIBRARY_V2_DDL = [
   // Current library state per license — THIS is the source of truth (D2).
   `CREATE TABLE IF NOT EXISTS library_songs (
-     license_key_id   INT NOT NULL REFERENCES licenses(id),
+     license_key_id   INT NOT NULL REFERENCES licenses(id) ON DELETE CASCADE,
      content_hash     TEXT NOT NULL,
      title            TEXT NOT NULL,
      artist           TEXT,
@@ -26,14 +26,14 @@ const LIBRARY_V2_DDL = [
 
   // Per-license snapshot version, bumped on every write to library_songs.
   `CREATE TABLE IF NOT EXISTS library_snapshot_version (
-     license_key_id INT PRIMARY KEY REFERENCES licenses(id),
+     license_key_id INT PRIMARY KEY REFERENCES licenses(id) ON DELETE CASCADE,
      version        BIGINT NOT NULL DEFAULT 0,
      updated_at     TIMESTAMPTZ NOT NULL
    )`,
 
   // Short-lived deletion notices for online clients; GC'd by compaction (§5).
   `CREATE TABLE IF NOT EXISTS library_tombstones (
-     license_key_id   INT NOT NULL REFERENCES licenses(id),
+     license_key_id   INT NOT NULL REFERENCES licenses(id) ON DELETE CASCADE,
      content_hash     TEXT NOT NULL,
      deleted_at       TIMESTAMPTZ NOT NULL,
      snapshot_version BIGINT NOT NULL,

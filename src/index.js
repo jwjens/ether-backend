@@ -1318,6 +1318,13 @@ app.delete("/api/platform/accounts/:id", requirePlatform, async (req, res) => {
       await client.query(`DELETE FROM license_activations WHERE license_key = $1`, [key]);
       await client.query(`DELETE FROM backups            WHERE license_key = $1`, [key]);
     }
+    // v2 tables that REFERENCE licenses(id) WITHOUT ON DELETE CASCADE — delete explicitly so the
+    // DELETE licenses below can't FK-violate (which would roll the whole delete back) and nothing is
+    // left orphaned. Covers station_attachments + the v2 library tables.
+    await client.query(`DELETE FROM station_attachments      WHERE license_key_id = $1`, [id]);
+    await client.query(`DELETE FROM library_songs            WHERE license_key_id = $1`, [id]);
+    await client.query(`DELETE FROM library_snapshot_version WHERE license_key_id = $1`, [id]);
+    await client.query(`DELETE FROM library_tombstones       WHERE license_key_id = $1`, [id]);
     const del = await client.query(`DELETE FROM licenses WHERE id = $1`, [id]);    // cascades account_users
     await client.query("COMMIT");
     res.json({ ok: true, deleted: del.rowCount, email: lic[0].email });
@@ -1382,6 +1389,7 @@ app.delete("/api/platform/stations/:uuid", requirePlatform, async (req, res) => 
     if (!rows.length) { client.release(); return res.status(404).json({ error: "station_not_found" }); }
     await client.query("BEGIN");
     await client.query(`DELETE FROM mutations WHERE station_id = $1 OR (table_name = 'stations' AND row_id = $1)`, [uuid]);
+    await client.query(`DELETE FROM station_attachments WHERE station_uuid = $1`, [uuid]); // no cascade FK — delete explicitly
     const del = await client.query(`DELETE FROM stations WHERE uuid = $1`, [uuid]); // cascades station_* data
     await client.query("COMMIT");
     res.json({ ok: true, deleted: del.rowCount, name: rows[0].name });
@@ -2369,6 +2377,7 @@ app.delete("/api/account/stations/:uuid", requireAuthAdmin, async (req, res) => 
     if (!rows.length) { client.release(); return res.status(404).json({ error: "station_not_found" }); }
     await client.query("BEGIN");
     await client.query(`DELETE FROM mutations WHERE station_id = $1 OR (table_name = 'stations' AND row_id = $1)`, [uuid]);
+    await client.query(`DELETE FROM station_attachments WHERE station_uuid = $1`, [uuid]); // no cascade FK — delete explicitly
     const del = await client.query(`DELETE FROM stations WHERE uuid = $1 AND license_key_id = $2`, [uuid, req.auth.lk]);
     await client.query("COMMIT");
     res.json({ ok: true, deleted: del.rowCount, name: rows[0].name });
@@ -4055,6 +4064,7 @@ app.post("/account/delete-station", async (req, res) => {
     try {
       await client.query("BEGIN");
       await client.query("DELETE FROM mutations WHERE station_id = $1 OR (table_name='stations' AND row_id = $1)", [u]);
+      await client.query("DELETE FROM station_attachments WHERE station_uuid=$1", [u]); // no cascade FK — delete explicitly
       const del = await client.query("DELETE FROM stations WHERE uuid=$1 AND license_key_id=$2", [u, license.id]);
       await client.query("COMMIT");
       console.log(`[Account/DeleteStation] license:${license.id} station:${u.slice(0, 8)} deleted:${del.rowCount}`);
