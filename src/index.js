@@ -936,6 +936,31 @@ async function lookupLicense(rawKey) {
   return null;
 }
 
+// Like lookupLicense, but tells the caller WHY there was no usable match, so a
+// caller (currently only /account/connect) can distinguish an EXPIRED TRIAL from
+// a genuinely bad key. Returns { row, reason }: reason 'ok' (row usable),
+// 'expired' (key matched but expires_at is past — a lapsed trial), or 'notfound'
+// (no matching key at all). lookupLicense above is unchanged for every other caller.
+async function lookupLicenseDetailed(rawKey) {
+  const prefix = rawKey.slice(0, 12);
+  const { rows } = await pool.query(
+    `SELECT * FROM licenses
+     WHERE (key_prefix = $1 OR license_key = $2) AND active = true`,
+    [prefix, rawKey]
+  ).catch(() => ({ rows: [] }));
+  let sawExpired = false;
+  for (const row of rows) {
+    const keyMatches = row.key_hash != null
+      ? await bcrypt.compare(rawKey, row.key_hash)
+      : rawKey === row.license_key;
+    if (!keyMatches) continue;
+    // Key matches this row. If it carries a past expires_at, it's a lapsed trial.
+    if (row.expires_at && new Date(row.expires_at).getTime() < Date.now()) { sawExpired = true; continue; }
+    return { row, reason: "ok" };
+  }
+  return { row: null, reason: sawExpired ? "expired" : "notfound" };
+}
+
 async function requireLicense(req, res, next) {
   const key = req.headers["x-license-key"];
   if (!key) return res.status(401).json({ error: "Missing x-license-key header" });
@@ -3697,7 +3722,15 @@ app.post("/account/connect", async (req, res) => {
       });
     }
 
-    const license = await lookupLicense(rawKey);
+    // Distinguish a lapsed trial from a genuinely bad key so the client can offer a
+    // "pick a plan" doorway instead of a dead-end "invalid key". An expired trial NEVER
+    // destroys data (expiry only gates access) — the stations/library remain and resume
+    // on renewal. renew_url points the operator at the plan picker.
+    const looked = await lookupLicenseDetailed(rawKey);
+    if (looked.reason === "expired") {
+      return res.status(401).json({ error: "trial_expired", renew_url: "https://signup.ether-technologies.com" });
+    }
+    const license = looked.row;
     if (!license) return res.status(401).json({ error: "invalid_license_key" });
 
     // license_activations.license_key fallback — see EB1 in close-out-tracker.
