@@ -468,6 +468,10 @@ async function initDB() {
   // art_url: public R2 URL of the on-air track's embedded cover art (primary artwork
   // for the listener page; iTunes is the listener's fallback). Additive.
   await pool.query(`ALTER TABLE station_now_playing ADD COLUMN IF NOT EXISTS art_url TEXT`);
+  // content_class: MUSIC | JIN | SWP | SPOT for the on-air item. Imaging/commercials (JIN/SWP/SPOT) must
+  // NEVER get an external music-store artwork lookup — the listener uses art_url (local pool/spot image) →
+  // hub/station logo only. Additive/nullable: a legacy install that omits it is treated as MUSIC.
+  await pool.query(`ALTER TABLE station_now_playing ADD COLUMN IF NOT EXISTS content_class TEXT`);
   // decks: full per-physical-deck snapshot {A,B,C} (title/artist/status/positionSec/durationSec)
   // so consumers (dashboard) can show each song on its REAL deck instead of normalizing the
   // on-air track to "Deck A". JSONB → no integer-strictness issue with fractional positions.
@@ -4750,6 +4754,8 @@ async function upsertStationNowPlaying(rawKey, body) {
   // every report — including the keepalive a silent/stalled station now sends — so a stalled station
   // stays "fresh" (→ reads "stalled", not "offline"). Unknown values are stored null (legacy fallback).
   const engineState = ["live", "stalled", "off"].includes(body.engine_state) ? body.engine_state : null;
+  // Content class of the on-air item (imaging/commercials get local art, never a music-store lookup).
+  const contentClass = ["MUSIC", "JIN", "SWP", "SPOT"].includes(body.content_class) ? body.content_class : null;
   // Slice 2: source-machine attribution + last error, all COALESCE'd so a non-sourcing machine's null
   // report can't erase another machine's claim/error (no false "no source" flicker). The LIVE source is
   // the only poster sending a non-null source_machine_id, so:
@@ -4763,8 +4769,8 @@ async function upsertStationNowPlaying(rawKey, body) {
 
   await pool.query(
     `INSERT INTO station_now_playing
-       (station_uuid, playing, title, artist, deck, started_at, position_sec, duration_sec, queue, art_url, decks, engine_state, engine_heartbeat_at, source_machine_id, source_machine_id_at, last_error, last_error_at, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, NOW(), $13::text, CASE WHEN $13::text IS NOT NULL THEN NOW() ELSE NULL END, $14::text, $15::timestamptz, NOW())
+       (station_uuid, playing, title, artist, deck, started_at, position_sec, duration_sec, queue, art_url, decks, engine_state, engine_heartbeat_at, source_machine_id, source_machine_id_at, last_error, last_error_at, content_class, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, NOW(), $13::text, CASE WHEN $13::text IS NOT NULL THEN NOW() ELSE NULL END, $14::text, $15::timestamptz, $16::text, NOW())
      ON CONFLICT (station_uuid) DO UPDATE SET
        playing=$2, title=$3, artist=$4, deck=$5, started_at=$6,
        position_sec=$7, duration_sec=$8, queue=$9, art_url=$10, decks=$11,
@@ -4773,13 +4779,14 @@ async function upsertStationNowPlaying(rawKey, body) {
        source_machine_id_at=CASE WHEN $13::text IS NOT NULL THEN NOW() ELSE station_now_playing.source_machine_id_at END,
        last_error=COALESCE($14::text, station_now_playing.last_error),
        last_error_at=COALESCE($15::timestamptz, station_now_playing.last_error_at),
+       content_class=$16::text,
        updated_at=NOW()`,
     [
       body.station_uuid, playing, body.title ?? null, body.artist ?? null,
       body.deck ?? null, startedAt, position, duration,
       JSON.stringify(Array.isArray(body.queue) ? body.queue : []),
       body.art_url ?? null, decksJson, engineState,
-      source_machine_id, last_error, last_error_at,
+      source_machine_id, last_error, last_error_at, contentClass,
     ]
   );
 
@@ -4796,6 +4803,7 @@ async function upsertStationNowPlaying(rawKey, body) {
         playing, title: body.title ?? null, artist: body.artist ?? null,
         deck: body.deck ?? null, decks: body.decks ?? null,
         started_at: startedAt, duration_sec: duration, art_url: body.art_url ?? null,
+        content_class: contentClass,
         queue: Array.isArray(body.queue) ? body.queue : [], updated_at: Date.now(),
       });
     }
@@ -4862,8 +4870,8 @@ app.get("/public/account/:slug/channels", async (req, res) => {
     if (!lic) return res.status(404).json({ error: "not_found" });
     const { rows } = await pool.query(
       `SELECT m.slug, m.display_name, m.logo_url, m.color_primary, m.color_secondary,
-              m.description, m.category, m.stream_url,
-              n.title, n.artist, n.art_url,
+              m.description, m.category, m.stream_url, m.links,
+              n.title, n.artist, n.art_url, n.content_class,
               (n.playing = true AND n.updated_at > NOW() - INTERVAL '5 minutes') AS live
          FROM stations s
          JOIN station_metadata m ON m.station_uuid = s.uuid
@@ -4885,7 +4893,7 @@ app.get("/public/account/:slug/channels", async (req, res) => {
         category: r.category || null,
         stream_url: r.stream_url || null,
         live: !!r.live,
-        now_playing: r.live ? { title: r.title, artist: r.artist, art_url: r.art_url || null } : null,
+        now_playing: r.live ? { title: r.title, artist: r.artist, art_url: r.art_url || null, content_class: r.content_class || null } : null,
       })),
     });
   } catch (e) {
@@ -4925,7 +4933,7 @@ app.get("/public/stations", async (_req, res) => {
         category: r.category || null,
         stream_url: r.stream_url || null,
         live: !!r.live,
-        now_playing: r.live ? { title: r.title, artist: r.artist, art_url: r.art_url || null } : null,
+        now_playing: r.live ? { title: r.title, artist: r.artist, art_url: r.art_url || null, content_class: r.content_class || null } : null,
       })),
     });
   } catch (e) {
@@ -4951,8 +4959,8 @@ app.get("/public/station/:slug/siblings", async (req, res) => {
     if (!owner || owner.license_key_id == null) return res.json({ account: null, stations: [] });
     const { rows } = await pool.query(
       `SELECT m.slug, m.display_name, m.logo_url, m.color_primary, m.color_secondary,
-              m.description, m.category, m.stream_url,
-              n.title, n.artist, n.art_url,
+              m.description, m.category, m.stream_url, m.links,
+              n.title, n.artist, n.art_url, n.content_class,
               (n.playing = true AND n.updated_at > NOW() - INTERVAL '5 minutes') AS live
          FROM stations s
          JOIN station_metadata m ON m.station_uuid = s.uuid
@@ -4972,8 +4980,9 @@ app.get("/public/station/:slug/siblings", async (req, res) => {
         description: r.description || null,
         category: r.category || null,
         stream_url: r.stream_url || null,
+        links: Array.isArray(r.links) ? r.links : [],
         live: !!r.live,
-        now_playing: r.live ? { title: r.title, artist: r.artist, art_url: r.art_url || null } : null,
+        now_playing: r.live ? { title: r.title, artist: r.artist, art_url: r.art_url || null, content_class: r.content_class || null } : null,
       })),
     });
   } catch (e) {
@@ -4991,7 +5000,7 @@ app.get("/public/station/:slug", async (req, res) => {
     const { rows } = await pool.query(
       `SELECT m.slug, m.display_name, m.logo_url, m.color_primary, m.color_secondary,
               m.description, m.socials, m.links, m.public_enabled, m.stream_url,
-              n.playing, n.title, n.artist, n.deck, n.decks, n.started_at, n.duration_sec, n.queue, n.art_url, n.updated_at
+              n.playing, n.title, n.artist, n.deck, n.decks, n.started_at, n.duration_sec, n.queue, n.art_url, n.content_class, n.updated_at
        FROM station_metadata m
        LEFT JOIN station_now_playing n ON n.station_uuid = m.station_uuid
        WHERE m.slug = $1`,
@@ -5011,7 +5020,7 @@ app.get("/public/station/:slug", async (req, res) => {
         stream_url: r.stream_url || null,
         now_playing: r.updated_at ? {
           playing: r.playing, title: r.title, artist: r.artist, deck: r.deck, decks: r.decks || null,
-          started_at: r.started_at, duration_sec: r.duration_sec, art_url: r.art_url || null,
+          started_at: r.started_at, duration_sec: r.duration_sec, art_url: r.art_url || null, content_class: r.content_class || null,
           queue: r.queue || [], updated_at: r.updated_at,
         } : null,
       });
