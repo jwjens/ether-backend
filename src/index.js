@@ -3146,6 +3146,42 @@ app.post("/api/account/audio/upload-url", requireAuthAdmin, async (req, res) => 
   }
 });
 
+// Release ONE audio object from R2 — the mirror of /audio/upload-url above, and the ONLY route
+// that deletes customer audio. The install calls it after its own local checks show the song was
+// the sole reference to the file (electron/deletion-sweep.js).
+//
+// THE FOLDER COMES FROM AUTH, NEVER FROM THE REQUEST. licenseId is req.auth.lk — the caller
+// supplies a BASENAME and nothing else, so there is no request this endpoint could accept that
+// names another account's prefix. That is the whole reason the key is assembled here rather than
+// taken whole from the body, and it is the same rule /audio/upload-url signs under.
+//
+// IDEMPOTENT BY DESIGN. A missing object is SUCCESS, not an error: the caller retries on failure,
+// so an "already gone" 404 treated as failure would retry forever against an object that is
+// already in the state the caller wanted. deleted:false says which of the two happened.
+app.post("/api/account/audio/delete", requireAuthAdmin, async (req, res) => {
+  try {
+    const licenseId = req.auth.lk;
+    if (!getR2Client()) return res.status(503).json({ error: "r2_not_configured" });
+
+    // Same sanitiser as /audio/upload-url and /audio/download-url — rejects path separators,
+    // dot-segments and null bytes. Shared so the three routes cannot drift on what a key may be.
+    const clean = sanitizeFileKey(req.body?.file_key);
+    if (clean.error) return res.status(400).json({ error: "bad_file_key", detail: clean.error });
+
+    const key = `${licenseId}/${clean.value}`;
+    if (!(await r2ObjectExists(key))) {
+      return res.json({ ok: true, deleted: false, file_key: clean.value, detail: "already_absent" });
+    }
+    const { DeleteObjectCommand } = require("@aws-sdk/client-s3");
+    await getR2Client().send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: key }));
+    console.log(`[account/audio/delete] released ${key}`);
+    res.json({ ok: true, deleted: true, file_key: clean.value });
+  } catch (e) {
+    console.error("[account/audio/delete]", e.stack || e.message);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
 // Install pushes new play_log rows for analytics (x-license-key). Append-only —
 // dedupe by row_uuid, ON CONFLICT DO NOTHING (history only grows, never updates).
 // played_at arrives as unix SECONDS (play_log.played_at). Chunked for backfills.
