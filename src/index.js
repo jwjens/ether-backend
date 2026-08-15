@@ -3146,42 +3146,6 @@ app.post("/api/account/audio/upload-url", requireAuthAdmin, async (req, res) => 
   }
 });
 
-// Release ONE audio object from R2 — the mirror of /audio/upload-url above, and the ONLY route
-// that deletes customer audio. The install calls it after its own local checks show the song was
-// the sole reference to the file (electron/deletion-sweep.js).
-//
-// THE FOLDER COMES FROM AUTH, NEVER FROM THE REQUEST. licenseId is req.auth.lk — the caller
-// supplies a BASENAME and nothing else, so there is no request this endpoint could accept that
-// names another account's prefix. That is the whole reason the key is assembled here rather than
-// taken whole from the body, and it is the same rule /audio/upload-url signs under.
-//
-// IDEMPOTENT BY DESIGN. A missing object is SUCCESS, not an error: the caller retries on failure,
-// so an "already gone" 404 treated as failure would retry forever against an object that is
-// already in the state the caller wanted. deleted:false says which of the two happened.
-app.post("/api/account/audio/delete", requireAuthAdmin, async (req, res) => {
-  try {
-    const licenseId = req.auth.lk;
-    if (!getR2Client()) return res.status(503).json({ error: "r2_not_configured" });
-
-    // Same sanitiser as /audio/upload-url and /audio/download-url — rejects path separators,
-    // dot-segments and null bytes. Shared so the three routes cannot drift on what a key may be.
-    const clean = sanitizeFileKey(req.body?.file_key);
-    if (clean.error) return res.status(400).json({ error: "bad_file_key", detail: clean.error });
-
-    const key = `${licenseId}/${clean.value}`;
-    if (!(await r2ObjectExists(key))) {
-      return res.json({ ok: true, deleted: false, file_key: clean.value, detail: "already_absent" });
-    }
-    const { DeleteObjectCommand } = require("@aws-sdk/client-s3");
-    await getR2Client().send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: key }));
-    console.log(`[account/audio/delete] released ${key}`);
-    res.json({ ok: true, deleted: true, file_key: clean.value });
-  } catch (e) {
-    console.error("[account/audio/delete]", e.stack || e.message);
-    res.status(500).json({ error: "server_error" });
-  }
-});
-
 // Install pushes new play_log rows for analytics (x-license-key). Append-only —
 // dedupe by row_uuid, ON CONFLICT DO NOTHING (history only grows, never updates).
 // played_at arrives as unix SECONDS (play_log.played_at). Chunked for backfills.
@@ -4285,6 +4249,60 @@ app.post("/audio/upload-url", async (req, res) => {
     res.json({ signed_url: signedUrl, expires_at: expiresAt });
   } catch (e) {
     console.error("[/audio/upload-url]", e.message);
+    res.status(500).json({ error: "internal", detail: e.message });
+  }
+});
+
+// POST /audio/delete — release ONE audio object from R2. The mirror of /audio/upload-url above,
+// and the ONLY route that deletes customer audio. The install calls it after its own local checks
+// show the deleted song was the sole reference to the file (electron/deletion-sweep.js).
+//
+// AUTHENTICATED THE SAME WAY ITS SIBLINGS ARE: license_key in the body, resolved by lookupLicense.
+// It deliberately does NOT use requireAuthAdmin/req.auth.lk. The desktop install holds a USER token
+// (typ:"user", uid/email, no role and no lk) — it has never had an admin/lk token, and giving it
+// one is the separate owner-login backlog item. An admin-gated delete route is one the install can
+// never call: 403 admin_required when fresh, and an `undefined/<key>` prefix even if it passed.
+//
+// THE FOLDER COMES FROM THE RESOLVED LICENSE, NEVER FROM THE REQUEST. The prefix is license.id as
+// returned by lookupLicense — the caller supplies a BASENAME and a key it must already possess, so
+// there is no request this endpoint could accept that names another account's prefix.
+//
+// IDEMPOTENT BY DESIGN. A missing object is SUCCESS, not an error: the caller retries on failure,
+// so an "already gone" 404 treated as failure would retry forever against an object that is
+// already in the state the caller wanted. deleted:false says which of the two happened.
+app.post("/audio/delete", async (req, res) => {
+  try {
+    const { license_key, file_key } = req.body || {};
+    const rawKey = license_key?.trim();
+    if (!rawKey) {
+      return res.status(400).json({ error: "missing_fields", detail: "license_key is required" });
+    }
+
+    // Same sanitiser as /audio/upload-url and /audio/download-url — rejects path separators,
+    // dot-segments and null bytes. Shared so the three routes cannot drift on what a key may be.
+    const sanitized = sanitizeFileKey(file_key);
+    if (sanitized.error) {
+      return res.status(400).json({ error: "invalid_file_key", detail: sanitized.error });
+    }
+
+    const license = await lookupLicense(rawKey);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+
+    if (!getR2Client()) {
+      return res.status(503).json({ error: "r2_not_configured", detail: "Backend R2 credentials not set" });
+    }
+
+    const r2Key = `${license.id}/${sanitized.value}`;
+    if (!(await r2ObjectExists(r2Key))) {
+      console.log(`[Audio/Delete] license:${license.id} key:${sanitized.value} — already absent`);
+      return res.json({ ok: true, deleted: false, file_key: sanitized.value, detail: "already_absent" });
+    }
+    const { DeleteObjectCommand } = require("@aws-sdk/client-s3");
+    await getR2Client().send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: r2Key }));
+    console.log(`[Audio/Delete] license:${license.id} key:${sanitized.value} — RELEASED`);
+    res.json({ ok: true, deleted: true, file_key: sanitized.value });
+  } catch (e) {
+    console.error("[/audio/delete]", e.stack || e.message);
     res.status(500).json({ error: "internal", detail: e.message });
   }
 });
