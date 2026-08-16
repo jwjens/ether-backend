@@ -342,6 +342,12 @@ async function initDB() {
   // Email marketing opt-out (CAN-SPAM). Each user gets a stable, opaque unsubscribe token.
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS marketing_opt_out BOOLEAN NOT NULL DEFAULT false`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS unsubscribe_token TEXT`);
+  // Admin-provisioned accounts (POST /api/platform/account/create) are handed a TEMPORARY password,
+  // so the user row records that it is temporary. Additive + defaulted, like every column above it.
+  // NOTE: nothing ENFORCES this yet — no sign-in path reads it. It is recorded now so the flag is
+  // truthful from the first provisioned account, and so a later password-change flow has the state
+  // it needs instead of having to guess which passwords were admin-set. See the build report.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT false`);
   await pool.query(`UPDATE users SET unsubscribe_token = md5(random()::text || clock_timestamp()::text || id::text) WHERE unsubscribe_token IS NULL`);
   await pool.query(`DELETE FROM guest_presence WHERE joined_at < NOW() - INTERVAL '24 hours'`).catch(() => {});
 
@@ -1374,7 +1380,10 @@ app.post("/api/platform/users/reset-password", requirePlatform, async (req, res)
     const password = String(req.body?.password || "");
     if (password.length < 8) return res.status(400).json({ error: "weak_password" });
     const accountId = parseInt(req.body?.accountId, 10) || null;
-    const email = String(req.body?.email || "").trim().toLowerCase();
+    // `let`, not `const` — the accountId branch below falls back to the LICENSE's email when the
+    // caller supplied none, and reassigning a const threw TypeError: Assignment to constant
+    // variable, taking out the exact path the dashboard uses when you click an account row.
+    let email = String(req.body?.email || "").trim().toLowerCase();
 
     let u = null;
     if (accountId) {
@@ -1405,6 +1414,117 @@ app.post("/api/platform/users/reset-password", requirePlatform, async (req, res)
     );
     res.json({ ok: true, email: rows[0].email, created: true });
   } catch (e) { console.error("[platform/reset-password]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+// A temporary password an admin can read down a phone line. Ambiguous glyphs (0/O, 1/l/I) are left
+// out on purpose — this gets dictated to a customer, and a mistyped password is indistinguishable
+// from a wrong one. 16 chars from a 57-char alphabet ≈ 93 bits, so shortening it for readability
+// costs nothing that matters. crypto.randomInt is rejection-sampled — no modulo bias.
+function generateTempPassword(len = 16) {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+  let out = "";
+  for (let i = 0; i < len; i++) out += alphabet[crypto.randomInt(alphabet.length)];
+  return out;
+}
+
+// POST /api/platform/account/create — provision a sign-in for a license that already exists.
+//
+// THE GAP THIS FILLS: a paid/lifetime license can exist with no `users` row, and until now there
+// was no way to create one. The customer has an entitlement and no way to sign in.
+//
+// Modelled ENTIRELY on /api/platform/users/reset-password above and /api/user/desktop-activate:
+// same `users` table, same bcrypt(12) into password_hash, same license link via users.license_key_id,
+// same email_verified=true reasoning (an admin set it directly, so there is nothing to verify by
+// mail). NO second auth scheme is introduced — the account this creates signs in through the exact
+// path the desktop already uses.
+//
+// Gated by requirePlatform, the same gate its sibling uses and the one platform.ether-technologies.com
+// holds — and namespaced to match. /admin/* in this file means the OTHER gate (requireAdmin, a raw
+// x-admin-secret header, :979), so an /api/admin/ path here would have advertised the wrong auth.
+//
+// THE TEMPORARY PASSWORD IS RETURNED EXACTLY ONCE. It is never stored in plaintext, never logged,
+// and never emailed — only its bcrypt hash is persisted. If the response is lost, the admin resets
+// via /api/platform/users/reset-password rather than recovering it, because it is not recoverable.
+//
+// REFUSES rather than overwrites. An existing `users` row for that email is a 409, not an upsert —
+// the sibling route upserts by design (it is a RESET), and quietly resetting a live customer's
+// password while trying to create an account would be the worst possible failure mode here.
+app.post("/api/platform/account/create", requirePlatform, async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    if (!EMAIL_RE.test(email)) return res.status(400).json({ error: "invalid_email" });
+    const licenseId = req.body?.license_id != null ? parseInt(req.body.license_id, 10) : null;
+    if (req.body?.license_id != null && !Number.isFinite(licenseId)) {
+      return res.status(400).json({ error: "invalid_license_id" });
+    }
+
+    // Resolve the license: explicit id wins; otherwise the one ISSUED TO this email. Newest active
+    // match, mirroring how desktop-activate resolves a license by email (ORDER BY id DESC LIMIT 1).
+    const license = licenseId
+      ? (await pool.query(`SELECT * FROM licenses WHERE id = $1 AND active = true`, [licenseId])).rows[0]
+      : (await pool.query(
+          `SELECT * FROM licenses WHERE lower(email) = $1 AND active = true ORDER BY id DESC LIMIT 1`, [email]
+        )).rows[0];
+    if (!license) {
+      return res.status(404).json({
+        error: "license_not_found",
+        detail: licenseId
+          ? `no active license with id ${licenseId}`
+          : `no active license issued to ${email} — pass license_id explicitly if it was issued to a different address`,
+      });
+    }
+
+    // REFUSE on an existing account. Reported, never overwritten.
+    const existing = (await pool.query(`SELECT id, email, license_key_id FROM users WHERE email = $1`, [email])).rows[0];
+    if (existing) {
+      return res.status(409).json({
+        error: "account_exists",
+        detail: `a sign-in already exists for ${email} — use /api/platform/users/reset-password to set a new password`,
+        user_id: existing.id,
+        linked_license_id: existing.license_key_id,
+      });
+    }
+
+    // Not a refusal: a license MAY legitimately carry several people later (RBAC memberships). But an
+    // admin provisioning "the customer's account" for a license that already has one is usually a
+    // mistake, so it is surfaced rather than hidden.
+    const siblings = (await pool.query(
+      `SELECT id, email FROM users WHERE license_key_id = $1 ORDER BY id`, [license.id])).rows;
+
+    const tempPassword = generateTempPassword();
+    const hash = await bcrypt.hash(tempPassword, 12);          // cost 12 — identical to every other writer
+    const unsub = crypto.randomBytes(18).toString("base64url");
+    const { rows } = await pool.query(
+      `INSERT INTO users (email, password_hash, email_verified, license_key_id, unsubscribe_token, must_change_password)
+       VALUES ($1, $2, true, $3, $4, true)
+       RETURNING id, email, license_key_id, must_change_password`,
+      [email, hash, license.id, unsub]
+    );
+    const user = rows[0];
+
+    // Log the FACT, never the secret.
+    console.log(`[platform/account/create] provisioned user:${user.id} <${user.email}> license:${license.id} plan:${license.plan}`);
+
+    res.json({
+      ok: true,
+      created: true,
+      user_id: user.id,
+      email: user.email,
+      license_id: license.id,
+      plan: license.plan,
+      must_change_password: user.must_change_password,
+      // Returned ONCE. Not stored, not logged, not recoverable.
+      temporary_password: tempPassword,
+      sign_in_with: "POST /api/user/desktop-activate (email + password) — the desktop's normal sign-in",
+      warnings: siblings.length
+        ? [`license ${license.id} already has ${siblings.length} sign-in(s): ${siblings.map(s => s.email).join(", ")}`]
+        : [],
+      known_gap: "must_change_password is recorded but NOT enforced — no sign-in path reads it yet.",
+    });
+  } catch (e) {
+    console.error("[platform/account/create]", e.stack || e.message);
+    res.status(500).json({ error: "server_error" });
+  }
 });
 
 // Delete a single station and everything under it — platform-owner only. The stations row delete
