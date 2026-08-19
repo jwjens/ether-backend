@@ -2938,7 +2938,17 @@ app.post("/api/account/data/sync", async (req, res) => {
         params
       );
     }
-    if (present.length > 0) {
+    // RECONCILE — tombstone rows this push no longer sends.
+    //
+    // HEALTH IS EXEMPT (2026-08-18, web health monitor design §1.1). The sweep assumes ONE writer owns
+    // the whole table, which holds for categories/clocks/shows: one install mirrors the lot. Health
+    // frames have MANY writers — a station can be served by more than one machine, which is the very
+    // reason a designated generator exists — and each machine only ever sends its own row. Sweeping
+    // here would make machine A tombstone machine B's frame on every push, so the two boxes would flap
+    // each other out of existence roughly once a minute. Health rows age out instead: the reader treats
+    // a frame older than its own declared cadence as stale, and OFFLINE past that (design §4), so a
+    // machine that stops pushing goes dark on its own without anything deleting it.
+    if (present.length > 0 && table !== "health") {
       await pool.query(
         `UPDATE station_cc_data SET deleted_at = NOW(), updated_at = NOW()
          WHERE station_uuid = $1 AND table_name = $2 AND deleted_at IS NULL
@@ -2976,6 +2986,61 @@ app.get("/api/account/station/:uuid/data", requireAuth, async (req, res) => {
     return res.json({ rows: rows.map((r) => r.payload) });
   } catch (e) {
     console.error("[account/data:get]", e.message);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// ── FLEET HEALTH — every station of this account, every machine reporting on it ────────────────────
+// The web Health Monitor's one read (design doc §6). JWT-authed and scoped by req.auth.lk exactly like
+// the per-station /data read above; an account can only ever see its own stations.
+//
+// LEFT JOIN, deliberately: a station that has NEVER pushed a health frame must still come back, as a
+// station with zero machines. A machine that silently vanishes from the response is indistinguishable
+// from a healthy fleet, which is the failure mode the whole staleness rule exists to prevent (§4).
+//
+// AGE IS COMPUTED HERE. server_now and age_sec come off the database clock, never the machine's — a box
+// with a wrong (or deliberately skewed) clock must not be able to make itself look freshly seen. The
+// payload's own observedAt rides along untouched so the reader can surface clock skew as its own fact.
+app.get("/api/account/health", requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT s.uuid            AS station_uuid,
+              s.name            AS station_name,
+              d.row_uuid        AS row_uuid,
+              d.payload         AS payload,
+              d.updated_at      AS updated_at,
+              EXTRACT(EPOCH FROM (NOW() - d.updated_at)) AS age_sec
+         FROM stations s
+         LEFT JOIN station_cc_data d
+                ON d.station_uuid = s.uuid
+               AND d.table_name   = 'health'
+               AND d.deleted_at IS NULL
+        WHERE s.license_key_id = $1
+        ORDER BY s.created_at ASC, d.updated_at DESC NULLS LAST`,
+      [req.auth.lk]
+    );
+
+    // Group into one entry per station, each carrying the machines currently reporting on it.
+    const byStation = new Map();
+    for (const r of rows) {
+      let st = byStation.get(r.station_uuid);
+      if (!st) {
+        st = { station_uuid: r.station_uuid, station_name: r.station_name, machines: [] };
+        byStation.set(r.station_uuid, st);
+      }
+      if (!r.row_uuid) continue;   // LEFT JOIN miss — the station simply has no frame yet
+      st.machines.push({
+        row_uuid: r.row_uuid,
+        machine_id: r.payload?.machine_id ?? null,
+        updated_at: r.updated_at,
+        age_sec: r.age_sec != null ? Math.round(Number(r.age_sec)) : null,
+        payload: r.payload,
+      });
+    }
+
+    return res.json({ server_now: new Date().toISOString(), stations: [...byStation.values()] });
+  } catch (e) {
+    console.error("[account/health:get]", e.message);
     return res.status(500).json({ error: "server_error" });
   }
 });
