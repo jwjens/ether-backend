@@ -705,6 +705,27 @@ async function initDB() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_staged_pending ON staged_programming(station_uuid) WHERE deleted_at IS NULL AND imported_at IS NULL`);
 
+  // ── JUKEBOX PUBLIC REQUESTS (Phase 2) ────────────────────────────────────────────────────────
+  // The pool a phone is allowed to search, published BY THE INSTALL. The backend never derives it:
+  // the checked categories and "is this file actually playable here" are facts only the install
+  // knows, and a guest must never be offered a song that cannot play.
+  //
+  // PUBLIC IDENTITY IS THE SLUG, never a license key (design §2). A phone presents a slug and can
+  // therefore only reach the one station whose QR it scanned; it cannot enumerate anything else.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS jukebox_pool (
+      slug           TEXT PRIMARY KEY,
+      station_uuid   TEXT NOT NULL REFERENCES stations(uuid) ON DELETE CASCADE,
+      license_key_id INTEGER NOT NULL,
+      station_name   TEXT,
+      songs          JSONB NOT NULL DEFAULT '[]'::jsonb,
+      updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  // A station owns one slug at a time; re-publishing under a new slug must not leave the old one
+  // answering with a stale pool.
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_jukebox_pool_station ON jukebox_pool(station_uuid)`);
+
   // Append-only play history for cross-install analytics (Phase 3a). The install pushes
   // new play_log rows incrementally; rows are never updated (ON CONFLICT DO NOTHING).
   // Distinct from station_cc_data (which tombstones) because history only grows.
@@ -5599,6 +5620,134 @@ app.post("/api/station/:uuid/now-playing-art-upload-url", async (req, res) => {
 
 // Auth: dashboard Bearer JWT (admin — Control Center remote edits) OR x-license-key
 // (companion/desktop transport controls). Fan-out + offline queue are per-license.
+// ── COMMAND DELIVERY, shared ──────────────────────────────────────────────────────────────────────
+// Deliver a command to every desktop on a license: SSE if any are listening, otherwise queued for the
+// next connect. Extracted from /api/cmd so the PUBLIC jukebox request path — which has no license key
+// of its own, only a slug — delivers over the EXACT same rail rather than growing a parallel one.
+function emitCommand(licenseId, cmd, data) {
+  const lid = String(licenseId);
+  const payload = JSON.stringify({ cmd, data, ts: Math.floor(Date.now() / 1000) });
+  const clients = sseClients.get(lid);
+  if (clients && clients.size > 0) {
+    for (const client of clients) {
+      if (!client.writableEnded) client.write(`event: cmd\ndata: ${payload}\n\n`);
+    }
+    console.log(`[cmd] ${cmd} -> SSE fan-out to ${clients.size} client(s) for license=${lid}`);
+    return { delivered: clients.size, queued: false };
+  }
+  // Nobody listening: queue it. A guest at an event must not lose their request because the desktop
+  // happened to reconnect a second earlier.
+  const q = pendingCmds.get(lid) || [];
+  q.push({ cmd, data, ts: Math.floor(Date.now() / 1000) });
+  if (q.length > 20) q.splice(0, q.length - 20);
+  pendingCmds.set(lid, q);
+  console.log(`[cmd] ${cmd} -> queued for license=${lid} (no listener)`);
+  return { delivered: 0, queued: true };
+}
+
+// ── JUKEBOX PHASE 2 — the public request page's three endpoints ───────────────────────────────────
+//
+// PUBLISH (install -> cloud, x-license-key). The install owns the pool: which categories are ticked
+// and whether a file is actually playable HERE are facts only it has. The backend never derives it,
+// so a guest can never be offered a song that cannot play.
+app.post("/api/account/jukebox/pool", async (req, res) => {
+  try {
+    const key = req.headers["x-license-key"];
+    if (!key) return res.status(401).json({ error: "missing_license_key" });
+    const license = await lookupLicense(key);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+
+    const stationUuid = String(req.body?.station_uuid || "");
+    const slug = String(req.body?.slug || "").trim().toLowerCase();
+    const songs = Array.isArray(req.body?.songs) ? req.body.songs : [];
+    const stationName = req.body?.station_name ? String(req.body.station_name) : null;
+    if (!stationUuid || !slug) return res.status(400).json({ error: "missing_fields" });
+    if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(slug)) return res.status(400).json({ error: "bad_slug" });
+
+    const { rows: own } = await pool.query(
+      `SELECT 1 FROM stations WHERE uuid = $1 AND license_key_id = $2`, [stationUuid, license.id]);
+    if (own.length === 0) return res.status(404).json({ error: "station_not_found" });
+
+    // A station owns ONE slug. Drop any previous slug for it, or an old slug keeps answering with a
+    // pool nobody is maintaining.
+    await pool.query(`DELETE FROM jukebox_pool WHERE station_uuid = $1 AND slug <> $2`, [stationUuid, slug]);
+    await pool.query(
+      `INSERT INTO jukebox_pool (slug, station_uuid, license_key_id, station_name, songs, updated_at)
+       VALUES ($1,$2,$3,$4,$5::jsonb,NOW())
+       ON CONFLICT (slug) DO UPDATE SET
+         station_uuid = EXCLUDED.station_uuid, license_key_id = EXCLUDED.license_key_id,
+         station_name = EXCLUDED.station_name, songs = EXCLUDED.songs, updated_at = NOW()`,
+      [slug, stationUuid, license.id, stationName, JSON.stringify(songs)]);
+
+    return res.json({ ok: true, slug, count: songs.length });
+  } catch (e) {
+    console.error("[jukebox/pool:publish]", e.message);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// READ (phone, PUBLIC, no auth — a guest at an event has no account). Slug-scoped: this can only ever
+// return the one station whose QR was scanned.
+app.get("/public/jukebox/:slug/pool", async (req, res) => {
+  try {
+    const slug = String(req.params.slug || "").trim().toLowerCase();
+    const { rows } = await pool.query(
+      `SELECT slug, station_name, songs, updated_at FROM jukebox_pool WHERE slug = $1`, [slug]);
+    if (rows.length === 0) return res.status(404).json({ error: "unknown_jukebox" });
+    const r = rows[0];
+    return res.json({
+      slug: r.slug, station_name: r.station_name, updated_at: r.updated_at,
+      songs: Array.isArray(r.songs) ? r.songs : [],
+    });
+  } catch (e) {
+    console.error("[jukebox/pool:get]", e.message);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// REQUEST (phone, PUBLIC, no auth). Validated against the published pool, then delivered to the
+// desktop over the EXISTING command bus — the same rail the dashboard's db:apply already rides.
+// The desktop writes it into its LOCAL jukebox_requests table; nothing here is CRDT-synced, because a
+// request is a live event at one venue on one night, not shared state.
+const JUKEBOX_NAME_MAX = 40;
+app.post("/public/jukebox/:slug/request", async (req, res) => {
+  try {
+    const slug = String(req.params.slug || "").trim().toLowerCase();
+    // Length-capped and stripped of markup at the boundary (design §2 "abuse surface"). The name goes
+    // on a wall in front of a room; it is never rendered as HTML anywhere, and this keeps it that way.
+    const name = String(req.body?.name || "").replace(/[<>]/g, "").trim().slice(0, JUKEBOX_NAME_MAX);
+    const songUuid = String(req.body?.song_uuid || "").trim();
+    if (!name) return res.status(400).json({ error: "name_required" });
+    if (!songUuid) return res.status(400).json({ error: "song_required" });
+
+    const { rows } = await pool.query(
+      `SELECT station_uuid, license_key_id, songs FROM jukebox_pool WHERE slug = $1`, [slug]);
+    if (rows.length === 0) return res.status(404).json({ error: "unknown_jukebox" });
+    const jb = rows[0];
+
+    // The song must be IN the published pool. Trusting a client-supplied id would let anyone queue
+    // anything in the library, ticked categories or not.
+    const song = (Array.isArray(jb.songs) ? jb.songs : []).find(x => x && x.uuid === songUuid);
+    if (!song) return res.status(400).json({ error: "song_not_in_pool" });
+
+    const r = emitCommand(jb.license_key_id, "jukebox:request", {
+      station_uuid: jb.station_uuid,
+      name,
+      song_uuid: songUuid,
+      title: song.title || null,
+      artist: song.artist || null,
+      source: "web",
+    });
+
+    // Honest about delivery: a queued request reaches a desktop that is currently offline only when
+    // it reconnects, and the page says so rather than implying it is already on the wall.
+    return res.json({ ok: true, delivered: r.delivered, queued: r.queued });
+  } catch (e) {
+    console.error("[jukebox/request]", e.message);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
 app.post("/api/cmd", async (req, res) => {
   let licenseId = null, viaJwt = false, jwtRole = null;
   const authz = req.headers["authorization"] || "";
@@ -5619,19 +5768,7 @@ app.post("/api/cmd", async (req, res) => {
   const { cmd } = req.body;
   if (!cmd) return res.status(400).json({ error: "Missing cmd" });
 
-  const payload = JSON.stringify({ cmd, data: req.body, ts: Math.floor(Date.now() / 1000) });
-  const clients = sseClients.get(licenseId);
-  if (clients && clients.size > 0) {
-    for (const client of clients) {
-      if (!client.writableEnded) client.write(`event: cmd\ndata: ${payload}\n\n`);
-    }
-    console.log(`[cmd] ${cmd} → SSE fan-out to ${clients.size} client(s) for license=${licenseId}`);
-  } else {
-    const q = pendingCmds.get(licenseId) || [];
-    q.push({ cmd, data: req.body, ts: Math.floor(Date.now() / 1000) });
-    if (q.length > 20) q.splice(0, q.length - 20);
-    pendingCmds.set(licenseId, q);
-  }
+  emitCommand(licenseId, cmd, req.body);
   res.json({ ok: true });
 });
 
