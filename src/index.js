@@ -722,6 +722,13 @@ async function initDB() {
       updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  // LIVE STATE for the lobby display (now playing, up next, the named queue). Same row as the pool so
+  // it shares the slug, the ownership check and the station link — but written by its OWN endpoint,
+  // because the pool changes when an operator re-ticks categories (rarely) and the state changes every
+  // song (constantly). Publishing the whole pool at the state's cadence would be pure waste.
+  await pool.query(`ALTER TABLE jukebox_pool ADD COLUMN IF NOT EXISTS state JSONB`);
+  await pool.query(`ALTER TABLE jukebox_pool ADD COLUMN IF NOT EXISTS state_at TIMESTAMPTZ`);
+
   // A station owns one slug at a time; re-publishing under a new slug must not leave the old one
   // answering with a stale pool.
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_jukebox_pool_station ON jukebox_pool(station_uuid)`);
@@ -5701,6 +5708,59 @@ app.get("/public/jukebox/:slug/pool", async (req, res) => {
     });
   } catch (e) {
     console.error("[jukebox/pool:get]", e.message);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// LIVE STATE — published by the Jukebox window (install -> cloud), read by the lobby display.
+// Separate from the pool on cadence alone; identical on identity and ownership.
+app.post("/api/account/jukebox/state", async (req, res) => {
+  try {
+    const key = req.headers["x-license-key"];
+    if (!key) return res.status(401).json({ error: "missing_license_key" });
+    const license = await lookupLicense(key);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+
+    const slug = String(req.body?.slug || "").trim().toLowerCase();
+    if (!slug) return res.status(400).json({ error: "missing_slug" });
+
+    // Ownership is checked against the row that already exists for this slug — the pool must have been
+    // published first, which is also what guarantees the lobby has songs to name.
+    const { rows } = await pool.query(
+      `SELECT license_key_id FROM jukebox_pool WHERE slug = $1`, [slug]);
+    if (rows.length === 0) return res.status(404).json({ error: "unknown_jukebox" });
+    if (rows[0].license_key_id !== license.id) return res.status(403).json({ error: "not_your_jukebox" });
+
+    await pool.query(
+      `UPDATE jukebox_pool SET state = $2::jsonb, state_at = NOW() WHERE slug = $1`,
+      [slug, JSON.stringify(req.body?.state ?? {})]);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("[jukebox/state:publish]", e.message);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// READ (lobby display, PUBLIC). age_sec comes off the DATABASE clock so a stale feed is detectable by
+// the display without trusting the publisher's clock — the same rule the health monitor follows.
+app.get("/public/jukebox/:slug/state", async (req, res) => {
+  try {
+    const slug = String(req.params.slug || "").trim().toLowerCase();
+    const { rows } = await pool.query(
+      `SELECT station_name, state, state_at,
+              EXTRACT(EPOCH FROM (NOW() - state_at)) AS age_sec
+         FROM jukebox_pool WHERE slug = $1`, [slug]);
+    if (rows.length === 0) return res.status(404).json({ error: "unknown_jukebox" });
+    const r = rows[0];
+    return res.json({
+      slug, station_name: r.station_name,
+      state: r.state || null,
+      state_at: r.state_at,
+      age_sec: r.age_sec != null ? Math.round(Number(r.age_sec)) : null,
+      server_now: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error("[jukebox/state:get]", e.message);
     return res.status(500).json({ error: "server_error" });
   }
 });
