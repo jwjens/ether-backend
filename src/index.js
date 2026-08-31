@@ -49,6 +49,7 @@ const bcrypt     = require('bcrypt');
 const jwt        = require('jsonwebtoken');
 const rateLimit  = require('express-rate-limit');
 const { validateSlug } = require("./slug");
+const opsCore = require("./ops-core");   // Park Ops: closing-time resolution + sanity rails
 const { deriveStationState, parseSourceFields, resolveSourceMachineId } = require("./station-state"); // honest state (Slice 1) + source/last_error (Slice 2)
 
 // JWT signing secret for the Control Center dashboard. MUST be set in production
@@ -685,6 +686,24 @@ async function initDB() {
       PRIMARY KEY (station_uuid, table_name, row_uuid)
     )
   `);
+
+  // ── PARK OPS write token ───────────────────────────────────────────────────
+  // Park Ops is a PUBLIC page: park.ether-cast.com/<station-slug>, reachable by anyone the operator
+  // sends the link to. Reads are open (the page is useless without a station, and gating reads would
+  // mean an operator whose phone dropped the query string sees an error instead of the closing time).
+  // The one WRITE — the closing time — is gated by this token.
+  //
+  // It is deliberately NOT the license key and NOT an account JWT. Those carry the whole account;
+  // this carries one station and one setting, and it lives in a public page's URL. Scope is the
+  // entire point: the worst a leaked token can do is change one park's closing time.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS station_ops_token (
+      station_uuid TEXT PRIMARY KEY REFERENCES stations(uuid) ON DELETE CASCADE,
+      token        TEXT NOT NULL,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_ops_token ON station_ops_token(token)`);
 
   // Cloud-first STAGED programming: dashboard-authored categories/clocks/clock_slots/shows that
   // exist in the cloud with NO running install, then sync DOWN when the install signs in. Keyed
@@ -5306,6 +5325,200 @@ app.get("/public/station/:slug", async (req, res) => {
   } catch (e) {
     console.error("[public/station]", e.message);
     res.status(500).json({ error: "server_error" });
+  }
+});
+
+// ── PARK OPS ───────────────────────────────────────────────────────────────────────────────────
+// park.ether-cast.com/<station-slug> — the park operations page. A listener clone in every respect
+// that matters: hosted, public, slug in the path, and ALWAYS REACHABLE. A station that is not airing
+// is not an error here — the page loads and says the station is dark, exactly as listen does.
+//
+// The data is mirrored up by the install over the existing pushCcData rail (POST /api/account/data/
+// sync -> station_cc_data), so this endpoint reads Postgres and never touches the station.
+
+/** slug -> station_uuid, honouring renames. Returns {uuid} or {redirect} or null. */
+async function resolveOpsSlug(slug) {
+  const { rows } = await pool.query(
+    `SELECT station_uuid FROM station_metadata WHERE slug = $1 AND public_enabled = true LIMIT 1`,
+    [slug]
+  );
+  if (rows.length) return { uuid: rows[0].station_uuid };
+  const { rows: hist } = await pool.query(
+    `SELECT m.slug FROM station_slug_history h
+       JOIN station_metadata m ON m.station_uuid = h.station_uuid
+      WHERE h.old_slug = $1 AND m.public_enabled = true AND m.slug IS NOT NULL`,
+    [slug]
+  );
+  if (hist.length && hist[0].slug && hist[0].slug !== slug) return { redirect: hist[0].slug };
+  return null;
+}
+
+/** Live (non-tombstoned) mirrored rows for one table. */
+async function ccRows(stationUuid, table) {
+  const { rows } = await pool.query(
+    `SELECT payload FROM station_cc_data
+      WHERE station_uuid = $1 AND table_name = $2 AND deleted_at IS NULL`,
+    [stationUuid, table]
+  );
+  return rows.map(r => r.payload);
+}
+
+app.get("/public/ops/:slug", async (req, res) => {
+  const slug = String(req.params.slug || "").toLowerCase();
+  try {
+    const found = await resolveOpsSlug(slug);
+    if (!found) return res.status(404).json({ error: "not_found" });
+    if (found.redirect) return res.redirect(301, `/public/ops/${found.redirect}`);
+    const stationUuid = found.uuid;
+
+    const { rows: meta } = await pool.query(
+      `SELECT m.slug, m.display_name, m.logo_url, m.color_primary,
+              n.playing, n.title, n.artist, n.started_at, n.duration_sec, n.updated_at
+         FROM station_metadata m
+         LEFT JOIN station_now_playing n ON n.station_uuid = m.station_uuid
+        WHERE m.station_uuid = $1`,
+      [stationUuid]
+    );
+    const m = meta[0] || {};
+
+    // The date is the STATION's local day where one is mirrored, falling back to the server's.
+    // A park closing at 22:00 must not roll over because Railway is on UTC.
+    const opsCfgRows = await ccRows(stationUuid, "ops_config");
+    const cfgRow = opsCfgRows.find(r => r && r.uuid === "ops") || opsCfgRows[0] || null;
+    const dateStr = (cfgRow && typeof cfgRow.local_date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(cfgRow.local_date))
+      ? cfgRow.local_date
+      : new Date().toISOString().slice(0, 10);
+    const dow = (() => { const d = new Date(`${dateStr}T00:00:00Z`); return isNaN(d) ? new Date().getUTCDay() : d.getUTCDay(); })();
+
+    const cfg = opsCore.parseClosing(cfgRow ? cfgRow.closing : null);
+    const effective = opsCore.resolveClosing(cfg, dateStr, dow);
+    const closingMin = opsCore.hhmmToMin(effective);
+
+    const sched = (await ccRows(stationUuid, "announcement_schedule"))
+      .filter(r => r && r.date === dateStr)
+      .sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0)
+                   || String(a.trigger_time || "").localeCompare(String(b.trigger_time || "")));
+    const queue = opsCore.buildQueue(sched, closingMin, dateStr);
+
+    // HONEST DARKNESS. `mirrored` says whether this station has ever pushed ops data. A park with no
+    // announcements yet and a park whose install has never run look identical in the row count, and
+    // the page must be able to tell the operator which it is.
+    const mirrored = opsCfgRows.length > 0;
+
+    return res.json({
+      ok: true,
+      station: {
+        slug: m.slug || slug,
+        name: m.display_name || null,
+        logo_url: m.logo_url || null,
+        color_primary: m.color_primary || null,
+      },
+      now: m.updated_at ? {
+        playing: !!m.playing, title: m.title || null, artist: m.artist || null,
+        started_at: m.started_at || null, duration_sec: m.duration_sec ?? null,
+        updated_at: m.updated_at,
+      } : null,
+      closing: { default: cfg.default, byWeekday: cfg.byWeekday, byDate: cfg.byDate, effective },
+      date: dateStr,
+      queue,
+      mirrored,
+      previewOnly: true,
+    });
+  } catch (e) {
+    console.error("[public/ops]", e.message);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
+// Mint (or return) the scoped closing-time token for a station. License-keyed: only the install that
+// owns the station can ask. The desktop calls this and shows the operator the resulting link.
+app.post("/api/ops/token", async (req, res) => {
+  try {
+    const key = req.headers["x-license-key"];
+    if (!key) return res.status(401).json({ error: "missing_license_key" });
+    const license = await lookupLicense(key);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+    const stationUuid = String(req.body?.station_uuid || "");
+    if (!stationUuid) return res.status(400).json({ error: "missing_station_uuid" });
+
+    const { rows: own } = await pool.query(
+      `SELECT 1 FROM stations WHERE uuid = $1 AND license_key_id = $2`, [stationUuid, license.id]
+    );
+    if (own.length === 0) return res.status(404).json({ error: "station_not_found" });
+
+    const { rows } = await pool.query(
+      `INSERT INTO station_ops_token (station_uuid, token) VALUES ($1, $2)
+       ON CONFLICT (station_uuid) DO UPDATE SET token = station_ops_token.token
+       RETURNING token`,
+      [stationUuid, crypto.randomBytes(16).toString("hex")]
+    );
+    const { rows: slugRow } = await pool.query(
+      `SELECT slug FROM station_metadata WHERE station_uuid = $1`, [stationUuid]
+    );
+    res.json({ ok: true, token: rows[0].token, slug: slugRow[0]?.slug || null });
+  } catch (e) {
+    console.error("[api/ops/token]", e.message);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
+// THE ONE WRITE. Token-gated, one station, one setting.
+//
+// It does two things, and both are necessary. It updates the mirrored copy so the page reflects the
+// change immediately — the install may be asleep, and an operator who sets a closing time must see
+// it stick. And it emits a db:apply on the command bus so the STATION's own database changes, which
+// is what actually governs what airs. emitCommand queues when no install is connected and drains on
+// reconnect, so a change made while the park's machine is off still lands when it comes back.
+app.put("/public/ops/:slug/closing-time", async (req, res) => {
+  const slug = String(req.params.slug || "").toLowerCase();
+  try {
+    const found = await resolveOpsSlug(slug);
+    if (!found || found.redirect) return res.status(404).json({ error: "not_found" });
+    const stationUuid = found.uuid;
+
+    const supplied = String(req.query.k || req.headers["x-ops-token"] || "");
+    const { rows: tok } = await pool.query(
+      `SELECT token FROM station_ops_token WHERE station_uuid = $1`, [stationUuid]
+    );
+    if (!supplied || !tok.length || supplied !== tok[0].token) {
+      return res.status(403).json({ ok: false, error: "This copy is view-only. Open the full Park Ops link - the one ending in ?k= - to make changes." });
+    }
+
+    const time = String(req.body?.time || "").trim();
+    if (opsCore.hhmmToMin(time) == null) return res.status(400).json({ ok: false, error: "That is not a time." });
+
+    const rows = await ccRows(stationUuid, "ops_config");
+    const cfgRow = rows.find(r => r && r.uuid === "ops") || rows[0] || null;
+    const cfg = opsCore.parseClosing(cfgRow ? cfgRow.closing : null);
+    cfg.default = time.slice(0, 5);                       // only `default` is written; the rest carried through
+
+    const payload = { ...(cfgRow || {}), uuid: "ops", closing: JSON.stringify(cfg) };
+    await pool.query(
+      `INSERT INTO station_cc_data (station_uuid, table_name, row_uuid, payload, deleted_at, updated_at)
+       VALUES ($1,'ops_config','ops',$2,NULL,NOW())
+       ON CONFLICT (station_uuid, table_name, row_uuid) DO UPDATE SET
+         payload = EXCLUDED.payload, deleted_at = NULL, updated_at = NOW()`,
+      [stationUuid, JSON.stringify(payload)]
+    );
+
+    // Reach the station itself. station_config_kv is the table the install stores this in.
+    const { rows: lic } = await pool.query(`SELECT license_key_id FROM stations WHERE uuid = $1`, [stationUuid]);
+    if (lic.length) {
+      emitCommand(String(lic[0].license_key_id), "db:apply", {
+        cmd: "db:apply",
+        table: "station_config_kv",
+        op: "update",
+        station_uuid: stationUuid,
+        payload: { key: "closing_time", value: JSON.stringify(cfg) },
+      });
+    }
+
+    const dateStr = (cfgRow && typeof cfgRow.local_date === "string") ? cfgRow.local_date : new Date().toISOString().slice(0, 10);
+    const dow = (() => { const d = new Date(`${dateStr}T00:00:00Z`); return isNaN(d) ? new Date().getUTCDay() : d.getUTCDay(); })();
+    res.json({ ok: true, closing: { ...cfg, effective: opsCore.resolveClosing(cfg, dateStr, dow) } });
+  } catch (e) {
+    console.error("[public/ops closing-time]", e.message);
+    res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
