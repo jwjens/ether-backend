@@ -5502,9 +5502,45 @@ app.put("/public/ops/:slug/closing-time", async (req, res) => {
 
     const rows = await ccRows(stationUuid, "ops_config");
     const cfgRow = rows.find(r => r && r.uuid === "ops") || rows[0] || null;
-    const cfg = opsCore.parseClosing(cfgRow ? cfgRow.closing : null);
-    cfg.default = time.slice(0, 5);                       // only `default` is written; the rest carried through
 
+    // TONIGHT'S DATE, as the STATION reckons it. The install mirrors its own local_date precisely so
+    // this is not computed from a UTC server clock: a park closing at 22:00 local is already
+    // "tomorrow" in UTC, and writing tomorrow's override would leave tonight unchanged and silently
+    // move a day nobody asked about.
+    const today = (cfgRow && typeof cfgRow.local_date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(cfgRow.local_date))
+      ? cfgRow.local_date
+      : new Date().toISOString().slice(0, 10);
+
+    // ── THE HARD RULE (Jeff, 2026-08-31) ──────────────────────────────────────────────────────
+    // "Changing a SINGLE day's closing time affects ONLY that day. It must NEVER touch the rest of
+    // the calendar, a following Sunday, the weekday pattern, or any other date."
+    //
+    // This endpoint is the phone, on the floor, changing TONIGHT. So it writes byDate[today] and
+    // nothing else. It previously wrote `default`, which silently rewrote every future day that had
+    // no explicit value — Sundays included. That was the defect.
+    //
+    // AND IT SENDS AN INTENT, NOT A DOCUMENT. The old version read the whole config from the
+    // MIRRORED copy, mutated it, and shipped the result to the install as a db:apply. The mirror is
+    // only as fresh as the last push, so a weekday pattern changed in the studio moments earlier
+    // could be carried back in its stale form and silently revert — a one-day change from a phone
+    // undoing a change it never mentioned. The station owns its own row: it is told WHICH DAY and
+    // WHAT TIME, and performs the merge against its own authoritative database.
+    const { rows: lic } = await pool.query(`SELECT license_key_id FROM stations WHERE uuid = $1`, [stationUuid]);
+    if (lic.length) {
+      emitCommand(String(lic[0].license_key_id), "ops:set-closing", {
+        cmd: "ops:set-closing",
+        station_uuid: stationUuid,
+        date: today,
+        time: time.slice(0, 5),
+      });
+    }
+
+    // The mirrored copy is updated optimistically so the operator's phone shows the change on the
+    // next poll instead of waiting for the install's push. DISPLAY ONLY — the install overwrites
+    // this with its own truth on the next pushOpsData, which is the arrangement that lets the write
+    // above be an intent rather than a document.
+    const cfg = opsCore.parseClosing(cfgRow ? cfgRow.closing : null);
+    cfg.byDate = { ...(cfg.byDate || {}), [today]: time.slice(0, 5) };
     const payload = { ...(cfgRow || {}), uuid: "ops", closing: JSON.stringify(cfg) };
     await pool.query(
       `INSERT INTO station_cc_data (station_uuid, table_name, row_uuid, payload, deleted_at, updated_at)
@@ -5514,21 +5550,8 @@ app.put("/public/ops/:slug/closing-time", async (req, res) => {
       [stationUuid, JSON.stringify(payload)]
     );
 
-    // Reach the station itself. station_config_kv is the table the install stores this in.
-    const { rows: lic } = await pool.query(`SELECT license_key_id FROM stations WHERE uuid = $1`, [stationUuid]);
-    if (lic.length) {
-      emitCommand(String(lic[0].license_key_id), "db:apply", {
-        cmd: "db:apply",
-        table: "station_config_kv",
-        op: "update",
-        station_uuid: stationUuid,
-        payload: { key: "closing_time", value: JSON.stringify(cfg) },
-      });
-    }
-
-    const dateStr = (cfgRow && typeof cfgRow.local_date === "string") ? cfgRow.local_date : new Date().toISOString().slice(0, 10);
-    const dow = (() => { const d = new Date(`${dateStr}T00:00:00Z`); return isNaN(d) ? new Date().getUTCDay() : d.getUTCDay(); })();
-    res.json({ ok: true, closing: { ...cfg, effective: opsCore.resolveClosing(cfg, dateStr, dow) } });
+    const dow = (() => { const d = new Date(`${today}T00:00:00Z`); return isNaN(d) ? new Date().getUTCDay() : d.getUTCDay(); })();
+    res.json({ ok: true, scope: "date", date: today, closing: { ...cfg, effective: opsCore.resolveClosing(cfg, today, dow) } });
   } catch (e) {
     console.error("[public/ops closing-time]", e.message);
     res.status(500).json({ ok: false, error: "server_error" });
