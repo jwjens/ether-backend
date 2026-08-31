@@ -5371,9 +5371,14 @@ app.get("/public/ops/:slug", async (req, res) => {
     if (found.redirect) return res.redirect(301, `/public/ops/${found.redirect}`);
     const stationUuid = found.uuid;
 
+    // position_sec / deck / decks travel because the page runs a live countdown, and the dashboard
+    // learned the hard way which field it has to be driven from: interpolate forward from
+    // position_sec + (now - updated_at), NOT from started_at. started_at can be the last-push time
+    // rather than the true start, which makes a progress fill begin late and never reach the end.
     const { rows: meta } = await pool.query(
       `SELECT m.slug, m.display_name, m.logo_url, m.color_primary,
-              n.playing, n.title, n.artist, n.started_at, n.duration_sec, n.updated_at
+              n.playing, n.title, n.artist, n.started_at, n.duration_sec, n.updated_at,
+              n.position_sec, n.deck, n.decks
          FROM station_metadata m
          LEFT JOIN station_now_playing n ON n.station_uuid = m.station_uuid
         WHERE m.station_uuid = $1`,
@@ -5416,11 +5421,19 @@ app.get("/public/ops/:slug", async (req, res) => {
       now: m.updated_at ? {
         playing: !!m.playing, title: m.title || null, artist: m.artist || null,
         started_at: m.started_at || null, duration_sec: m.duration_sec ?? null,
+        position_sec: m.position_sec ?? null, deck: m.deck || null, decks: m.decks || null,
         updated_at: m.updated_at,
       } : null,
       closing: { default: cfg.default, byWeekday: cfg.byWeekday, byDate: cfg.byDate, effective },
       date: dateStr,
       queue,
+      // THE CART WALL. Slot numbers, titles and colours — the install deliberately does not mirror
+      // file paths, so there is nothing here to leak and nothing to name but a slot the station
+      // filled itself. Ordered by slot so the grid reads the way the desktop wall does.
+      carts: (await ccRows(stationUuid, "cart_slots"))
+        .filter(c => c && Number.isFinite(Number(c.slot_number)))
+        .map(c => ({ slot: Number(c.slot_number), title: c.title || `Cart ${c.slot_number}`, color: c.color || null }))
+        .sort((a, b) => a.slot - b.slot),
       mirrored,
       previewOnly: true,
     });
@@ -5518,6 +5531,60 @@ app.put("/public/ops/:slug/closing-time", async (req, res) => {
     res.json({ ok: true, closing: { ...cfg, effective: opsCore.resolveClosing(cfg, dateStr, dow) } });
   } catch (e) {
     console.error("[public/ops closing-time]", e.message);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+// FIRE A CART. The remote twin of clicking a tile on the desktop cart wall.
+//
+// Same bus the dashboard's controls ride: emitCommand -> SSE -> the desktop's execCmd. It could not
+// reuse an existing command, because every command the dashboard sends is identity-free (skip,
+// play_now, automation_on) and none can name WHICH cart — so `cart:fire` carries a slot number.
+// That is the only new thing; the transport and the playout path it lands on are existing.
+//
+// A SLOT NUMBER, NEVER A PATH. The install resolves slot -> file locally, exactly as its own cart
+// wall does. So the machine's filesystem never appears in a public payload, and the only thing a
+// caller can name is a slot that station has actually filled.
+//
+// Gated by the scoped ops token, which is what the ?k= link carries. That token can now put audio
+// out, not just change a setting — a deliberate ruling, on the grounds that this is the remote twin
+// of a button the operator already has. Whether a fired cart reaches air depends on the station's
+// board and channel setup, which is the operator's business here exactly as it is on the desktop:
+// this fires the cart, it does not police the routing.
+app.post("/public/ops/:slug/fire", async (req, res) => {
+  const slug = String(req.params.slug || "").toLowerCase();
+  try {
+    const found = await resolveOpsSlug(slug);
+    if (!found || found.redirect) return res.status(404).json({ ok: false, error: "not_found" });
+    const stationUuid = found.uuid;
+
+    const supplied = String(req.query.k || req.headers["x-ops-token"] || "");
+    const { rows: tok } = await pool.query(
+      `SELECT token FROM station_ops_token WHERE station_uuid = $1`, [stationUuid]
+    );
+    if (!supplied || !tok.length || supplied !== tok[0].token) {
+      return res.status(403).json({ ok: false, error: "This copy is view-only. Open the full Park Ops link - the one ending in ?k= - to fire a cart." });
+    }
+
+    // The slot must be one this station has mirrored as loaded. Without this an invented number
+    // would be forwarded straight to the install.
+    const slot = Number(req.body?.slot);
+    if (!Number.isFinite(slot)) return res.status(400).json({ ok: false, error: "missing_slot" });
+    const carts = await ccRows(stationUuid, "cart_slots");
+    const row = carts.find(c => c && Number(c.slot_number) === slot);
+    if (!row) return res.status(404).json({ ok: false, error: "That cart is not on this station's wall." });
+
+    const { rows: lic } = await pool.query(`SELECT license_key_id FROM stations WHERE uuid = $1`, [stationUuid]);
+    if (!lic.length) return res.status(404).json({ ok: false, error: "station_not_found" });
+
+    emitCommand(String(lic[0].license_key_id), "cart:fire", {
+      cmd: "cart:fire",
+      station_uuid: stationUuid,
+      slot,
+    });
+    res.json({ ok: true, fired: row.title || `Cart ${slot}` });
+  } catch (e) {
+    console.error("[public/ops fire]", e.message);
     res.status(500).json({ ok: false, error: "server_error" });
   }
 });
