@@ -1938,6 +1938,24 @@ const authLimiter = rateLimit({
   message: { error: "too_many_attempts" },
 });
 
+// The PUBLIC jukebox request route had no limiter at all, while /api/user/* has had one since it
+// shipped. A phone can POST a request as fast as it can loop.
+//
+// THE CEILING IS DELIBERATELY HIGH, and the reason matters more than the number: EVERYONE AT A VENUE
+// SHARES ONE NAT ADDRESS. Opportunity Village's guest wifi presents one IP for the whole room, so a
+// limit tight enough to stop one abuser silences everybody. This is protection against a SCRIPT, not
+// a per-person rule — the per-person rule is one-at-a-time, and it is enforced by the desktop against
+// the requester token because that is the only place a person can actually be told apart.
+//
+// Keyed on slug + IP rather than IP alone, so a busy room at one venue cannot exhaust the budget for
+// a different venue behind the same corporate egress.
+const jukeboxPublicLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 120,
+  standardHeaders: true, legacyHeaders: false,
+  keyGenerator: (req) => `${String(req.params?.slug || "").toLowerCase()}|${req.ip}`,
+  message: { error: "too_many_requests" },
+});
+
 // ── Customer accounts (email + password) ──────────────────────────────────
 // The simplified customer identity: free signup → 15-day trial → paid subscription. Distinct from
 // the dashboard's license-key + PIN auth (/api/auth/*); these live at /api/user/*. JWT carries
@@ -6103,13 +6121,24 @@ app.get("/public/jukebox/:slug/state", async (req, res) => {
 // The desktop writes it into its LOCAL jukebox_requests table; nothing here is CRDT-synced, because a
 // request is a live event at one venue on one night, not shared state.
 const JUKEBOX_NAME_MAX = 40;
-app.post("/public/jukebox/:slug/request", async (req, res) => {
+app.post("/public/jukebox/:slug/request", jukeboxPublicLimiter, async (req, res) => {
   try {
     const slug = String(req.params.slug || "").trim().toLowerCase();
     // Length-capped and stripped of markup at the boundary (design §2 "abuse surface"). The name goes
     // on a wall in front of a room; it is never rendered as HTML anywhere, and this keeps it that way.
     const name = String(req.body?.name || "").replace(/[<>]/g, "").trim().slice(0, JUKEBOX_NAME_MAX);
     const songUuid = String(req.body?.song_uuid || "").trim();
+    // WHO ASKED. A random id the request page mints into localStorage on first visit — the only
+    // thing that survives a page refresh and tells one phone from another. It is NOT an identity and
+    // must never be presented as one: clearing site data, a private window or a second handset each
+    // defeat it. It exists so "one song at a time" can mean something, because the alternative —
+    // matching on the typed name — is defeated by typing a different name, which is not a rule.
+    //
+    // Passed straight through to the desktop, which owns the rule: it holds jukebox_requests and the
+    // play history, and this server holds neither. Never stored here, and deliberately never
+    // published into jukebox_pool.state — that blob is served to anyone who asks for the lobby feed,
+    // and a list of tokens on a public endpoint would hand out exactly the thing they identify.
+    const requesterToken = String(req.body?.requester_token || "").trim().slice(0, 64);
     if (!name) return res.status(400).json({ error: "name_required" });
     if (!songUuid) return res.status(400).json({ error: "song_required" });
 
@@ -6126,6 +6155,7 @@ app.post("/public/jukebox/:slug/request", async (req, res) => {
     const r = emitCommand(jb.license_key_id, "jukebox:request", {
       station_uuid: jb.station_uuid,
       name,
+      requester_token: requesterToken || null,
       song_uuid: songUuid,
       title: song.title || null,
       artist: song.artist || null,
@@ -6134,7 +6164,17 @@ app.post("/public/jukebox/:slug/request", async (req, res) => {
 
     // Honest about delivery: a queued request reaches a desktop that is currently offline only when
     // it reconnects, and the page says so rather than implying it is already on the wall.
-    return res.json({ ok: true, delivered: r.delivered, queued: r.queued });
+    //
+    // AND HONEST ABOUT ADMISSION. `ok` here means "accepted and sent", NOT "it is on the list". The
+    // rules that can refuse it — one at a time, already queued, played too recently — are enforced on
+    // the desktop, because only the desktop holds the request table and the play history. The command
+    // bus is one-way, so that verdict cannot come back down this response. The page must therefore
+    // say "watch the screen" rather than "you are in the queue", and `admitted: null` says plainly
+    // that this server does not know.
+    //
+    // This is exactly why the PAID flow, when it arrives, holds its reservation in Postgres instead:
+    // a refusal after payment is a refund, and a refund nobody is told about is a complaint.
+    return res.json({ ok: true, delivered: r.delivered, queued: r.queued, admitted: null });
   } catch (e) {
     console.error("[jukebox/request]", e.message);
     return res.status(500).json({ error: "server_error" });
