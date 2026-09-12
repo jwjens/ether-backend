@@ -4908,7 +4908,37 @@ app.post("/webhook/stripe", async (req, res) => {
     return res.status(400).send(`Webhook Error: ${e.message}`);
   }
 
-  console.log(`[Stripe] ${event.type}`);
+  console.log(`[Stripe] ${event.type}${event.account ? ` (connected acct ${event.account})` : ""}`);
+
+  // ── PLATFORM EVENTS ONLY. Everything below this line issues or revokes LICENCES ──────────────
+  //
+  // Jeff, 2026-09-11: "Narrow webhook branch 2 to platform events only — gate on !event.account.
+  // That has to land before any connected account exists, not after."
+  //
+  // Stripe stamps `event.account` on every event originating from a CONNECTED account and leaves it
+  // undefined for the platform's own. This endpoint had no idea the distinction existed, because
+  // until now there were no connected accounts and every event was necessarily ours.
+  //
+  // The hazard is the second branch below: it catches BARE `checkout.session.completed` with no
+  // further qualification, reads a customer email off it, maps a priceId to a plan and ISSUES A
+  // LICENCE KEY BY EMAIL. Once a station connects its own Stripe account for jukebox donations, its
+  // sessions land here too — carrying a stranger's email, from a charge that has nothing to do with
+  // Ether. Today that would fail on the priceId lookup, but only by luck: the lookup misses because
+  // a checkout session has no `lines` array. The day a connected account uses a price id that IS in
+  // PLAN_BY_PRICE_ID, luck ends and a member of the public is emailed a licence.
+  //
+  // ONE GUARD AT THE TOP rather than `&& !event.account` on each branch, which is what was asked
+  // for. Three copies of a condition is three chances to forget the fourth, and a branch added
+  // later would inherit the hole by default. Here it inherits the guard by default instead.
+  //
+  // Connected-account events are ACKNOWLEDGED, not rejected: a non-2xx makes Stripe retry with
+  // backoff for days over something we deliberately do not want. The jukebox donation flow gets its
+  // own endpoint and its own signing secret (docs/jukebox-paywall-design), and that endpoint is
+  // where these belong.
+  if (event.account) {
+    console.log(`[Stripe] ignoring ${event.type} from connected account ${event.account} — this endpoint handles platform events only`);
+    return res.json({ received: true, ignored: "connected_account" });
+  }
 
   // Account-linked subscription (from the signup app's /api/user/checkout): the session carries the
   // user id (client_reference_id) + chosen plan (metadata). Create/activate the license and link it
