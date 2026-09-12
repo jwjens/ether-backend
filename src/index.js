@@ -240,6 +240,9 @@ const nowPlaying  = { data: null };  // desktop pushes, mobile polls
 // ── Middleware ────────────────────────────────────────────────
 
 app.use("/webhook/stripe", express.raw({ type: "application/json" }));
+// The jukebox endpoint needs its own raw mount, and its own signing secret. See the endpoint itself
+// for why it cannot share the platform one.
+app.use("/webhook/stripe/jukebox", express.raw({ type: "application/json" }));
 app.use(express.json({ limit: "10mb" }));
 app.use(cors({ origin: "*" }));
 
@@ -751,6 +754,52 @@ async function initDB() {
   // A station owns one slug at a time; re-publishing under a new slug must not leave the old one
   // answering with a stale pool.
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_jukebox_pool_station ON jukebox_pool(station_uuid)`);
+
+  // ── WHERE A STATION'S MONEY GOES (jukebox paywall, phase 2) ─────────────────────────────────
+  //
+  // Jeff, 2026-09-11: "each station connects their own Stripe account and money goes to them, not
+  // me. A nonprofit's donations must go to the nonprofit."
+  //
+  // NOT ON jukebox_pool, deliberately. That table is a publish target the install OVERWRITES, and
+  // /api/account/jukebox/pool already DELETEs sibling rows on republish. Money configuration must
+  // never live somewhere a routine publish can erase.
+  //
+  // PER STATION, not per licence: one licence can hold four stations and they may be different legal
+  // entities. license_key_id rides along for scoping and audit, never as the identity.
+  //
+  // The three booleans are STORED, refreshed from Stripe by account.updated and by an explicit
+  // refresh — never inferred from "we created an account once". A cached "connected" flag that stops
+  // tracking Stripe's own view is how a station takes money it cannot actually receive.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS station_payouts (
+      station_uuid      TEXT PRIMARY KEY REFERENCES stations(uuid) ON DELETE CASCADE,
+      license_key_id    INTEGER NOT NULL,
+      stripe_account_id TEXT UNIQUE,
+      charges_enabled   BOOLEAN NOT NULL DEFAULT false,
+      payouts_enabled   BOOLEAN NOT NULL DEFAULT false,
+      details_submitted BOOLEAN NOT NULL DEFAULT false,
+      requirements_due  JSONB,
+      account_name      TEXT,
+      country           TEXT,
+      currency          TEXT,
+      -- THREE REAL MODES, ALL SHIPPING (Jeff, 2026-09-11):
+      --   off        no donation ask at all
+      --   suggested  the song plays either way; we ask, the guest can skip, nobody is turned away
+      --   required   payment gates the request
+      -- 'required' is a mode an operator CHOOSES, not a fallback. The free-when-Stripe-is-not-ready
+      -- behaviour applies to 'required' only; under 'suggested' an unready account simply means the
+      -- ask is not shown. The column carries all three from the first migration so adding the UI for
+      -- one later is not a migration against a table holding live donation history.
+      donations_mode    TEXT NOT NULL DEFAULT 'off'
+                        CHECK (donations_mode IN ('off','suggested','required')),
+      -- Open amount with a floor (Jeff: "a donate button, not fixed tiers"). Stripe's per-charge fee
+      -- makes a $1 gift roughly 60c to the nonprofit, which is why there is a floor at all.
+      min_amount_cents  INTEGER NOT NULL DEFAULT 100,
+      connected_at      TIMESTAMPTZ,
+      updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_station_payouts_license ON station_payouts(license_key_id)`);
 
   // Append-only play history for cross-install analytics (Phase 3a). The install pushes
   // new play_log rows incrementally; rows are never updated (ON CONFLICT DO NOTHING).
@@ -6050,12 +6099,42 @@ app.get("/public/jukebox/:slug/pool", async (req, res) => {
   try {
     const slug = String(req.params.slug || "").trim().toLowerCase();
     const { rows } = await pool.query(
-      `SELECT slug, station_name, songs, updated_at FROM jukebox_pool WHERE slug = $1`, [slug]);
+      `SELECT jp.slug, jp.station_name, jp.songs, jp.updated_at, jp.station_uuid,
+              sp.donations_mode, sp.min_amount_cents, sp.stripe_account_id, sp.charges_enabled,
+              sp.account_name
+         FROM jukebox_pool jp
+         LEFT JOIN station_payouts sp ON sp.station_uuid = jp.station_uuid
+        WHERE jp.slug = $1`, [slug]);
     if (rows.length === 0) return res.status(404).json({ error: "unknown_jukebox" });
     const r = rows[0];
+    // WHAT THE PHONE IS TOLD ABOUT MONEY. Phase 2 ships this block and NOTHING acts on it yet —
+    // there is no donate button and no charge anywhere. It is here so the page can be built against
+    // a real shape in phase 3a rather than a guessed one.
+    //
+    // `ready` is Stripe's own answer (charges_enabled on a connected account), never "we created an
+    // account once". A station that believes it is collecting and is not is the failure this whole
+    // arc exists to avoid.
+    //
+    // The three modes are NOT interchangeable and the page must not treat them as one flag:
+    //   off        no ask at all
+    //   suggested  the song plays either way; the ask comes AFTER the request is admitted, and it
+    //              is a GIFT — it buys nothing, so nothing can fail to be delivered
+    //   required   payment gates the request; if not ready, requests fall back to FREE (Jeff)
+    // effective_mode is what the page should actually honour, with the not-ready fallback already
+    // applied here so a phone never has to work out the policy for itself.
+    const mode = r.donations_mode || "off";
+    const ready = !!(r.stripe_account_id && r.charges_enabled);
+    const effective = mode === "off" ? "off" : ready ? mode : (mode === "required" ? "free_fallback" : "off");
     return res.json({
       slug: r.slug, station_name: r.station_name, updated_at: r.updated_at,
       songs: Array.isArray(r.songs) ? r.songs : [],
+      donations: {
+        mode,
+        ready,
+        effective_mode: effective,
+        min_amount_cents: r.min_amount_cents ?? 100,
+        payee_name: ready ? (r.account_name || r.station_name || null) : null,
+      },
     });
   } catch (e) {
     console.error("[jukebox/pool:get]", e.message);
@@ -6116,6 +6195,231 @@ app.get("/public/jukebox/:slug/state", async (req, res) => {
   }
 });
 
+
+// ── JUKEBOX DONATIONS — phase 2: CONNECT ONBOARDING ONLY, NOTHING IS CHARGED HERE ───────────────
+//
+// Jeff, 2026-09-11: "each station connects their own Stripe account and money goes to them, not me."
+//
+// STANDARD accounts, not Express. A Standard account BELONGS to the station: their own Stripe login,
+// their own dashboard, their own disputes, their own tax reporting. Express onboards faster and
+// leaves the platform carrying obligations that should sit with the nonprofit. For a 501(c)(3)
+// taking public donations, Standard is the honest fit and the lower liability for Jeff.
+//
+// DIRECT CHARGES when charging arrives (phase 3): the charge is created ON the connected account, so
+// the station is merchant of record, the receipt carries the station's name, and the money never
+// touches the platform balance. A destination charge would make Ether Technologies the recipient of
+// a gift intended for Opportunity Village — wrong legally, wrong for the donor, wrong for OV's books,
+// however the cash eventually settles. No application_fee_amount anywhere: Jeff takes no cut.
+//
+// NOTHING IN PHASE 2 CREATES A CHARGE. No Checkout session, no PaymentIntent, no donate button. This
+// is onboarding and the truth about its state, and nothing else.
+
+function stripeOrNull() {
+  const k = process.env.STRIPE_SECRET_KEY;
+  return k ? require("stripe")(k) : null;
+}
+
+// Read-through of Stripe's OWN view of the account, stored rather than inferred. Called on connect,
+// on explicit refresh, and from the account.updated webhook.
+async function syncPayoutAccount(stationUuid, acctId) {
+  const stripe = stripeOrNull();
+  if (!stripe || !acctId) return null;
+  const a = await stripe.accounts.retrieve(acctId);
+  const due = (a.requirements && (a.requirements.currently_due || [])) || [];
+  await pool.query(
+    `UPDATE station_payouts SET charges_enabled=$2, payouts_enabled=$3, details_submitted=$4,
+            requirements_due=$5::jsonb, account_name=$6, country=$7, currency=$8, updated_at=NOW()
+      WHERE station_uuid=$1`,
+    [stationUuid, !!a.charges_enabled, !!a.payouts_enabled, !!a.details_submitted,
+     JSON.stringify(due), a.business_profile?.name || a.settings?.dashboard?.display_name || null,
+     a.country || null, a.default_currency || null]);
+  return a;
+}
+
+// The desktop reads this when the Jukebox settings open. Never returns a secret, and never claims a
+// readiness it has not read back from Stripe.
+app.get("/api/account/jukebox/payouts/:uuid", async (req, res) => {
+  const owned = await getOwnedStation(req, res);
+  if (!owned) return;
+  try {
+    const { rows } = await pool.query(
+      `SELECT * FROM station_payouts WHERE station_uuid = $1`, [req.params.uuid]);
+    const r = rows[0] || null;
+    return res.json({
+      ok: true,
+      connected:         !!r?.stripe_account_id,
+      stripe_account_id: r?.stripe_account_id || null,
+      charges_enabled:   !!r?.charges_enabled,
+      payouts_enabled:   !!r?.payouts_enabled,
+      details_submitted: !!r?.details_submitted,
+      requirements_due:  r?.requirements_due || [],
+      account_name:      r?.account_name || null,
+      country:           r?.country || null,
+      currency:          r?.currency || null,
+      donations_mode:    r?.donations_mode || "off",
+      min_amount_cents:  r?.min_amount_cents ?? 100,
+      // READY means Stripe says this account can actually take a charge. Anything else is a station
+      // that would collect nothing while believing it was collecting.
+      ready:             !!(r?.stripe_account_id && r?.charges_enabled),
+      stripe_configured: !!process.env.STRIPE_SECRET_KEY,
+    });
+  } catch (e) {
+    console.error("[jukebox/payouts:get]", e.message);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// Begin or resume onboarding. Creates a Standard account the first time, then mints a fresh
+// Account Link every call — Stripe expires them quickly and single-use, so "resume" is simply
+// another link against the same account, never a second account.
+app.post("/api/account/jukebox/payouts/:uuid/connect", async (req, res) => {
+  const owned = await getOwnedStation(req, res);
+  if (!owned) return;
+  const stripe = stripeOrNull();
+  if (!stripe) return res.status(503).json({ error: "stripe_unconfigured" });
+  try {
+    const uuid = req.params.uuid;
+    const { rows } = await pool.query(
+      `SELECT sp.stripe_account_id, s.license_key_id FROM stations s
+         LEFT JOIN station_payouts sp ON sp.station_uuid = s.uuid
+        WHERE s.uuid = $1`, [uuid]);
+    if (rows.length === 0) return res.status(404).json({ error: "station_not_found" });
+    let acctId = rows[0].stripe_account_id;
+
+    if (!acctId) {
+      const acct = await stripe.accounts.create({
+        type: "standard",
+        metadata: { ether_station_uuid: uuid, ether_license_key_id: String(rows[0].license_key_id) },
+      });
+      acctId = acct.id;
+      await pool.query(
+        `INSERT INTO station_payouts (station_uuid, license_key_id, stripe_account_id, connected_at)
+         VALUES ($1,$2,$3,NOW())
+         ON CONFLICT (station_uuid) DO UPDATE SET stripe_account_id = EXCLUDED.stripe_account_id,
+           license_key_id = EXCLUDED.license_key_id, connected_at = NOW(), updated_at = NOW()`,
+        [uuid, rows[0].license_key_id, acctId]);
+      console.log(`[jukebox/payouts] created Standard account ${acctId} for station ${uuid}`);
+    }
+
+    const base = (process.env.ACCOUNT_APP_URL || "https://ether-technologies.com").replace(/\/$/, "");
+    const link = await stripe.accountLinks.create({
+      account: acctId,
+      type: "account_onboarding",
+      refresh_url: `${base}/jukebox-payouts?refresh=1`,
+      return_url:  `${base}/jukebox-payouts?done=1`,
+    });
+    // Best-effort first read; the operator may not have finished anything yet, and that is fine.
+    try { await syncPayoutAccount(uuid, acctId); } catch { /* the refresh endpoint will catch up */ }
+    return res.json({ ok: true, url: link.url, stripe_account_id: acctId });
+  } catch (e) {
+    console.error("[jukebox/payouts:connect]", e.message);
+    return res.status(500).json({ error: "server_error", detail: e.message });
+  }
+});
+
+// Ask Stripe again, now. The webhook keeps this current on its own; this is the button for an
+// operator who has just finished onboarding in a browser tab and wants the screen to agree.
+app.post("/api/account/jukebox/payouts/:uuid/refresh", async (req, res) => {
+  const owned = await getOwnedStation(req, res);
+  if (!owned) return;
+  try {
+    const { rows } = await pool.query(
+      `SELECT stripe_account_id FROM station_payouts WHERE station_uuid = $1`, [req.params.uuid]);
+    const acctId = rows[0]?.stripe_account_id;
+    if (!acctId) return res.status(404).json({ error: "not_connected" });
+    await syncPayoutAccount(req.params.uuid, acctId);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("[jukebox/payouts:refresh]", e.message);
+    return res.status(500).json({ error: "server_error", detail: e.message });
+  }
+});
+
+// The operator's two choices: which mode, and the floor.
+app.post("/api/account/jukebox/payouts/:uuid/settings", async (req, res) => {
+  const owned = await getOwnedStation(req, res);
+  if (!owned) return;
+  try {
+    const mode = String(req.body?.donations_mode || "off");
+    if (!["off", "suggested", "required"].includes(mode)) return res.status(400).json({ error: "bad_mode" });
+    const min = Math.max(100, Math.min(100000, parseInt(req.body?.min_amount_cents, 10) || 100));
+    const { rows: st } = await pool.query(`SELECT license_key_id FROM stations WHERE uuid = $1`, [req.params.uuid]);
+    if (st.length === 0) return res.status(404).json({ error: "station_not_found" });
+    await pool.query(
+      `INSERT INTO station_payouts (station_uuid, license_key_id, donations_mode, min_amount_cents)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (station_uuid) DO UPDATE SET donations_mode = EXCLUDED.donations_mode,
+         min_amount_cents = EXCLUDED.min_amount_cents, updated_at = NOW()`,
+      [req.params.uuid, st[0].license_key_id, mode, min]);
+    return res.json({ ok: true, donations_mode: mode, min_amount_cents: min });
+  } catch (e) {
+    console.error("[jukebox/payouts:settings]", e.message);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// ── THE JUKEBOX WEBHOOK — connected-account events only ─────────────────────────────────────────
+//
+// Its own endpoint and its own signing secret, and it must stay that way. The platform endpoint's
+// second branch catches BARE checkout.session.completed, reads a customer email and ISSUES A LICENCE
+// KEY. Every jukebox donation will be a checkout.session.completed. Today it would fail at the
+// priceId lookup — by luck, because a session has no lines array — and log "UNKNOWN priceId ...
+// Operator must issue manually", which is the one alarm meaning a real customer did not get a key.
+// Routing donations through it trains Jeff to ignore that alarm.
+//
+// THE INVERSE GUARD. The platform endpoint returns early when event.account is SET. This one
+// requires it: with direct charges every jukebox event originates on the station's connected
+// account. An event without one is a misconfiguration, not a donation.
+//
+// PHASE 2 HANDLES ONE EVENT. account.updated keeps the stored onboarding state honest without the
+// operator pressing anything. checkout.session.completed, checkout.session.expired and
+// charge.refunded arrive with phase 3, and are deliberately absent rather than stubbed: an event
+// handled by an empty branch looks handled.
+app.post("/webhook/stripe/jukebox", async (req, res) => {
+  const stripe = stripeOrNull();
+  const secret = process.env.STRIPE_JUKEBOX_WEBHOOK_SECRET;
+  if (!stripe || !secret) return res.status(503).send("jukebox webhook unconfigured");
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.headers["stripe-signature"], secret);
+  } catch (e) {
+    console.error("[Stripe:jukebox] Signature failed:", e.message);
+    return res.status(400).send("Webhook Error: " + e.message);
+  }
+
+  if (!event.account) {
+    console.warn(`[Stripe:jukebox] ${event.type} arrived with NO connected account — platform events do not belong here`);
+    return res.json({ received: true, ignored: "platform_event" });
+  }
+
+  console.log(`[Stripe:jukebox] ${event.type} from ${event.account}`);
+
+  if (event.type === "account.updated") {
+    try {
+      const { rows } = await pool.query(
+        `SELECT station_uuid FROM station_payouts WHERE stripe_account_id = $1`, [event.account]);
+      if (rows.length === 0) {
+        // An account we have no station for. Acknowledge and say so — a 4xx would make Stripe retry
+        // for days over something that is not going to change.
+        console.warn("[Stripe:jukebox] account.updated for an account no station claims:", event.account);
+      } else {
+        const a = event.data.object || {};
+        const due = (a.requirements && (a.requirements.currently_due || [])) || [];
+        await pool.query(
+          `UPDATE station_payouts SET charges_enabled=$2, payouts_enabled=$3, details_submitted=$4,
+                  requirements_due=$5::jsonb, account_name=$6, country=$7, currency=$8, updated_at=NOW()
+            WHERE stripe_account_id=$1`,
+          [event.account, !!a.charges_enabled, !!a.payouts_enabled, !!a.details_submitted,
+           JSON.stringify(due), a.business_profile?.name || null, a.country || null, a.default_currency || null]);
+        console.log(`[Stripe:jukebox] ${rows[0].station_uuid}: charges=${!!a.charges_enabled} payouts=${!!a.payouts_enabled}`);
+      }
+    } catch (e) {
+      console.error("[Stripe:jukebox] account.updated failed:", e.message);
+    }
+  }
+
+  return res.json({ received: true });
+});
 // REQUEST (phone, PUBLIC, no auth). Validated against the published pool, then delivered to the
 // desktop over the EXISTING command bus — the same rail the dashboard's db:apply already rides.
 // The desktop writes it into its LOCAL jukebox_requests table; nothing here is CRDT-synced, because a
