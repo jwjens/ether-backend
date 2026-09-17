@@ -51,6 +51,7 @@ const rateLimit  = require('express-rate-limit');
 const { validateSlug } = require("./slug");
 const opsCore = require("./ops-core");   // Park Ops: closing-time resolution + sanity rails
 const { deriveStationState, parseSourceFields, resolveSourceMachineId } = require("./station-state"); // honest state (Slice 1) + source/last_error (Slice 2)
+const { isStationScopedCommand, stampTarget } = require("./lib/station-commands");   // web remote slice 1: a station control targets the sourcing machine
 
 // JWT signing secret for the Control Center dashboard. MUST be set in production
 // (Railway env). Falls back to a per-boot random secret in dev so tokens simply
@@ -6505,7 +6506,53 @@ app.post("/api/cmd", async (req, res) => {
   const { cmd } = req.body;
   if (!cmd) return res.status(400).json({ error: "Missing cmd" });
 
-  emitCommand(licenseId, cmd, req.body);
+  // WEB REMOTE SLICE 1 (2026-09-16, docs/web-remote-design-2026-09-16.md §1): a station control is
+  // aimed at ONE machine — the one sourcing the station's stream — and the backend decides which.
+  // Before this, {cmd, station_uuid} fanned out to every install on the license and every install
+  // holding the station row executed it (OVEVENTS taken off air from a button named for OV). The
+  // decision itself is pure (src/lib/station-commands.js); this block only does the three lookups.
+  let body = req.body;
+  if (isStationScopedCommand(cmd)) {
+    try {
+      const stationUuid = typeof body.station_uuid === "string" ? body.station_uuid.trim() : "";
+      let stationOwned = false, nowPlaying = null, activationKey = null;
+      if (stationUuid) {
+        const own = await pool.query(`SELECT 1 FROM stations WHERE uuid = $1 AND license_key_id = $2`, [stationUuid, licenseId]);
+        stationOwned = own.rows.length > 0;
+        if (stationOwned) {
+          // The STICKY column (the last machine that sourced it), not the 90s-gated view: with the
+          // stream down, Restart/AUTO/Stop still go to the machine that was sourcing it.
+          nowPlaying = (await pool.query(
+            `SELECT source_machine_id, source_machine_id_at FROM station_now_playing WHERE station_uuid = $1`, [stationUuid])).rows[0] || null;
+          const lic = (await pool.query(`SELECT license_key FROM licenses WHERE id = $1`, [licenseId])).rows[0];
+          activationKey = lic ? (lic.license_key || `lic-${licenseId}`) : `lic-${licenseId}`;   // same key /api/account/devices uses
+        }
+      }
+      // Devices are looked up per call (one or two per command) — the same rows /api/account/devices lists.
+      const devices = new Map();
+      if (activationKey) {
+        const { rows } = await pool.query(
+          `SELECT machine_id, machine_name FROM license_activations WHERE license_key = $1 AND deauthorized_at IS NULL`, [activationKey]);
+        for (const r of rows) devices.set(r.machine_id, r);
+      }
+      const verdict = stampTarget({
+        cmd, body, stationOwned, nowPlaying,
+        deviceLookup: (id) => devices.get(id) || null,
+        resolveSourceMachineId,
+      });
+      if (!verdict.ok) {
+        console.log(`[cmd] ${cmd} station=${stationUuid || "-"} REFUSED ${verdict.status} ${verdict.error} license=${licenseId}`);
+        return res.status(verdict.status).json({ error: verdict.error, ...(verdict.detail || {}) });
+      }
+      body = verdict.body;
+      console.log(`[cmd] ${cmd} station=${stationUuid} target=${verdict.target.machine_id} (${verdict.target.machine_name || "unnamed"}) via=${verdict.via} license=${licenseId}`);
+    } catch (e) {
+      console.error("[cmd] target stamping failed:", e.message);
+      return res.status(500).json({ error: "server_error" });
+    }
+  }
+
+  emitCommand(licenseId, cmd, body);
   res.json({ ok: true });
 });
 
