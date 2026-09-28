@@ -50,7 +50,7 @@ const jwt        = require('jsonwebtoken');
 const rateLimit  = require('express-rate-limit');
 const { validateSlug } = require("./slug");
 const opsCore = require("./ops-core");   // Park Ops: closing-time resolution + sanity rails
-const { deriveStationState, parseSourceFields, resolveSourceMachineId } = require("./station-state"); // honest state (Slice 1) + source/last_error (Slice 2)
+const { deriveStationState, parseSourceFields, resolveSourceMachineId, sourceFields } = require("./station-state"); // honest state (Slice 1) + source/last_error (Slice 2)
 const cmdBus = require("./lib/cmd-bus");   // web remote slice 2: per-machine delivery (targeted commands)
 const { parkOpsRefusal } = cmdBus;
 const { isStationScopedCommand, stampTarget } = require("./lib/station-commands");   // web remote slice 1: a station control targets the sourcing machine
@@ -2560,8 +2560,8 @@ app.get("/api/account/stations", requireAuth, async (req, res) => {
         // Slice 2: which machine is sourcing the mount (+ friendly name) and the last stream error.
         // resolveSourceMachineId releases a stale claim (source stopped affirming) so the panel never
         // sticks on a machine that's gone; the friendly name follows the resolved id.
-        source_machine_id: resolveSourceMachineId(r.source_machine_id, r.source_machine_id_at),
-        source_machine_name: resolveSourceMachineId(r.source_machine_id, r.source_machine_id_at) ? (r.source_machine_name || null) : null,
+        // Web remote slice 2: the fresh view AND the last sourcer (last_source_machine_id / _name / last_source_at).
+        ...sourceFields(r),
         last_error: r.last_error || null,
         last_error_at: r.last_error_at || null,
       } : null,
@@ -2999,8 +2999,8 @@ app.get("/api/accounts/:accountId/stations", requireMember(), async (req, res) =
         // Slice 2: which machine is sourcing the mount (+ friendly name) and the last stream error.
         // resolveSourceMachineId releases a stale claim (source stopped affirming) so the panel never
         // sticks on a machine that's gone; the friendly name follows the resolved id.
-        source_machine_id: resolveSourceMachineId(r.source_machine_id, r.source_machine_id_at),
-        source_machine_name: resolveSourceMachineId(r.source_machine_id, r.source_machine_id_at) ? (r.source_machine_name || null) : null,
+        // Web remote slice 2: the fresh view AND the last sourcer (last_source_machine_id / _name / last_source_at).
+        ...sourceFields(r),
         last_error: r.last_error || null,
         last_error_at: r.last_error_at || null,
       } : null,

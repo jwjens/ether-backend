@@ -54,4 +54,24 @@ function resolveSourceMachineId(sourceMachineId, sourceMachineIdAt) {
   return sourceMachineId;
 }
 
-module.exports = { deriveStationState, HEARTBEAT_STALE_MS, parseSourceFields, resolveSourceMachineId };
+/**
+ * The source fields a station list exposes (web remote slice 2). source_machine_* is the FRESH view (null once the
+ * source stops affirming — resolveSourceMachineId); last_source_* is the raw sticky column, always: the machine that
+ * sourced the stream last and when it last affirmed it — what the page names as "last sourced from … · offline
+ * since …", and the machine a station control is aimed at (/api/cmd stamps from the same raw column).
+ * `r.source_machine_name` is the activation name for the RAW id (the list's SQL subquery).
+ */
+function sourceFields(r) {
+  const row = r || {};
+  const raw = typeof row.source_machine_id === "string" && row.source_machine_id.trim() ? row.source_machine_id.trim() : null;
+  const fresh = raw ? resolveSourceMachineId(raw, row.source_machine_id_at) : null;
+  return {
+    source_machine_id: fresh,
+    source_machine_name: fresh ? (row.source_machine_name || null) : null,
+    last_source_machine_id: raw,
+    last_source_machine_name: raw ? (row.source_machine_name || null) : null,
+    last_source_at: raw ? (row.source_machine_id_at || null) : null,
+  };
+}
+
+module.exports = { deriveStationState, HEARTBEAT_STALE_MS, parseSourceFields, resolveSourceMachineId, sourceFields };
