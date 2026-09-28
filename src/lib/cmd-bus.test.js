@@ -81,3 +81,49 @@ test("the routes are wired: cmd-stream registers ?machine_id, /api/cmd refuses t
   assert.match(src, /target_connected === false/);
   assert.match(src, /targetOffline\(/);
 });
+
+// ── SLICE 5 (backend): cmd_id on every station command; the target's ack is kept per license and read back. ──
+test("every emitted STATION command carries a cmd_id; license-wide commands do not", () => {
+  const clients = new Map(), pending = new Map();
+  const ov = fakeRes();
+  bus.registerClient(clients, "7", ov, "ov-machine");
+  let n = 0; const newId = () => `cmd-${++n}`;
+  const r = bus.emitCommand({ sseClients: clients, pendingCmds: pending, licenseId: "7", cmd: "skip", stationScoped: true, newId,
+                              data: { station_uuid: "st-1", target_machine_id: "ov-machine" } });
+  assert.equal(r.cmd_id, "cmd-1");
+  assert.equal(sent(ov)[0].data.cmd_id, "cmd-1");         // the desktop reads data.cmd_id for its ack
+  const d = bus.emitCommand({ sseClients: clients, pendingCmds: pending, licenseId: "7", cmd: "db:apply", stationScoped: false, newId, data: {} });
+  assert.equal(d.cmd_id, null);
+  assert.equal("cmd_id" in sent(ov)[1].data, false);
+  const input = { station_uuid: "st-1", target_machine_id: "ov-machine" };
+  bus.emitCommand({ sseClients: clients, pendingCmds: pending, licenseId: "7", cmd: "skip", stationScoped: true, newId, data: input });
+  assert.equal("cmd_id" in input, false);                   // the caller's object is never mutated
+});
+
+test("acks: stored per license in a bounded ring, read back by cmd_id, newest wins", () => {
+  const acks = new Map();
+  const at = "2026-09-27T12:00:00.000Z";
+  assert.deepEqual(bus.recordAck(acks, "7", { cmd_id: "c1", station_uuid: "st-1", machine_id: "ov", ok: false, error: "403 Forbidden" }, at),
+    { ok: true, ack: { cmd_id: "c1", ok: false, error: "403 Forbidden", machine_id: "ov", station_uuid: "st-1", at } });
+  assert.equal(bus.findAck(acks, "7", "c1").error, "403 Forbidden");
+  assert.equal(bus.findAck(acks, "8", "c1"), null);                     // another license never sees it
+  bus.recordAck(acks, "7", { cmd_id: "c1", machine_id: "ov", ok: true }, at);
+  assert.equal(bus.findAck(acks, "7", "c1").ok, true);
+  for (let i = 0; i < bus.ACK_RING + 10; i++) bus.recordAck(acks, "7", { cmd_id: `x${i}`, ok: true }, at);
+  assert.equal(acks.get("7").length, bus.ACK_RING);
+  assert.equal(bus.findAck(acks, "7", "x0"), null);                      // oldest fell off
+});
+
+test("an ack without a cmd_id, or with a non-boolean ok, is refused", () => {
+  const acks = new Map();
+  assert.deepEqual(bus.recordAck(acks, "7", { ok: true }, "t"), { ok: false, status: 400, error: "cmd_id_required" });
+  assert.deepEqual(bus.recordAck(acks, "7", { cmd_id: "c", ok: "yes" }, "t"), { ok: false, status: 400, error: "ok_must_be_boolean" });
+  assert.equal(acks.size, 0);
+});
+
+test("the routes are wired: /api/cmd returns the delivery facts; POST /api/cmd/ack (license) and GET /api/cmd/ack/:cmd_id (JWT)", () => {
+  const src = require("fs").readFileSync(require("path").join(__dirname, "..", "index.js"), "utf8");
+  assert.match(src, /res\.json\(\{ ok: true, cmd_id: sent\.cmd_id, delivered: sent\.delivered, target_machine_id: target \? target\.machine_id : null, target_machine_name: target \? \(target\.machine_name \|\| null\) : null, target_connected: sent\.target_connected \}\)/);
+  assert.match(src, /app\.post\("\/api\/cmd\/ack",/);
+  assert.match(src, /app\.get\("\/api\/cmd\/ack\/:cmd_id", requireAuth,/);
+});

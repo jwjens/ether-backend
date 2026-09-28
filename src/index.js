@@ -236,6 +236,7 @@ const { grantedOwnerLicenseIds, resolveAudioPrefixId } = require("./lib/libraryG
 // ── In-memory state ───────────────────────────────────────────
 const pendingCmds = new Map();   // licenseId(string) → array of queued cmds (per-license; drained on cmd-stream connect)
 const sseClients  = new Map();   // licenseId(string) → Set<res> for cmd-stream subscribers
+const cmdAcks     = new Map();   // licenseId(string) → ring of the target machines' answers (web remote slice 5, lib/cmd-bus.js)
 const streamClients = new Map(); // slug → Set<res> for public listener-page SSE (Phase 3)
 const nowPlaying  = { data: null };  // desktop pushes, mobile polls
 
@@ -6036,7 +6037,8 @@ app.post("/api/station/:uuid/now-playing-art-upload-url", async (req, res) => {
 function emitCommand(licenseId, cmd, data) {
   // WEB REMOTE SLICE 2: a command carrying target_machine_id goes ONLY to that machine's SSE client(s), and is never
   // queued — the result's target_connected says whether it arrived. Untargeted commands: fan-out / queue as before.
-  return cmdBus.emitCommand({ sseClients, pendingCmds, licenseId, cmd, data });
+  // SLICE 5: every STATION command gets a cmd_id, so the target's ack (POST /api/cmd/ack) can be matched to it.
+  return cmdBus.emitCommand({ sseClients, pendingCmds, licenseId, cmd, data, stationScoped: isStationScopedCommand(cmd) });
 }
 
 // ── JUKEBOX PHASE 2 — the public request page's three endpoints ───────────────────────────────────
@@ -6547,7 +6549,28 @@ app.post("/api/cmd", async (req, res) => {
     const off = cmdBus.targetOffline({ machineId: target.machine_id, machineName: target.machine_name, offlineSince: lastSourceAt });
     return res.status(off.status).json(off.body);
   }
+  // SLICE 5: the delivery facts, never a bare "sent". The page then polls GET /api/cmd/ack/:cmd_id for the answer.
+  res.json({ ok: true, cmd_id: sent.cmd_id, delivered: sent.delivered, target_machine_id: target ? target.machine_id : null, target_machine_name: target ? (target.machine_name || null) : null, target_connected: sent.target_connected });
+});
+
+// SLICE 5 — the target machine's answer. The desktop POSTs this after a station command it accepted has run, with
+// the REAL result (a daemon refusal, go-live's 403, a skipped branch → ok:false + the reason). x-license-key, like
+// every desktop call. Kept in memory per license (cmdBus ring) — an ack only matters for the seconds the page waits.
+app.post("/api/cmd/ack", async (req, res) => {
+  const rawKey = req.headers["x-license-key"];
+  const license = rawKey ? await lookupLicense(rawKey).catch(() => null) : null;
+  if (!license) return res.status(401).json({ error: "invalid_license_key" });
+  const r = cmdBus.recordAck(cmdAcks, String(license.id), req.body);
+  if (!r.ok) return res.status(r.status).json({ error: r.error });
+  console.log(`[cmd/ack] ${r.ack.cmd_id} ${r.ack.ok ? "ok" : `FAILED — ${r.ack.error}`} machine=${r.ack.machine_id || "-"} license=${license.id}`);
   res.json({ ok: true });
+});
+
+// The page reads the answer back (dashboard JWT). 404 = no answer YET — the page decides when to stop waiting.
+app.get("/api/cmd/ack/:cmd_id", requireAuth, (req, res) => {
+  const ack = cmdBus.findAck(cmdAcks, String(req.auth.lk), req.params.cmd_id);
+  if (!ack) return res.status(404).json({ error: "no_ack_yet" });
+  res.json({ ok: true, ack });
 });
 
 // SSE: Ether desktop subscribes here for instant command delivery.
