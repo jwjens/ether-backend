@@ -4,8 +4,8 @@
 //
 // THE LIST IS A MIRROR of the desktop's STATION_SCOPED set in
 //   C:\openair\src\audio\cmd-routing.ts:24-40
-// (the desktop's cmd-routing.ts is the source of truth; a shared-list test is a later slice — until
-// then, edit both). Everything NOT in this set is license-wide and is passed through untouched:
+// (the desktop's cmd-routing.ts is the source of truth; station-commands.test.js compares the two lists
+// whenever the desktop repo is on the same disk — edit both). Everything NOT in this set is license-wide and is passed through untouched:
 // db:apply (synced tables — every install must apply it), library:*, health:watch, jukebox:request.
 //
 // THE RULING (docs/web-remote-design-2026-09-16.md §0-§1): the web remote controls ONLY the machine
@@ -24,6 +24,7 @@ const STATION_SCOPED = new Set([
   "deck:load", "deck:cue", "deck:crossfade", "deck:off",
   "queue:enqueue", "queue:reorder", "queue:remove", "queue:move", "queue:clear",
   "stream:start", "stream:stop",
+  "stream:restart",   // the web's Restart = a stream restart on the target (web remote slice 4)
   "cart:fire",
   "ops:set-closing",
 ]);

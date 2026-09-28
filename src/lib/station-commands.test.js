@@ -22,10 +22,23 @@ test("the list mirrors the desktop's STATION_SCOPED (cmd-routing.ts:24-40)", () 
     "set_volume", "play_emergency_cart", "mic_on",
     "deck:load", "deck:cue", "deck:crossfade", "deck:off",
     "queue:enqueue", "queue:reorder", "queue:remove", "queue:move", "queue:clear",
-    "stream:start", "stream:stop", "cart:fire", "ops:set-closing",
+    "stream:start", "stream:stop", "stream:restart", "cart:fire", "ops:set-closing",
   ];
   assert.deepEqual([...STATION_SCOPED].sort(), expected.sort());
   for (const c of expected) assert.equal(isStationScopedCommand(c), true, c);
+});
+
+// THE SHARED-LIST TEST (design §3): when the desktop repo is on this disk, the two lists must be EQUAL — read from
+// the desktop's own source, not a copy. Skipped where the desktop is not checked out (e.g. the deploy host).
+test("the list equals the desktop's STATION_SCOPED, read from C:/openair/src/audio/cmd-routing.ts", (t) => {
+  const fs = require("fs");
+  const p = process.env.OPENAIR_CMD_ROUTING || "C:/openair/src/audio/cmd-routing.ts";
+  if (!fs.existsSync(p)) return t.skip("desktop repo not on this disk");
+  const src = fs.readFileSync(p, "utf8");
+  const block = src.slice(src.indexOf("const STATION_SCOPED"), src.indexOf("]);", src.indexOf("const STATION_SCOPED")));
+  const desktop = [...block.replace(/\/\/.*$/gm, "").matchAll(/"([^"]+)"/g)].map(m => m[1]);
+  assert.ok(desktop.length > 20, "parsed the desktop list");
+  assert.deepEqual([...STATION_SCOPED].sort(), desktop.sort());
 });
 
 test("stamping OVERWRITES a client-supplied target with the sticky source", () => {
