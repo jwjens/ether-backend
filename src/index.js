@@ -51,6 +51,7 @@ const rateLimit  = require('express-rate-limit');
 const { validateSlug } = require("./slug");
 const opsCore = require("./ops-core");   // Park Ops: closing-time resolution + sanity rails
 const { deriveStationState, parseSourceFields, resolveSourceMachineId } = require("./station-state"); // honest state (Slice 1) + source/last_error (Slice 2)
+const cmdBus = require("./lib/cmd-bus");   // web remote slice 2: per-machine delivery (targeted commands)
 const { isStationScopedCommand, stampTarget } = require("./lib/station-commands");   // web remote slice 1: a station control targets the sourcing machine
 
 // JWT signing secret for the Control Center dashboard. MUST be set in production
@@ -6033,24 +6034,9 @@ app.post("/api/station/:uuid/now-playing-art-upload-url", async (req, res) => {
 // next connect. Extracted from /api/cmd so the PUBLIC jukebox request path — which has no license key
 // of its own, only a slug — delivers over the EXACT same rail rather than growing a parallel one.
 function emitCommand(licenseId, cmd, data) {
-  const lid = String(licenseId);
-  const payload = JSON.stringify({ cmd, data, ts: Math.floor(Date.now() / 1000) });
-  const clients = sseClients.get(lid);
-  if (clients && clients.size > 0) {
-    for (const client of clients) {
-      if (!client.writableEnded) client.write(`event: cmd\ndata: ${payload}\n\n`);
-    }
-    console.log(`[cmd] ${cmd} -> SSE fan-out to ${clients.size} client(s) for license=${lid}`);
-    return { delivered: clients.size, queued: false };
-  }
-  // Nobody listening: queue it. A guest at an event must not lose their request because the desktop
-  // happened to reconnect a second earlier.
-  const q = pendingCmds.get(lid) || [];
-  q.push({ cmd, data, ts: Math.floor(Date.now() / 1000) });
-  if (q.length > 20) q.splice(0, q.length - 20);
-  pendingCmds.set(lid, q);
-  console.log(`[cmd] ${cmd} -> queued for license=${lid} (no listener)`);
-  return { delivered: 0, queued: true };
+  // WEB REMOTE SLICE 2: a command carrying target_machine_id goes ONLY to that machine's SSE client(s), and is never
+  // queued — the result's target_connected says whether it arrived. Untargeted commands: fan-out / queue as before.
+  return cmdBus.emitCommand({ sseClients, pendingCmds, licenseId, cmd, data });
 }
 
 // ── JUKEBOX PHASE 2 — the public request page's three endpoints ───────────────────────────────────
@@ -6512,6 +6498,7 @@ app.post("/api/cmd", async (req, res) => {
   // holding the station row executed it (OVEVENTS taken off air from a button named for OV). The
   // decision itself is pure (src/lib/station-commands.js); this block only does the three lookups.
   let body = req.body;
+  let target = null, lastSourceAt = null;
   if (isStationScopedCommand(cmd)) {
     try {
       const stationUuid = typeof body.station_uuid === "string" ? body.station_uuid.trim() : "";
@@ -6545,6 +6532,8 @@ app.post("/api/cmd", async (req, res) => {
         return res.status(verdict.status).json({ error: verdict.error, ...(verdict.detail || {}) });
       }
       body = verdict.body;
+      target = verdict.target;
+      lastSourceAt = nowPlaying ? (nowPlaying.source_machine_id_at || null) : null;
       console.log(`[cmd] ${cmd} station=${stationUuid} target=${verdict.target.machine_id} (${verdict.target.machine_name || "unnamed"}) via=${verdict.via} license=${licenseId}`);
     } catch (e) {
       console.error("[cmd] target stamping failed:", e.message);
@@ -6552,7 +6541,12 @@ app.post("/api/cmd", async (req, res) => {
     }
   }
 
-  emitCommand(licenseId, cmd, body);
+  const sent = emitCommand(licenseId, cmd, body);
+  // SLICE 2: the target machine is not on the bus → nothing was sent and nothing queued. Say so.
+  if (target && sent.target_connected === false) {
+    const off = cmdBus.targetOffline({ machineId: target.machine_id, machineName: target.machine_name, offlineSince: lastSourceAt });
+    return res.status(off.status).json(off.body);
+  }
   res.json({ ok: true });
 });
 
@@ -6575,10 +6569,10 @@ app.get("/api/cmd-stream", async (req, res) => {
   res.flushHeaders();
 
   const licenseId = String(license.id);  // stable integer PK; license_key is NULL for bcrypt rows
-  if (!sseClients.has(licenseId)) sseClients.set(licenseId, new Set());
-  const clients = sseClients.get(licenseId);
-  clients.add(res);
-  console.log(`[cmd-stream] connected — license=${licenseId} streams=${clients.size}`);
+  // WEB REMOTE SLICE 2: remember WHICH machine this connection is (?machine_id=), so a station control can be
+  // delivered to the one machine sourcing the stream. A desktop that sends no id can never be a target.
+  const clients = cmdBus.registerClient(sseClients, licenseId, res, req.query.machine_id);
+  console.log(`[cmd-stream] connected — license=${licenseId} machine=${res.machineId || "(none)"} streams=${clients.size}`);
 
   // Drain any commands queued for THIS license before the connection arrived
   const queued = pendingCmds.get(licenseId);
@@ -6596,9 +6590,8 @@ app.get("/api/cmd-stream", async (req, res) => {
 
   res.on("close", () => {
     clearInterval(keepalive);
-    clients.delete(res);
-    if (clients.size === 0) sseClients.delete(licenseId);
-    console.log(`[cmd-stream] disconnected — license=${licenseId} streams=${clients.size}`);
+    cmdBus.unregisterClient(sseClients, licenseId, res);
+    console.log(`[cmd-stream] disconnected — license=${licenseId} machine=${res.machineId || "(none)"} streams=${clients.size}`);
   });
 });
 
