@@ -100,4 +100,19 @@ function targetOffline({ machineId, machineName, offlineSince }) {
   return { status: 409, body: { error: "target_offline", machine: machineName || machineId || null, offline_since: offlineSince || null } };
 }
 
-module.exports = { registerClient, unregisterClient, emitCommand, targetOffline, recordAck, findAck, PENDING_MAX, ACK_RING };
+/** The Park Ops page shows `error` verbatim, so a refusal there is a sentence; the machine-readable code rides in `code`.
+ *  Takes either a stamping refusal ({status, error}) or a targetOffline() result ({status, body}). */
+function parkOpsRefusal(r) {
+  const code = (r && r.body && r.body.error) || (r && r.error) || "refused";
+  if (code === "target_offline") {
+    const who = (r.body && r.body.machine) || "The on-air computer";
+    return { status: 409, body: { ok: false, code, machine: r.body.machine || null, offline_since: r.body.offline_since || null,
+      error: `${who} is not connected right now — nothing was sent. Try again when it is back online.` } };
+  }
+  if (code === "no_source_machine") {
+    return { status: 409, body: { ok: false, code, error: "No computer has put this station on air yet, so there is nowhere to send this." } };
+  }
+  return { status: (r && r.status) || 400, body: { ok: false, code, error: "This could not be sent to the station." } };
+}
+
+module.exports = { registerClient, unregisterClient, emitCommand, targetOffline, recordAck, findAck, parkOpsRefusal, PENDING_MAX, ACK_RING };

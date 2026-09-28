@@ -52,6 +52,7 @@ const { validateSlug } = require("./slug");
 const opsCore = require("./ops-core");   // Park Ops: closing-time resolution + sanity rails
 const { deriveStationState, parseSourceFields, resolveSourceMachineId } = require("./station-state"); // honest state (Slice 1) + source/last_error (Slice 2)
 const cmdBus = require("./lib/cmd-bus");   // web remote slice 2: per-machine delivery (targeted commands)
+const { parkOpsRefusal } = cmdBus;
 const { isStationScopedCommand, stampTarget } = require("./lib/station-commands");   // web remote slice 1: a station control targets the sourcing machine
 
 // JWT signing secret for the Control Center dashboard. MUST be set in production
@@ -5625,14 +5626,26 @@ app.put("/public/ops/:slug/closing-time", async (req, res) => {
     // could be carried back in its stale form and silently revert — a one-day change from a phone
     // undoing a change it never mentioned. The station owns its own row: it is told WHICH DAY and
     // WHAT TIME, and performs the merge against its own authoritative database.
+    //
+    // AIMED LIKE EVERY STATION CONTROL (web remote): the target is the machine sourcing the station's stream, stamped
+    // by the same function /api/cmd uses. It is NOT queued for a machine that is offline (a closing time that lands
+    // hours later, unannounced, is worse than a clear "not sent") — the phone is told, and the mirror below is
+    // written only once the station actually received it.
     const { rows: lic } = await pool.query(`SELECT license_key_id FROM stations WHERE uuid = $1`, [stationUuid]);
     if (lic.length) {
-      emitCommand(String(lic[0].license_key_id), "ops:set-closing", {
+      const licenseId = String(lic[0].license_key_id);
+      const v = await stampStationCommand(licenseId, "ops:set-closing", {
         cmd: "ops:set-closing",
         station_uuid: stationUuid,
         date: today,
         time: time.slice(0, 5),
       });
+      if (!v.ok) { const r = parkOpsRefusal(v); return res.status(r.status).json(r.body); }
+      const sent = emitCommand(licenseId, "ops:set-closing", v.body);
+      if (sent.target_connected === false) {
+        const r = parkOpsRefusal(cmdBus.targetOffline({ machineId: v.target.machine_id, machineName: v.target.machine_name, offlineSince: v.lastSourceAt }));
+        return res.status(r.status).json(r.body);
+      }
     }
 
     // The mirrored copy is updated optimistically so the operator's phone shows the change on the
@@ -5700,12 +5713,17 @@ app.post("/public/ops/:slug/fire", async (req, res) => {
     const { rows: lic } = await pool.query(`SELECT license_key_id FROM stations WHERE uuid = $1`, [stationUuid]);
     if (!lic.length) return res.status(404).json({ ok: false, error: "station_not_found" });
 
-    emitCommand(String(lic[0].license_key_id), "cart:fire", {
-      cmd: "cart:fire",
-      station_uuid: stationUuid,
-      slot,
-    });
-    res.json({ ok: true, fired: row.title || `Cart ${slot}` });
+    // AIMED LIKE EVERY STATION CONTROL (web remote): only the machine sourcing the station's stream fires it — the
+    // same stamping /api/cmd uses — and an offline target is told, never queued (a cart that fires later is wrong).
+    const licenseId = String(lic[0].license_key_id);
+    const v = await stampStationCommand(licenseId, "cart:fire", { cmd: "cart:fire", station_uuid: stationUuid, slot });
+    if (!v.ok) { const r = parkOpsRefusal(v); return res.status(r.status).json(r.body); }
+    const sent = emitCommand(licenseId, "cart:fire", v.body);
+    if (sent.target_connected === false) {
+      const r = parkOpsRefusal(cmdBus.targetOffline({ machineId: v.target.machine_id, machineName: v.target.machine_name, offlineSince: v.lastSourceAt }));
+      return res.status(r.status).json(r.body);
+    }
+    res.json({ ok: true, fired: row.title || `Cart ${slot}`, cmd_id: sent.cmd_id });
   } catch (e) {
     console.error("[public/ops fire]", e.message);
     res.status(500).json({ ok: false, error: "server_error" });
@@ -6474,6 +6492,41 @@ app.post("/public/jukebox/:slug/request", jukeboxPublicLimiter, async (req, res)
   }
 });
 
+// WEB REMOTE SLICE 1, the lookups: for a station control, find the station (it must be this license's), its RAW
+// source machine (the sticky column — the last machine that sourced it, so Restart/AUTO/Stop still reach it with the
+// stream down) and this license's live activations, then let the pure stampTarget decide. ONE function, used by
+// /api/cmd AND the Park Ops routes (cart:fire, ops:set-closing), so every station control is aimed the same way.
+// Returns stampTarget's verdict plus lastSourceAt (the raw source_machine_id_at — "offline since" for the 409).
+async function stampStationCommand(licenseId, cmd, reqBody) {
+  const body = reqBody || {};
+  const stationUuid = typeof body.station_uuid === "string" ? body.station_uuid.trim() : "";
+  let stationOwned = false, nowPlaying = null, activationKey = null;
+  if (stationUuid) {
+    const own = await pool.query(`SELECT 1 FROM stations WHERE uuid = $1 AND license_key_id = $2`, [stationUuid, licenseId]);
+    stationOwned = own.rows.length > 0;
+    if (stationOwned) {
+      nowPlaying = (await pool.query(
+        `SELECT source_machine_id, source_machine_id_at FROM station_now_playing WHERE station_uuid = $1`, [stationUuid])).rows[0] || null;
+      const lic = (await pool.query(`SELECT license_key FROM licenses WHERE id = $1`, [licenseId])).rows[0];
+      activationKey = lic ? (lic.license_key || `lic-${licenseId}`) : `lic-${licenseId}`;   // same key /api/account/devices uses
+    }
+  }
+  // Devices are looked up per call (one or two per command) — the same rows /api/account/devices lists.
+  const devices = new Map();
+  if (activationKey) {
+    const { rows } = await pool.query(
+      `SELECT machine_id, machine_name FROM license_activations WHERE license_key = $1 AND deauthorized_at IS NULL`, [activationKey]);
+    for (const r of rows) devices.set(r.machine_id, r);
+  }
+  const verdict = stampTarget({ cmd, body, stationOwned, nowPlaying, deviceLookup: (id) => devices.get(id) || null, resolveSourceMachineId });
+  if (!verdict.ok) {
+    console.log(`[cmd] ${cmd} station=${stationUuid || "-"} REFUSED ${verdict.status} ${verdict.error} license=${licenseId}`);
+    return verdict;
+  }
+  console.log(`[cmd] ${cmd} station=${stationUuid} target=${verdict.target.machine_id} (${verdict.target.machine_name || "unnamed"}) via=${verdict.via} license=${licenseId}`);
+  return { ...verdict, lastSourceAt: nowPlaying ? (nowPlaying.source_machine_id_at || null) : null };
+}
+
 app.post("/api/cmd", async (req, res) => {
   let licenseId = null, viaJwt = false, jwtRole = null;
   const authz = req.headers["authorization"] || "";
@@ -6502,45 +6555,14 @@ app.post("/api/cmd", async (req, res) => {
   let body = req.body;
   let target = null, lastSourceAt = null;
   if (isStationScopedCommand(cmd)) {
-    try {
-      const stationUuid = typeof body.station_uuid === "string" ? body.station_uuid.trim() : "";
-      let stationOwned = false, nowPlaying = null, activationKey = null;
-      if (stationUuid) {
-        const own = await pool.query(`SELECT 1 FROM stations WHERE uuid = $1 AND license_key_id = $2`, [stationUuid, licenseId]);
-        stationOwned = own.rows.length > 0;
-        if (stationOwned) {
-          // The STICKY column (the last machine that sourced it), not the 90s-gated view: with the
-          // stream down, Restart/AUTO/Stop still go to the machine that was sourcing it.
-          nowPlaying = (await pool.query(
-            `SELECT source_machine_id, source_machine_id_at FROM station_now_playing WHERE station_uuid = $1`, [stationUuid])).rows[0] || null;
-          const lic = (await pool.query(`SELECT license_key FROM licenses WHERE id = $1`, [licenseId])).rows[0];
-          activationKey = lic ? (lic.license_key || `lic-${licenseId}`) : `lic-${licenseId}`;   // same key /api/account/devices uses
-        }
-      }
-      // Devices are looked up per call (one or two per command) — the same rows /api/account/devices lists.
-      const devices = new Map();
-      if (activationKey) {
-        const { rows } = await pool.query(
-          `SELECT machine_id, machine_name FROM license_activations WHERE license_key = $1 AND deauthorized_at IS NULL`, [activationKey]);
-        for (const r of rows) devices.set(r.machine_id, r);
-      }
-      const verdict = stampTarget({
-        cmd, body, stationOwned, nowPlaying,
-        deviceLookup: (id) => devices.get(id) || null,
-        resolveSourceMachineId,
-      });
-      if (!verdict.ok) {
-        console.log(`[cmd] ${cmd} station=${stationUuid || "-"} REFUSED ${verdict.status} ${verdict.error} license=${licenseId}`);
-        return res.status(verdict.status).json({ error: verdict.error, ...(verdict.detail || {}) });
-      }
-      body = verdict.body;
-      target = verdict.target;
-      lastSourceAt = nowPlaying ? (nowPlaying.source_machine_id_at || null) : null;
-      console.log(`[cmd] ${cmd} station=${stationUuid} target=${verdict.target.machine_id} (${verdict.target.machine_name || "unnamed"}) via=${verdict.via} license=${licenseId}`);
-    } catch (e) {
+    let v;
+    try { v = await stampStationCommand(licenseId, cmd, req.body); }
+    catch (e) {
       console.error("[cmd] target stamping failed:", e.message);
       return res.status(500).json({ error: "server_error" });
     }
+    if (!v.ok) return res.status(v.status).json({ error: v.error, ...(v.detail || {}) });
+    body = v.body; target = v.target; lastSourceAt = v.lastSourceAt;
   }
 
   const sent = emitCommand(licenseId, cmd, body);
