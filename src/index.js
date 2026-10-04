@@ -879,6 +879,10 @@ async function initDB() {
   const { ATTACHMENTS_DDL } = require("./lib/attachments-schema");
   for (const ddl of ATTACHMENTS_DDL) await pool.query(ddl);
 
+  // Remote Link pairing (2026-10-04): published link keys + one-use guest codes. Additive CREATE ... IF NOT EXISTS.
+  const { LINK_PAIRING_DDL } = require("./lib/link-pairing");
+  for (const ddl of LINK_PAIRING_DDL) await pool.query(ddl);
+
   console.log("[DB] Schema ready");
 }
 
@@ -6851,6 +6855,10 @@ app.use('/library', requireLicenseOrMember, libraryRouter);
 // license_key in body (same as /account/connect), so mounted plainly at /account.
 const attachmentsRouter = require('./routes/attachments')(pool, lookupLicense);
 app.use('/account', attachmentsRouter);
+
+// Remote Link pairing (Jeff's ruling 2026-10-04: the link key is never copied by hand). Same account: machines
+// publish their key and fetch each other's; guests: an 8-character, 10-minute, one-use code. Signed-in user only.
+app.use('/api/link', require('./lib/link-pairing').router(pool, requireUser));
 
 // ── Start ─────────────────────────────────────────────────────
 
