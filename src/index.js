@@ -54,6 +54,8 @@ const { deriveStationState, parseSourceFields, resolveSourceMachineId, sourceFie
 const cmdBus = require("./lib/cmd-bus");   // web remote slice 2: per-machine delivery (targeted commands)
 const { parkOpsRefusal } = cmdBus;
 const { isStationScopedCommand, stampTarget } = require("./lib/station-commands");   // web remote slice 1: a station control targets the sourcing machine
+const stripeWebhook = require("./lib/stripe-webhook");   // P0: what a verified platform Stripe event does to licenses
+const { userEntitlement: computeUserEntitlement } = require("./lib/entitlement");   // P0 B6: expiry-aware account entitlement
 
 // JWT signing secret for the Control Center dashboard. MUST be set in production
 // (Railway env). Falls back to a per-boot random secret in dev so tokens simply
@@ -282,7 +284,8 @@ async function initDB() {
       email           TEXT NOT NULL,
       license_key     TEXT NOT NULL UNIQUE,
       plan            TEXT NOT NULL DEFAULT 'pro',
-      stripe_sub_id   TEXT,
+      stripe_customer_id     TEXT,
+      stripe_subscription_id TEXT,
       active          BOOLEAN DEFAULT true,
       created_at      TIMESTAMPTZ DEFAULT NOW(),
       last_validated  TIMESTAMPTZ
@@ -363,6 +366,10 @@ async function initDB() {
   // ADD COLUMN IF NOT EXISTS backfills existing rows with the declared DEFAULT.
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT true`);
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS last_validated TIMESTAMPTZ`);
+  // The REAL Stripe columns (prod has had these since before this file's CREATE TABLE; the code used a phantom
+  // `stripe_sub_id` until P0/B1). No-ops on prod; they make a fresh database match it.
+  await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS stripe_customer_id     TEXT`);
+  await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT`);
   // Trial licenses expire (expires_at = the user's trial_ends_at); paid licenses leave it NULL = perpetual.
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ`);
   // bcrypt key storage (key_prefix + key_hash) — queried by lookupLicense / minted by /admin/issue,
@@ -2014,17 +2021,9 @@ function requireUser(req, res, next) {
   } catch { return res.status(401).json({ error: "invalid_token" }); }
 }
 // Current entitlement: an active paid license wins; else an unexpired trial; else expired/none.
+// Expiry-aware since P0/B6 (lib/entitlement.js); lifetime/operator plans never expire.
 async function userEntitlement(u) {
-  if (u.license_key_id) {
-    const { rows } = await pool.query(`SELECT plan, active FROM licenses WHERE id = $1`, [u.license_key_id]);
-    if (rows[0] && rows[0].active) return { status: "active", plan: rows[0].plan, trial_days_left: 0 };
-  }
-  if (u.trial_ends_at) {
-    const ms = new Date(u.trial_ends_at).getTime() - Date.now();
-    if (ms > 0) return { status: "trial", plan: "trial", trial_days_left: Math.ceil(ms / 86400000) };
-    return { status: "expired", plan: null, trial_days_left: 0 };
-  }
-  return { status: "none", plan: null, trial_days_left: 0 };
+  return computeUserEntitlement(pool, u);
 }
 function publicAccount(u, ent) {
   return { id: u.id, name: u.name || null, email: u.email, email_verified: !!u.email_verified, trial_ends_at: u.trial_ends_at, entitlement: ent };
@@ -3681,20 +3680,20 @@ app.get("/api/account/station/:uuid/listenership", requireAuth, async (req, res)
 // mints a Stripe-hosted Customer Portal session and returns its URL.
 app.get("/api/account/billing", requireAuth, async (req, res) => {
   try {
-    const { rows } = await pool.query(`SELECT plan, stripe_sub_id, email FROM licenses WHERE id = $1`, [req.auth.lk]);
+    const { rows } = await pool.query(`SELECT plan, stripe_subscription_id, email FROM licenses WHERE id = $1`, [req.auth.lk]);
     const lic = rows[0];
     if (!lic) return res.status(404).json({ error: "license_not_found" });
     let status = null, renewsAt = null, cancelAtPeriodEnd = false;
-    if (lic.stripe_sub_id && process.env.STRIPE_SECRET_KEY) {
+    if (lic.stripe_subscription_id && process.env.STRIPE_SECRET_KEY) {
       try {
         const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
-        const sub = await stripe.subscriptions.retrieve(lic.stripe_sub_id);
+        const sub = await stripe.subscriptions.retrieve(lic.stripe_subscription_id);
         status = sub.status;
         renewsAt = sub.current_period_end ? new Date(sub.current_period_end * 1000).toISOString() : null;
         cancelAtPeriodEnd = !!sub.cancel_at_period_end;
       } catch (e) { console.warn("[account/billing] sub retrieve failed:", e.message); }
     }
-    return res.json({ plan: lic.plan, email: lic.email, manageable: !!lic.stripe_sub_id, status, renewsAt, cancelAtPeriodEnd });
+    return res.json({ plan: lic.plan, email: lic.email, manageable: !!lic.stripe_subscription_id, status, renewsAt, cancelAtPeriodEnd });
   } catch (e) {
     console.error("[account/billing]", e.message);
     return res.status(500).json({ error: "server_error" });
@@ -3704,8 +3703,8 @@ app.get("/api/account/billing", requireAuth, async (req, res) => {
 app.post("/api/account/billing/portal", requireAuth, async (req, res) => {
   try {
     if (!process.env.STRIPE_SECRET_KEY) return res.status(503).json({ error: "stripe_unconfigured" });
-    const { rows } = await pool.query(`SELECT stripe_sub_id FROM licenses WHERE id = $1`, [req.auth.lk]);
-    const subId = rows[0]?.stripe_sub_id;
+    const { rows } = await pool.query(`SELECT stripe_subscription_id FROM licenses WHERE id = $1`, [req.auth.lk]);
+    const subId = rows[0]?.stripe_subscription_id;
     if (!subId) return res.status(400).json({ error: "no_subscription" });
     const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
     const sub = await stripe.subscriptions.retrieve(subId);
@@ -4994,99 +4993,18 @@ app.post("/webhook/stripe", async (req, res) => {
     return res.json({ received: true, ignored: "connected_account" });
   }
 
-  // Account-linked subscription (from the signup app's /api/user/checkout): the session carries the
-  // user id (client_reference_id) + chosen plan (metadata). Create/activate the license and link it
-  // to that account so its entitlement flips to paid. No key email — the customer uses email+password.
-  if (event.type === "checkout.session.completed" && event.data.object.client_reference_id) {
-    const s = event.data.object;
-    const userId = parseInt(s.client_reference_id, 10);
-    const email  = (s.customer_details?.email || s.customer_email || "").toLowerCase().trim();
-    const plan   = s.metadata?.plan;
-    const subId  = s.subscription || s.id;
-    if (userId && plan && VALID_PLANS.has(plan)) {
-      const { rows: existing } = await pool.query("SELECT id FROM licenses WHERE stripe_sub_id=$1", [subId]);
-      let licId;
-      if (existing.length) {
-        await pool.query("UPDATE licenses SET active=true, plan=$1, email=$2 WHERE id=$3", [plan, email || null, existing[0].id]);
-        licId = existing[0].id;
-      } else {
-        const key = generateLicenseKey(plan);
-        const r = await pool.query(
-          "INSERT INTO licenses (email,plan,stripe_sub_id,key_prefix,key_hash) VALUES ($1,$2,$3,$4,$5) RETURNING id",
-          [email || null, plan, subId, key.slice(0, 12), await bcrypt.hash(key, 12)]
-        );
-        licId = r.rows[0].id;
-      }
-      await pool.query("UPDATE users SET license_key_id=$1 WHERE id=$2", [licId, userId]);
-      console.log(`[Stripe] account subscription: user ${userId} → license ${licId} (${plan})`);
-    } else {
-      console.warn(`[Stripe] account checkout missing userId/plan (ref=${s.client_reference_id}, plan=${plan})`);
-    }
-    return res.json({ received: true });
+  // Everything a verified platform event does to licenses lives in lib/stripe-webhook.js (P0: B1 real Stripe
+  // columns, B2 failed payment resolves its subscription and keeps grace, B3 subscription.updated handled).
+  try {
+    const out = await stripeWebhook.handlePlatformEvent(event, {
+      pool, validPlans: VALID_PLANS, planByPriceId: PLAN_BY_PRICE_ID, generateLicenseKey,
+      hashKey: (k) => bcrypt.hash(k, 12), sendLicenseEmail,
+    });
+    return res.status(out.status).json(out.body);
+  } catch (e) {
+    console.error(`[Stripe] ${event.type} handling failed:`, e.message);
+    return res.status(500).json({ error: "webhook_failed" });   // non-2xx → Stripe retries
   }
-
-  if (["checkout.session.completed","invoice.payment_succeeded"].includes(event.type)) {
-    const obj   = event.data.object;
-    const email = (obj.customer_email || obj.customer_details?.email || "").toLowerCase().trim();
-    const subId = obj.subscription || obj.id;
-    if (!email) { console.warn("[Stripe] No email"); return res.json({ received: true }); }
-
-    const items   = obj.lines?.data || [];
-    const priceId = items[0]?.price?.id || "";
-    const plan    = PLAN_BY_PRICE_ID[priceId];
-    if (!plan) {
-      // EB3: was a silent fallback to "pro". Now unknown priceIds — empty
-      // string from a malformed event, a new Stripe product without a
-      // matching env var, or anything else — fail loudly. Ack to Stripe so
-      // it doesn't retry indefinitely, but issue no license. Operator must
-      // notice the log and issue manually via /admin/issue. See also EB12.
-      console.error(
-        `[Stripe] UNKNOWN priceId "${priceId}" for ${email} ` +
-        `(event: ${event.type}, subId: ${subId}) — no license issued. ` +
-        `Acknowledging webhook to prevent retry. Operator must issue manually.`
-      );
-      return res.json({ received: true });
-    }
-
-    const { rows: existing } = await pool.query("SELECT * FROM licenses WHERE stripe_sub_id=$1", [subId]);
-    let licenseKey;
-    if (existing.length) {
-      await pool.query("UPDATE licenses SET active=true, email=$1 WHERE id=$2", [email, existing[0].id]);
-      licenseKey = existing[0].license_key;
-      console.log(`[License] Reactivated: ${licenseKey} → ${email}`);
-    } else {
-      licenseKey = generateLicenseKey(plan);
-      const keyPrefix = licenseKey.slice(0, 12);
-      const keyHash   = await bcrypt.hash(licenseKey, 12); // computed before BEGIN — keeps tx window short
-      // Transaction: if email throws, INSERT is rolled back so Stripe retries a clean slate.
-      // On retry: no existing row → fresh key generated → new email attempt.
-      const txClient = await pool.connect();
-      try {
-        await txClient.query('BEGIN');
-        await txClient.query(
-          "INSERT INTO licenses (email,plan,stripe_sub_id,key_prefix,key_hash) VALUES ($1,$2,$3,$4,$5)",
-          [email, plan, subId, keyPrefix, keyHash]
-        );
-        await sendLicenseEmail(email, licenseKey, plan);
-        await txClient.query('COMMIT');
-        console.log(`[License] Issued: ${keyPrefix}... → ${email} (${plan})`);
-      } catch (e) {
-        await txClient.query('ROLLBACK').catch(() => {});
-        console.error('[License] Issue+email failed, rolled back:', e.message);
-        throw e;  // non-2xx → Stripe retries with exponential backoff
-      } finally {
-        txClient.release();
-      }
-    }
-  }
-
-  if (["customer.subscription.deleted","invoice.payment_failed"].includes(event.type)) {
-    const subId = event.data.object.id;
-    const { rowCount } = await pool.query("UPDATE licenses SET active=false WHERE stripe_sub_id=$1", [subId]);
-    console.log(`[License] Deactivated sub ${subId} (${rowCount} rows)`);
-  }
-
-  res.json({ received: true });
 });
 
 // ── Now Playing ───────────────────────────────────────────────
