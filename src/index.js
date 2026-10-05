@@ -1307,25 +1307,13 @@ app.get("/api/platform/diag", requirePlatform, async (_req, res) => {
 // ── Mutation-log retention ────────────────────────────────────────────────────
 // The mutations table is otherwise append-forever (N-119). When sync was re-enabled
 // for the Lifetime/Enterprise tiers the backlog filled the Postgres volume. We keep
-// the LATEST mutation per (table_name,row_id) forever — that's the current state a
-// fresh device needs — and drop superseded history older than a recent buffer, so
-// active clients still have their recent log. row_id is a UUID, so (table,row) is
-// globally unique and this never crosses accounts.
-async function pruneSupersededMutations(bufferDays = 2) {
-  // Hash-join against the latest server_seq per (table,row) — far faster than a
-  // correlated EXISTS, which scans the whole table per row with no covering index.
-  const r = await pool.query(
-    `DELETE FROM mutations m
-       USING (SELECT table_name, row_id, MAX(server_seq) AS keep
-                FROM mutations GROUP BY table_name, row_id) g
-      WHERE m.table_name = g.table_name
-        AND m.row_id     = g.row_id
-        AND m.server_seq < g.keep
-        AND m.received_at < NOW() - ($1::int * INTERVAL '1 day')`,
-    [bufferDays],
-  );
-  return r.rowCount;
-}
+// the LATEST mutation per (license_key_id,table_name,row_id) forever — that's the
+// current state a fresh device of that account needs — and drop that account's own
+// superseded history older than a recent buffer. Retention is PER LICENSE: row ids
+// are client-supplied and legitimately shared across licenses (clone uuid-passthrough,
+// grants, checkpoints), so a global (table,row) grouping let one account's write
+// prune another account's history (H3). All of it lives in lib/mutation-retention.js.
+const mutationRetention = require("./lib/mutation-retention");
 
 // What's actually using the volume — top tables by total (heap+toast+index) size.
 app.get("/api/platform/db-stats", requirePlatform, async (_req, res) => {
@@ -1341,12 +1329,9 @@ app.get("/api/platform/db-stats", requirePlatform, async (_req, res) => {
          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = 'public' AND c.relkind = 'r'
         ORDER BY pg_total_relation_size(c.oid) DESC LIMIT 15`);
-    // superseded = every row that isn't the latest for its (table,row) group — one pass, fast.
-    const mut = await pool.query(
-      `SELECT COUNT(*)::bigint AS total,
-              (COUNT(*) - COUNT(DISTINCT (table_name, row_id)))::bigint AS superseded
-         FROM mutations`);
-    res.json({ ...db.rows[0], mutations: mut.rows[0], tables: tables.rows });
+    // superseded = every row that isn't the latest for its (license,table,row) group — one pass, fast.
+    const mutations = await mutationRetention.supersededStats(pool);
+    res.json({ ...db.rows[0], mutations, tables: tables.rows });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1356,17 +1341,10 @@ app.post("/api/platform/prune-mutations", requirePlatform, async (req, res) => {
   try {
     const bufferDays = Number.isFinite(+req.body?.buffer_days) ? +req.body.buffer_days : 2;
     if (req.body?.dry_run) {
-      const c = await pool.query(
-        `SELECT COUNT(*)::bigint AS would_delete
-           FROM mutations m
-           JOIN (SELECT table_name, row_id, MAX(server_seq) AS keep
-                   FROM mutations GROUP BY table_name, row_id) g
-             ON m.table_name = g.table_name AND m.row_id = g.row_id
-          WHERE m.server_seq < g.keep
-            AND m.received_at < NOW() - ($1::int * INTERVAL '1 day')`, [bufferDays]);
-      return res.json({ dry_run: true, buffer_days: bufferDays, would_delete: c.rows[0].would_delete });
+      const would_delete = await mutationRetention.countPrunable(pool, bufferDays);
+      return res.json({ dry_run: true, buffer_days: bufferDays, would_delete });
     }
-    const deleted = await pruneSupersededMutations(bufferDays);
+    const deleted = await mutationRetention.pruneSupersededMutations(pool, bufferDays);
     let vacuumed = false;
     if (req.body?.vacuum_full) { await pool.query(`VACUUM (FULL, ANALYZE) mutations`); vacuumed = true; }
     else { await pool.query(`VACUUM (ANALYZE) mutations`).catch(() => {}); }
@@ -1376,7 +1354,7 @@ app.post("/api/platform/prune-mutations", requirePlatform, async (req, res) => {
 
 // Daily auto-prune so the log can't grow unbounded again.
 setInterval(() => {
-  pruneSupersededMutations(2)
+  mutationRetention.pruneSupersededMutations(pool, 2)
     .then((n) => n && console.log(`[retention] pruned ${n} superseded mutations`))
     .catch((e) => console.error("[retention] prune failed:", e.message));
 }, 24 * 60 * 60 * 1000);
@@ -1639,10 +1617,11 @@ app.delete("/api/platform/stations/:uuid", requirePlatform, async (req, res) => 
   if (!uuid) return res.status(400).json({ error: "bad_uuid" });
   const client = await pool.connect();
   try {
-    const { rows } = await client.query(`SELECT name FROM stations WHERE uuid = $1`, [uuid]);
+    const { rows } = await client.query(`SELECT name, license_key_id FROM stations WHERE uuid = $1`, [uuid]);
     if (!rows.length) { client.release(); return res.status(404).json({ error: "station_not_found" }); }
     await client.query("BEGIN");
-    await client.query(`DELETE FROM mutations WHERE station_id = $1 OR (table_name = 'stations' AND row_id = $1)`, [uuid]);
+    // Only the OWNING license's log rows — another license's rows naming this uuid are theirs (H3 adjacent).
+    await mutationRetention.deleteStationMutations(client, rows[0].license_key_id, uuid);
     await client.query(`DELETE FROM station_attachments WHERE station_uuid = $1`, [uuid]); // no cascade FK — delete explicitly
     const del = await client.query(`DELETE FROM stations WHERE uuid = $1`, [uuid]); // cascades station_* data
     await client.query("COMMIT");
@@ -2648,7 +2627,7 @@ app.delete("/api/account/stations/:uuid", requireAuthAdmin, async (req, res) => 
     );
     if (!rows.length) { client.release(); return res.status(404).json({ error: "station_not_found" }); }
     await client.query("BEGIN");
-    await client.query(`DELETE FROM mutations WHERE station_id = $1 OR (table_name = 'stations' AND row_id = $1)`, [uuid]);
+    await mutationRetention.deleteStationMutations(client, req.auth.lk, uuid); // the caller's own log rows only
     await client.query(`DELETE FROM station_attachments WHERE station_uuid = $1`, [uuid]); // no cascade FK — delete explicitly
     const del = await client.query(`DELETE FROM stations WHERE uuid = $1 AND license_key_id = $2`, [uuid, req.auth.lk]);
     await client.query("COMMIT");
@@ -4408,7 +4387,7 @@ app.post("/account/delete-station", async (req, res) => {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
-      await client.query("DELETE FROM mutations WHERE station_id = $1 OR (table_name='stations' AND row_id = $1)", [u]);
+      await mutationRetention.deleteStationMutations(client, license.id, u); // this license's own log rows only
       await client.query("DELETE FROM station_attachments WHERE station_uuid=$1", [u]); // no cascade FK — delete explicitly
       const del = await client.query("DELETE FROM stations WHERE uuid=$1 AND license_key_id=$2", [u, license.id]);
       await client.query("COMMIT");
