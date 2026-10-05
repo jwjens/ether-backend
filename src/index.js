@@ -6655,9 +6655,14 @@ app.get("/guest/status/:token", async (req, res) => {
 });
 
 // ── Cloud Backup ──────────────────────────────────────────────
+// LEGACY Postgres backups. Every query is scoped to the caller's license (lib/legacy-backups.js, H2); station_id
+// is only a label inside it. The current cloud backup is the R2 pair /backup/upload-url + /backup/download-url.
+const legacyBackups = require("./lib/legacy-backups");
 
 app.post("/backup/upload", requireLicense, (req, res) => {
   if (!upload) return res.status(503).json({ error: "multer not installed — run: npm install multer" });
+  const licenseKey = legacyBackups.legacyKey(req.license);
+  if (!licenseKey) return res.status(legacyBackups.NO_LEGACY_STORAGE.status).json(legacyBackups.NO_LEGACY_STORAGE.body);
   upload.single("backup")(req, res, async (err) => {
     if (err) return res.status(400).json({ error: err.message });
     if (!req.file) return res.status(400).json({ error: "No file provided" });
@@ -6673,18 +6678,12 @@ app.post("/backup/upload", requireLicense, (req, res) => {
       const checksum    = crypto.createHash("sha256").update(req.file.buffer).digest("hex");
       const sizeBytes   = req.file.buffer.length;
 
-      if (req.license.plan === "pro") {
-        const { rows: [{ count }] } = await pool.query("SELECT COUNT(*) FROM backups WHERE station_id=$1", [stationId]);
-        if (parseInt(count) >= 30) {
-          await pool.query("DELETE FROM backups WHERE id=(SELECT id FROM backups WHERE station_id=$1 ORDER BY created_at ASC LIMIT 1)", [stationId]);
-        }
-      }
+      // Studio rotation evicts only the CALLER's own oldest backups under this label.
+      if (req.license.plan === "pro") await legacyBackups.rotateStudioBackups(pool, licenseKey, stationId);
 
-      const { rows: [row] } = await pool.query(
-        `INSERT INTO backups (station_id,license_key,filename,size_bytes,checksum,data,description)
-         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id,created_at`,
-        [stationId, req.license.license_key, filename, sizeBytes, checksum, req.file.buffer, description]
-      );
+      const row = await legacyBackups.insertBackup(pool, {
+        licenseKey, stationId, filename, sizeBytes, checksum, data: req.file.buffer, description,
+      });
       res.json({ success: true, backup_id: row.id, created_at: row.created_at, size_bytes: sizeBytes, checksum });
     } catch (e) {
       console.error("[backup/upload]", e.message);
@@ -6695,15 +6694,12 @@ app.post("/backup/upload", requireLicense, (req, res) => {
 
 app.get("/backup/list", requireLicense, async (req, res) => {
   try {
-    const stationId = req.query.station_id || req.license.email;
-    const { rows } = await pool.query(
-      "SELECT id,filename,size_bytes,checksum,created_at,description FROM backups WHERE station_id=$1 ORDER BY created_at DESC",
-      [stationId]
-    );
-    const { rows: [{ total }] } = await pool.query(
-      "SELECT COALESCE(SUM(size_bytes),0) as total FROM backups WHERE station_id=$1", [stationId]
-    );
-    res.json({ backups: rows, total_size_bytes: parseInt(total), plan: req.license.plan, limit: req.license.plan === "pro" ? 30 : null });
+    const licenseKey = legacyBackups.legacyKey(req.license);
+    if (!licenseKey) return res.status(legacyBackups.NO_LEGACY_STORAGE.status).json(legacyBackups.NO_LEGACY_STORAGE.body);
+    // station_id narrows within the caller's own backups; omitted = all of them.
+    const stationId = req.query.station_id ? String(req.query.station_id) : null;
+    const { rows, total } = await legacyBackups.listBackups(pool, licenseKey, stationId);
+    res.json({ backups: rows, total_size_bytes: total, plan: req.license.plan, limit: req.license.plan === "pro" ? legacyBackups.STUDIO_KEEP : null });
   } catch (e) {
     console.error("[backup/list]", e.message);
     res.status(500).json({ error: "List failed" });
@@ -6712,12 +6708,14 @@ app.get("/backup/list", requireLicense, async (req, res) => {
 
 app.get("/backup/download/:id", requireLicense, async (req, res) => {
   try {
-    const { rows } = await pool.query("SELECT * FROM backups WHERE id=$1 AND license_key=$2", [req.params.id, req.license.license_key]);
-    if (!rows.length) return res.status(404).json({ error: "Not found" });
+    const licenseKey = legacyBackups.legacyKey(req.license);
+    if (!licenseKey) return res.status(legacyBackups.NO_LEGACY_STORAGE.status).json(legacyBackups.NO_LEGACY_STORAGE.body);
+    const b = await legacyBackups.getBackup(pool, licenseKey, req.params.id);
+    if (!b) return res.status(404).json({ error: "Not found" });
     res.setHeader("Content-Type", "application/gzip");
-    res.setHeader("Content-Disposition", `attachment; filename="${rows[0].filename}"`);
-    res.setHeader("X-Checksum", rows[0].checksum);
-    res.send(rows[0].data);
+    res.setHeader("Content-Disposition", `attachment; filename="${b.filename}"`);
+    res.setHeader("X-Checksum", b.checksum);
+    res.send(b.data);
   } catch (e) {
     console.error("[backup/download]", e.message);
     res.status(500).json({ error: "Download failed" });
@@ -6726,8 +6724,9 @@ app.get("/backup/download/:id", requireLicense, async (req, res) => {
 
 app.delete("/backup/:id", requireLicense, async (req, res) => {
   try {
-    const { rows } = await pool.query("DELETE FROM backups WHERE id=$1 AND license_key=$2 RETURNING id", [req.params.id, req.license.license_key]);
-    if (!rows.length) return res.status(404).json({ error: "Not found" });
+    const licenseKey = legacyBackups.legacyKey(req.license);
+    if (!licenseKey) return res.status(legacyBackups.NO_LEGACY_STORAGE.status).json(legacyBackups.NO_LEGACY_STORAGE.body);
+    if (!(await legacyBackups.deleteBackup(pool, licenseKey, req.params.id))) return res.status(404).json({ error: "Not found" });
     res.json({ success: true, deleted_id: parseInt(req.params.id) });
   } catch (e) {
     console.error("[backup/delete]", e.message);
