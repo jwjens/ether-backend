@@ -53,6 +53,7 @@ const opsCore = require("./ops-core");   // Park Ops: closing-time resolution + 
 const { deriveStationState, parseSourceFields, resolveSourceMachineId, sourceFields } = require("./station-state");
 const broadcastOwner = require("./lib/broadcast-owner"); // ONE broadcast owner per station (2026-10-13)
 const parkAuth = require("./lib/park-auth");             // Park page staff login with the existing username + PIN users
+const parkSound = require("./lib/park-sound");           // the Park page fader stays steady (older-build pushes, owner online)
 const cmdBus = require("./lib/cmd-bus");   // web remote slice 2: per-machine delivery (targeted commands)
 const { parkOpsRefusal } = cmdBus;
 const { isStationScopedCommand, stampTarget } = require("./lib/station-commands");   // web remote slice 1: a station control targets the sourcing machine
@@ -3079,7 +3080,22 @@ app.post("/api/account/data/sync", async (req, res) => {
     const byUuid = new Map();
     for (const r of rows) { if (r?.uuid) byUuid.set(String(r.uuid), r); }
     const present = [...byUuid.keys()];
-    const entries = [...byUuid.entries()];
+    let entries = [...byUuid.entries()];
+    // PARK SOUND (2026-10-13, lib/park-sound.js): a station open on two machines pushes this row from both. A build
+    // older than the Park sound controls must not wipe the park's level the current build reports.
+    if (table === "ops_config" && entries.length) {
+      const { rows: stored } = await pool.query(
+        `SELECT row_uuid, payload FROM station_cc_data WHERE station_uuid = $1 AND table_name = 'ops_config' AND row_uuid = ANY($2::text[])`,
+        [stationUuid, present]);
+      const prev = new Map(stored.map(x => [x.row_uuid, x.payload]));
+      const kept = [];
+      for (const [rowUuid, r] of entries) {
+        const d = parkSound.opsConfigWrite(prev.get(rowUuid) || null, r, Date.now());
+        if (d.write) kept.push([rowUuid, d.write]);
+        if (d.reason !== "current_build") console.log(`[ops_config] ${stationUuid} ${rowUuid}: ${d.reason}`);
+      }
+      entries = kept;
+    }
     const CHUNK = 500;
     for (let i = 0; i < entries.length; i += CHUNK) {
       const chunk = entries.slice(i, i + CHUNK);
@@ -5519,6 +5535,11 @@ app.get("/public/ops/:slug", async (req, res) => {
       [stationUuid]
     );
     const m = meta[0] || {};
+    // Is the machine every Park command is aimed at connected right now? (lib/park-sound.js ownerOnline)
+    const { rows: own } = await pool.query(
+      `SELECT s.license_key_id, n.source_machine_id FROM stations s LEFT JOIN station_now_playing n ON n.station_uuid = s.uuid WHERE s.uuid = $1`,
+      [stationUuid]);
+    const stationOnline = own.length ? parkSound.ownerOnline(sseClients.get(String(own[0].license_key_id)), own[0].source_machine_id) : false;
 
     // The date is the STATION's local day where one is mirrored, falling back to the server's.
     // A park closing at 22:00 must not roll over because Railway is on UTC.
@@ -5583,6 +5604,9 @@ app.get("/public/ops/:slug", async (req, res) => {
         topDb: Number.isFinite(Number(cfgRow.park.top_db)) ? Number(cfgRow.park.top_db) : 0,
         muted: !!cfgRow.park.muted,
       } : null,
+      // The station's owning machine is connected, so the fader and MUTE can reach it. When false the page keeps the
+      // fader on screen, greyed, saying "Station offline" — it never vanishes.
+      stationOnline,
       // The cart playing right now, read off the station's cart channel (position at `at`, so the page counts down).
       cartPlaying: (cfgRow && cfgRow.cart_playing && typeof cfgRow.cart_playing === "object") ? cfgRow.cart_playing : null,
       mirrored,
