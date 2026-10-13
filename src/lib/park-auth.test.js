@@ -9,25 +9,28 @@ const S = 'station-hv';
 const live = () => ({ ended_at: null, pin_fp: A.pinFingerprint(PIN_HASH), station_uuid: S });
 
 test('a good session stays good', () => {
-  assert.deepStrictEqual(A.sessionVerdict(live(), { pin_hash: PIN_HASH }, true, S), { ok: true });
+  assert.deepStrictEqual(A.sessionVerdict(live(), { pin_hash: PIN_HASH, role: 'admin' }, S), { ok: true });
 });
 test('Log out ends it', () => {
-  assert.strictEqual(A.sessionVerdict({ ...live(), ended_at: new Date() }, { pin_hash: PIN_HASH }, true, S).reason, 'logged_out');
+  assert.strictEqual(A.sessionVerdict({ ...live(), ended_at: new Date() }, { pin_hash: PIN_HASH, role: 'admin' }, S).reason, 'logged_out');
 });
 test('changing the PIN logs every device out', () => {
-  assert.strictEqual(A.sessionVerdict(live(), { pin_hash: 'xyz:new' }, true, S).reason, 'pin_changed');
+  assert.strictEqual(A.sessionVerdict(live(), { pin_hash: 'xyz:new', role: 'admin' }, S).reason, 'pin_changed');
 });
 test('removing the user logs every device out', () => {
-  assert.strictEqual(A.sessionVerdict(live(), null, true, S).reason, 'user_removed');
+  assert.strictEqual(A.sessionVerdict(live(), null, S).reason, 'user_removed');
 });
-test('taking away Park access for the station logs the device out', () => {
-  assert.strictEqual(A.sessionVerdict(live(), { pin_hash: PIN_HASH }, false, S).reason, 'no_access');
+test('admins only: a user who is no longer an admin is logged out', () => {
+  assert.strictEqual(A.sessionVerdict(live(), { pin_hash: PIN_HASH, role: 'user' }, S).reason, 'not_admin');
+  assert.strictEqual(A.isAdmin({ role: 'Admin' }), true);
+  assert.strictEqual(A.isAdmin({ role: 'user' }), false);
+  assert.strictEqual(A.isAdmin(null), false);
 });
 test('a login for one station does not work on another', () => {
-  assert.strictEqual(A.sessionVerdict(live(), { pin_hash: PIN_HASH }, true, 'other').reason, 'other_station');
+  assert.strictEqual(A.sessionVerdict(live(), { pin_hash: PIN_HASH, role: 'admin' }, 'other').reason, 'other_station');
 });
 test('no session → please log in', () => {
-  assert.strictEqual(A.sessionVerdict(null, null, false, S).reason, 'no_session');
+  assert.strictEqual(A.sessionVerdict(null, null, S).reason, 'no_session');
 });
 test('tokens are random and only their hash is kept', () => {
   const a = A.newSession(), b = A.newSession();

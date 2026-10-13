@@ -67,8 +67,8 @@ if (!process.env.JWT_SECRET) {
   console.warn("[AUTH] JWT_SECRET not set — using an ephemeral per-boot secret (dashboard sessions reset on restart). Set JWT_SECRET in production.");
 }
 const JWT_TTL = "12h";                       // access-token lifetime
-// Wrong-PIN lockout: the account's own settings (account_security_settings; Remote page -> Users -> Login safety),
-// read by lockoutRuleFor. They were constants here (5 tries / 15 min) -- now the values used until an account saves its own.
+// Wrong-PIN lockout: 5 tries / 15 min (lockoutRuleFor). account_security_settings can override it, but nothing writes it:
+// its settings screen was removed (Jeff, 2026-10-13) until it is designed in Ether's Users & Security and approved.
 
 // multer is optional — install with: npm install multer
 let multer;
@@ -602,16 +602,6 @@ async function initDB() {
       pin_max_fails       INTEGER NOT NULL,
       pin_lockout_minutes INTEGER NOT NULL,
       updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-  // Keyed by USERNAME (lower), not account_users.id: an install's user mirror can re-create a row under a new id.
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS park_access (
-      license_key_id INTEGER NOT NULL REFERENCES licenses(id) ON DELETE CASCADE,
-      username_lower TEXT NOT NULL,
-      station_uuid   TEXT NOT NULL REFERENCES stations(uuid) ON DELETE CASCADE,
-      granted_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (license_key_id, username_lower, station_uuid)
     )
   `);
   await pool.query(`
@@ -5658,16 +5648,13 @@ async function parkActor(req, stationUuid) {
   const tok = String(req.headers["x-park-session"] || "");
   if (tok) {
     const s = (await pool.query(`SELECT * FROM park_sessions WHERE token_hash = $1`, [parkAuth.tokenHash(tok)])).rows[0] || null;
-    let user = null, access = false;
+    let user = null;
     if (s) {
       user = (await pool.query(
-        `SELECT id, username, display_name, pin_hash FROM account_users
+        `SELECT id, username, display_name, role, pin_hash FROM account_users
           WHERE license_key_id = $1 AND lower(username) = $2 AND deleted_at IS NULL`, [s.license_key_id, s.username_lower])).rows[0] || null;
-      access = (await pool.query(
-        `SELECT 1 FROM park_access WHERE license_key_id = $1 AND username_lower = $2 AND station_uuid = $3`,
-        [s.license_key_id, s.username_lower, stationUuid])).rows.length > 0;
     }
-    const v = parkAuth.sessionVerdict(s, user, access, stationUuid);
+    const v = parkAuth.sessionVerdict(s, user, stationUuid);
     if (!v.ok) {
       if (s && !s.ended_at) await pool.query(`UPDATE park_sessions SET ended_at = NOW(), end_reason = $2 WHERE token_hash = $1`, [s.token_hash, v.reason]);
       return { ok: false, status: 401, body: { ok: false, error: v.message, reason: v.reason, logged_out: true } };
@@ -5721,10 +5708,8 @@ app.post("/public/ops/:slug/login", authLimiter, async (req, res) => {
     }
     await pool.query(`UPDATE account_users SET failed_attempts = 0, locked_until = NULL, updated_at = NOW() WHERE id = $1`, [user.id]);
     const ul = String(user.username).toLowerCase();
-    const allowed = (await pool.query(`SELECT 1 FROM park_access WHERE license_key_id = $1 AND username_lower = $2 AND station_uuid = $3`,
-      [licenseId, ul, stationUuid])).rows.length > 0;
     const name = user.display_name || user.username;
-    if (!allowed) return res.status(403).json({ ok: false, error: `${name} isn't allowed on this station's Park page. Ask the station manager.` });
+    if (!parkAuth.isAdmin(user)) return res.status(403).json({ ok: false, error: `Only admins can use the Park page. ${name} is not an admin.` });
 
     const sess = parkAuth.newSession();
     await pool.query(
@@ -5763,56 +5748,6 @@ app.post("/public/ops/:slug/logout", async (req, res) => {
   } catch (e) { console.error("[public/ops logout]", e.message); res.status(500).json({ ok: false, error: "server_error" }); }
 });
 
-// ── Remote page → Users: Park page access, login safety settings, Park page activity (admin) ───────────────────────
-app.get("/api/account/park", requireAuthAdmin, async (req, res) => {
-  try {
-    const { rows: stations } = await pool.query(
-      `SELECT s.uuid, s.name, m.slug FROM stations s JOIN station_metadata m ON m.station_uuid = s.uuid
-        WHERE s.license_key_id = $1 AND m.public_enabled = true AND m.slug IS NOT NULL ORDER BY s.name`, [req.auth.lk]);
-    const { rows: access } = await pool.query(`SELECT username_lower, station_uuid FROM park_access WHERE license_key_id = $1`, [req.auth.lk]);
-    const { rows: set } = await pool.query(`SELECT pin_max_fails, pin_lockout_minutes FROM account_security_settings WHERE license_key_id = $1`, [req.auth.lk]);
-    const rule = parkAuth.lockoutRule(set[0] || null);
-    res.json({ stations, access, settings: { pin_max_fails: rule.maxFails, pin_lockout_minutes: rule.lockoutMinutes, saved: !!set.length } });
-  } catch (e) { console.error("[account/park]", e.message); res.status(500).json({ error: "server_error" }); }
-});
-app.put("/api/account/users/:id/park-access", requireAuthAdmin, async (req, res) => {
-  try {
-    const u = (await pool.query(`SELECT username FROM account_users WHERE id = $1 AND license_key_id = $2 AND deleted_at IS NULL`, [req.params.id, req.auth.lk])).rows[0];
-    if (!u) return res.status(404).json({ error: "not_found" });
-    const want = Array.isArray(req.body?.stations) ? req.body.stations.map(String) : null;
-    if (!want) return res.status(400).json({ error: "stations_required" });
-    if (want.length) {
-      const { rows } = await pool.query(`SELECT uuid FROM stations WHERE license_key_id = $1 AND uuid = ANY($2)`, [req.auth.lk, want]);
-      if (rows.length !== new Set(want).size) return res.status(400).json({ error: "station_not_in_account" });
-    }
-    const ul = String(u.username).toLowerCase();
-    await pool.query(`DELETE FROM park_access WHERE license_key_id = $1 AND username_lower = $2 AND NOT (station_uuid = ANY($3))`, [req.auth.lk, ul, want]);
-    for (const su of want) await pool.query(
-      `INSERT INTO park_access (license_key_id, username_lower, station_uuid) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [req.auth.lk, ul, su]);
-    res.json({ ok: true, stations: want });
-  } catch (e) { console.error("[account/users park-access]", e.message); res.status(500).json({ error: "server_error" }); }
-});
-app.put("/api/account/security-settings", requireAuthAdmin, async (req, res) => {
-  try {
-    const v = parkAuth.validSettings(req.body);
-    if (!v.ok) return res.status(400).json({ error: v.error });
-    await pool.query(
-      `INSERT INTO account_security_settings (license_key_id, pin_max_fails, pin_lockout_minutes) VALUES ($1,$2,$3)
-       ON CONFLICT (license_key_id) DO UPDATE SET pin_max_fails = $2, pin_lockout_minutes = $3, updated_at = NOW()`,
-      [req.auth.lk, v.maxFails, v.lockoutMinutes]);
-    res.json({ ok: true, settings: { pin_max_fails: v.maxFails, pin_lockout_minutes: v.lockoutMinutes, saved: true } });
-  } catch (e) { console.error("[account/security-settings]", e.message); res.status(500).json({ error: "server_error" }); }
-});
-app.get("/api/account/park-log", requireAuthAdmin, async (req, res) => {
-  try {
-    const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 200));
-    const { rows } = await pool.query(
-      `SELECT a.at, a.actor, a.via, a.action, a.detail, s.name AS station
-         FROM park_audit a JOIN stations s ON s.uuid = a.station_uuid
-        WHERE s.license_key_id = $1 ORDER BY a.at DESC LIMIT $2`, [req.auth.lk, limit]);
-    res.json({ entries: rows });
-  } catch (e) { console.error("[account/park-log]", e.message); res.status(500).json({ error: "server_error" }); }
-});
 
 app.put("/public/ops/:slug/closing-time", async (req, res) => {
   const slug = String(req.params.slug || "").toLowerCase();
