@@ -5604,6 +5604,12 @@ app.get("/public/ops/:slug", async (req, res) => {
         level: Number.isFinite(Number(cfgRow.park.level)) ? Number(cfgRow.park.level) : null,
         topDb: Number.isFinite(Number(cfgRow.park.top_db)) ? Number(cfgRow.park.top_db) : 0,
         muted: !!cfgRow.park.muted,
+        // The studio's lock, and the last change to the sound from anywhere ({what, level, by, via, at}).
+        locked: cfgRow.park.locked === true,
+        // Staff names only to staff: a public viewer sees the change and the time, never who.
+        last: (cfgRow.park.last && typeof cfgRow.park.last === "object")
+          ? (await parkViewerIsStaff(req, stationUuid) ? cfgRow.park.last : { ...cfgRow.park.last, by: null })
+          : null,
       } : null,
       // The station's owning machine is connected, so the fader and MUTE can reach it. When false the page keeps the
       // fader on screen, greyed, saying "Station offline" — it never vanishes.
@@ -5700,6 +5706,37 @@ async function parkActor(req, stationUuid) {
   }
   return { ok: false, status: 403, body: { ok: false, error: "Log in to make changes." } };
 }
+// THE STUDIO'S LOCK (Jeff, 2026-10-13): Ether's "Park page control: OFF" locks the fader, MUTE, carts and closing time on
+// every Park page ("Controls locked by the studio"); Listen stays allowed; only Ether turns it back on (no route here can).
+// The station pushes it in ops_config.park.locked the moment it changes. The station refuses these commands itself too.
+const PARK_LOCKED = "Controls locked by the studio";
+async function parkLocked(stationUuid) {
+  const rows = await ccRows(stationUuid, "ops_config");
+  const cfgRow = rows.find(r => r && r.uuid === "ops") || rows[0] || null;
+  return !!(cfgRow && cfgRow.park && typeof cfgRow.park === "object" && cfgRow.park.locked === true);
+}
+function parkLockedReply(res) { return res.status(423).json({ ok: false, locked: true, error: PARK_LOCKED }); }
+
+// READ-ONLY: is this page view a logged-in staff member (or the staff link)? Used to show staff names (who changed the
+// park's sound) only to staff, never to a public viewer. Unlike parkActor it writes nothing — the page polls every 4 s.
+async function parkViewerIsStaff(req, stationUuid) {
+  try {
+    const tok = String(req.headers["x-park-session"] || "");
+    if (tok) {
+      const s = (await pool.query(`SELECT * FROM park_sessions WHERE token_hash = $1`, [parkAuth.tokenHash(tok)])).rows[0] || null;
+      if (!s) return false;
+      const user = (await pool.query(
+        `SELECT id, username, display_name, pin_hash FROM account_users
+          WHERE license_key_id = $1 AND lower(username) = $2 AND deleted_at IS NULL`, [s.license_key_id, s.username_lower])).rows[0] || null;
+      return parkAuth.sessionVerdict(s, user, stationUuid).ok;
+    }
+    const supplied = String(req.query.k || req.headers["x-ops-token"] || "");
+    if (!supplied) return false;
+    const { rows } = await pool.query(`SELECT token FROM station_ops_token WHERE station_uuid = $1`, [stationUuid]);
+    return !!rows.length && supplied === rows[0].token;
+  } catch { return false; }
+}
+
 /** The who-did-what log (Remote page → Users → Park page activity). Never blocks the change it records. */
 async function parkAudit(stationUuid, actor, action, detail) {
   try {
@@ -5789,6 +5826,8 @@ app.put("/public/ops/:slug/closing-time", async (req, res) => {
     const who = await parkActor(req, stationUuid);
     if (!who.ok) return res.status(who.status).json(who.body);
 
+    if (await parkLocked(stationUuid)) return parkLockedReply(res);
+
     const time = String(req.body?.time || "").trim();
     if (opsCore.hhmmToMin(time) == null) return res.status(400).json({ ok: false, error: "That is not a time." });
 
@@ -5830,6 +5869,7 @@ app.put("/public/ops/:slug/closing-time", async (req, res) => {
         station_uuid: stationUuid,
         date: today,
         time: time.slice(0, 5),
+        from_park: true,
       });
       if (!v.ok) { const r = parkOpsRefusal(v); return res.status(r.status).json(r.body); }
       const sent = emitCommand(licenseId, "ops:set-closing", v.body);
@@ -5874,10 +5914,12 @@ async function parkSoundWrite(req, res, cmd, body) {
     const stationUuid = found.uuid;
     const who = await parkActor(req, stationUuid);
     if (!who.ok) return res.status(who.status).json(who.body);
+    if (await parkLocked(stationUuid)) return parkLockedReply(res);
     const { rows: lic } = await pool.query(`SELECT license_key_id FROM stations WHERE uuid = $1`, [stationUuid]);
     if (!lic.length) return res.status(404).json({ ok: false, error: "station_not_found" });
     const licenseId = String(lic[0].license_key_id);
-    const v = await stampStationCommand(licenseId, cmd, { cmd, station_uuid: stationUuid, ...body });
+    // `by` is the logged-in staff member's name: the station shows "Muted from Park page by <name>, <time>".
+    const v = await stampStationCommand(licenseId, cmd, { cmd, station_uuid: stationUuid, ...body, from_park: true, by: who.actor.name });
     if (!v.ok) { const r = parkOpsRefusal(v); return res.status(r.status).json(r.body); }
     const sent = emitCommand(licenseId, cmd, v.body);
     if (sent.target_connected === false) {
@@ -5924,6 +5966,7 @@ app.post("/public/ops/:slug/fire", async (req, res) => {
 
     const who = await parkActor(req, stationUuid);
     if (!who.ok) return res.status(who.status).json(who.body);
+    if (await parkLocked(stationUuid)) return parkLockedReply(res);
 
     // The slot must be one this station has mirrored as loaded. Without this an invented number
     // would be forwarded straight to the install.
@@ -5939,7 +5982,7 @@ app.post("/public/ops/:slug/fire", async (req, res) => {
     // AIMED LIKE EVERY STATION CONTROL (web remote): only the machine sourcing the station's stream fires it — the
     // same stamping /api/cmd uses — and an offline target is told, never queued (a cart that fires later is wrong).
     const licenseId = String(lic[0].license_key_id);
-    const v = await stampStationCommand(licenseId, "cart:fire", { cmd: "cart:fire", station_uuid: stationUuid, slot });
+    const v = await stampStationCommand(licenseId, "cart:fire", { cmd: "cart:fire", station_uuid: stationUuid, slot, from_park: true });
     if (!v.ok) { const r = parkOpsRefusal(v); return res.status(r.status).json(r.body); }
     const sent = emitCommand(licenseId, "cart:fire", v.body);
     if (sent.target_connected === false) {
