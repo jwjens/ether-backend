@@ -28,6 +28,7 @@ const STATION_SCOPED = new Set([
   "cart:fire",
   "ops:set-closing",
   "ops:set-level", "ops:set-mute",   // the Park page's sound (2026-10-13) -- aimed at the owner like every control
+  "park:listen",                     // the Park page's Listen (2026-10-13) -- only the owner sends the park's feed
 ]);
 
 function isStationScopedCommand(cmd) {

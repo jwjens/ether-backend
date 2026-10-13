@@ -53,7 +53,8 @@ const opsCore = require("./ops-core");   // Park Ops: closing-time resolution + 
 const { deriveStationState, parseSourceFields, resolveSourceMachineId, sourceFields } = require("./station-state");
 const broadcastOwner = require("./lib/broadcast-owner"); // ONE broadcast owner per station (2026-10-13)
 const parkAuth = require("./lib/park-auth");             // Park page staff login with the existing username + PIN users
-const parkSound = require("./lib/park-sound");           // the Park page fader stays steady (older-build pushes, owner online)
+const parkSound = require("./lib/park-sound");
+const { ListenBook, pathOf: listenPathOf, STATION_LEASE_SEC } = require("./lib/park-listen");   // Park page Listen (2026-10-13)           // the Park page fader stays steady (older-build pushes, owner online)
 const cmdBus = require("./lib/cmd-bus");   // web remote slice 2: per-machine delivery (targeted commands)
 const { parkOpsRefusal } = cmdBus;
 const { isStationScopedCommand, stampTarget } = require("./lib/station-commands");   // web remote slice 1: a station control targets the sourcing machine
@@ -5607,6 +5608,12 @@ app.get("/public/ops/:slug", async (req, res) => {
       // The station's owning machine is connected, so the fader and MUTE can reach it. When false the page keeps the
       // fader on screen, greyed, saying "Station offline" — it never vanishes.
       stationOnline,
+      // PARK LISTEN: set up on this station (every Listen setting set in Ether's Preferences), and the listener buffer the
+      // station chose for the phone. The server's own relay addresses must also be configured (listenRelay).
+      listen: {
+        ready: !!(cfgRow && cfgRow.listen && cfgRow.listen.ready) && listenRelayConfigured(),
+        buffer_ms: (cfgRow && cfgRow.listen && Number.isFinite(Number(cfgRow.listen.buffer_ms))) ? Number(cfgRow.listen.buffer_ms) : null,
+      },
       // The cart playing right now, read off the station's cart channel (position at `at`, so the page counts down).
       cartPlaying: (cfgRow && cfgRow.cart_playing && typeof cfgRow.cart_playing === "object") ? cfgRow.cart_playing : null,
       mirrored,
@@ -5945,6 +5952,97 @@ app.post("/public/ops/:slug/fire", async (req, res) => {
     console.error("[public/ops fire]", e.message);
     res.status(500).json({ ok: false, error: "server_error" });
   }
+});
+
+// ── PARK PAGE LISTEN (2026-10-13; desktop docs/park-listen-plan-2026-10-13.md, lib/park-listen.js) ─────────────────────
+// Logged-in staff press Listen → this server tells the station's owning machine to send its park-speaker feed to the
+// relay (MediaMTX on the stream server), hands the phone a ticket, and the relay asks /internal/mediamtx/auth before it
+// serves anyone. The relay's two addresses are server settings (env), never code:
+//   PARK_LISTEN_RTSP_BASE  where the station publishes, e.g. rtsps://stream.example.com:8322
+//   PARK_LISTEN_WHEP_BASE  where the phone plays,      e.g. https://stream.example.com:8889
+//   MEDIAMTX_AUTH_SECRET   (optional) the relay must send ?s=<this> on its auth calls
+const parkListen = new ListenBook();
+function listenRelayConfigured() { return !!(process.env.PARK_LISTEN_RTSP_BASE && process.env.PARK_LISTEN_WHEP_BASE); }
+function listenPublishUrl(stationUuid, token) {
+  const u = new URL(String(process.env.PARK_LISTEN_RTSP_BASE).replace(/\/+$/, "") + "/" + listenPathOf(stationUuid));
+  u.username = "station"; u.password = token;
+  return u.toString();
+}
+/** Tell the station's owning machine to send (with a lease) or stop. Aimed like every station control. */
+async function tellStationListen(stationUuid, on, publishToken) {
+  const { rows } = await pool.query(`SELECT license_key_id FROM stations WHERE uuid = $1`, [stationUuid]);
+  if (!rows.length) return { ok: false, status: 404, body: { ok: false, error: "station_not_found" } };
+  const licenseId = String(rows[0].license_key_id);
+  const body = { cmd: "park:listen", station_uuid: stationUuid, on: !!on, lease_sec: STATION_LEASE_SEC };
+  if (on) body.url = listenPublishUrl(stationUuid, publishToken);
+  const v = await stampStationCommand(licenseId, "park:listen", body);
+  if (!v.ok) { const r = parkOpsRefusal(v); return { ok: false, status: r.status, body: r.body }; }
+  const sent = emitCommand(licenseId, "park:listen", v.body);
+  if (sent.target_connected === false) {
+    const r = parkOpsRefusal(cmdBus.targetOffline({ machineId: v.target.machine_id, machineName: v.target.machine_name, offlineSince: v.lastSourceAt }));
+    return { ok: false, status: r.status, body: r.body };
+  }
+  return { ok: true };
+}
+async function listenStation(req, res) {
+  const found = await resolveOpsSlug(String(req.params.slug || "").toLowerCase());
+  if (!found || found.redirect) { res.status(404).json({ ok: false, error: "not_found" }); return null; }
+  const who = await parkActor(req, found.uuid);
+  if (!who.ok) { res.status(who.status).json(who.body); return null; }
+  if (!who.token_hash) { res.status(403).json({ ok: false, error: "Log in to listen." }); return null; }
+  return { stationUuid: found.uuid, who };
+}
+app.post("/public/ops/:slug/listen", async (req, res) => {
+  try {
+    const ctx = await listenStation(req, res); if (!ctx) return;
+    if (!listenRelayConfigured()) return res.status(503).json({ ok: false, error: "Listen isn't set up on the server yet." });
+    const cfgRows = await ccRows(ctx.stationUuid, "ops_config");
+    const cfg = cfgRows.find(r => r && r.uuid === "ops") || null;
+    if (!(cfg && cfg.listen && cfg.listen.ready)) return res.status(409).json({ ok: false, error: "Listen isn't set up on this station yet (Ether → Preferences → Park page — Listen)." });
+    const o = parkListen.open(ctx.stationUuid, ctx.who.token_hash);
+    if (o.tellStation) {
+      const t = await tellStationListen(ctx.stationUuid, true, o.publishToken);
+      if (!t.ok) { parkListen.close(o.ticket); return res.status(t.status).json(t.body); }
+    }
+    await parkAudit(ctx.stationUuid, ctx.who.actor, "started listening", null);
+    res.json({ ok: true, ticket: o.ticket, whep: `${String(process.env.PARK_LISTEN_WHEP_BASE).replace(/\/+$/, "")}/${listenPathOf(ctx.stationUuid)}/whep`,
+               buffer_ms: Number.isFinite(Number(cfg.listen.buffer_ms)) ? Number(cfg.listen.buffer_ms) : null });
+  } catch (e) { console.error("[public/ops listen]", e.message); res.status(500).json({ ok: false, error: "server_error" }); }
+});
+app.post("/public/ops/:slug/listen/renew", async (req, res) => {
+  try {
+    const ctx = await listenStation(req, res); if (!ctx) return;
+    const r = parkListen.renew(String(req.body?.ticket || ""), ctx.who.token_hash);
+    if (!r.ok) return res.status(410).json({ ok: false, error: "Listening stopped. Press Listen again." });
+    if (r.tellStation) {
+      const t = await tellStationListen(r.station, true, r.publishToken);
+      if (!t.ok) return res.status(t.status).json(t.body);
+    }
+    res.json({ ok: true });
+  } catch (e) { console.error("[public/ops listen renew]", e.message); res.status(500).json({ ok: false, error: "server_error" }); }
+});
+app.post("/public/ops/:slug/listen/stop", async (req, res) => {
+  try {
+    const c = parkListen.close(String(req.body?.ticket || ""));
+    if (c.ok && c.stopStation) await tellStationListen(c.station, false).catch(() => {});
+    res.json({ ok: true });
+  } catch (e) { console.error("[public/ops listen stop]", e.message); res.status(500).json({ ok: false, error: "server_error" }); }
+});
+// Lapsed listeners (a phone that vanished): stop their stations. The station's own lease stops it anyway.
+setInterval(() => {
+  for (const s of parkListen.sweep()) tellStationListen(s, false).catch(() => {});
+}, 10 * 1000).unref();
+// The relay's question (MediaMTX authMethod: http): 2xx = allowed, anything else = refused.
+app.post("/internal/mediamtx/auth", (req, res) => {
+  const want = process.env.MEDIAMTX_AUTH_SECRET || "";
+  if (want && String(req.query.s || "") !== want) return res.status(401).end();
+  const b = req.body || {};
+  const path = String(b.path || ""), action = String(b.action || "");
+  const token = String(b.token || b.password || "");
+  const ok = action === "publish" ? parkListen.canPublish(path, token)
+           : action === "read"    ? parkListen.canRead(path, token)
+           : false;
+  res.status(ok ? 200 : 401).end();
 });
 
 // SSE stream of now-playing for a public station. Mirrors /api/cmd-stream:
