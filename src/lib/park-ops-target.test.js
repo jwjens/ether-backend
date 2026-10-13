@@ -51,9 +51,22 @@ test("closing time: the display mirror is written only AFTER the command was del
 test("the park's sound routes are gated and aimed like every station control", () => {
   const a = src.indexOf("async function parkSoundWrite(");
   const body = src.slice(a, src.indexOf("\n}\n", a));
-  assert.ok(body.includes("station_ops_token") && body.includes("403"), "token-gated (view-only copies cannot change it)");
+  assert.ok(body.includes("await parkActor(req, stationUuid)"), "gated by the one Park check (login or the long key)");
   assert.ok(body.includes("stampStationCommand(licenseId, cmd"), "stamped by the one stamping function");
   assert.ok(body.includes("target_connected === false") && body.includes("targetOffline"), "an offline machine is told, never queued");
   assert.ok(/app\.put\("\/public\/ops\/:slug\/level"[\s\S]*?parkSoundWrite\(req, res, "ops:set-level"/.test(src), "PUT …/level → ops:set-level");
   assert.ok(/app\.put\("\/public\/ops\/:slug\/mute"[\s\S]*?parkSoundWrite\(req, res, "ops:set-mute"/.test(src), "PUT …/mute → ops:set-mute");
+});
+
+// 2026-10-13 — staff login: every Park page change goes through ONE check (parkActor): a logged-in staff session,
+// re-verified on every request, or — for now — the long ?k= key. Nothing else may change anything.
+test("every Park page change is gated by the one Park check, and refuses everyone else with 403", () => {
+  for (const needle of ['app.put("/public/ops/:slug/closing-time"', 'app.post("/public/ops/:slug/fire"']) {
+    assert.match(route(needle), /const who = await parkActor\(req, stationUuid\);\s*if \(!who\.ok\) return res\.status\(who\.status\)\.json\(who\.body\);/, needle);
+  }
+  const a = src.indexOf("async function parkActor(");
+  const body = src.slice(a, src.indexOf("\n}\n", a));
+  assert.ok(body.includes("x-park-session") && body.includes("sessionVerdict"), "a staff session, re-checked every request");
+  assert.ok(body.includes("station_ops_token"), "the long key still works");
+  assert.ok(body.includes("status: 403"), "anyone else is refused");
 });
