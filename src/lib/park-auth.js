@@ -4,11 +4,11 @@
 //
 // The users are account_users: the people created in Ether → Settings → Users & Security (mirrored up) or on the
 // Remote page, each with a username and a 4-digit PIN in the shared "salt:sha256" form. The Park page adds only:
-//   · WHO MAY use a station's Park page — the account's ADMINS, on every station of the account (Jeff, 2026-10-13:
-//     "Admins can use every station's Park page"). Per-station access is not built: it goes in Ether's Users &
-//     Security only after Jeff approves a screenshot;
+//   · WHO MAY use a station's Park page — ANY user of the station's account, any role (Jeff, 2026-10-13: "any user I
+//     created in Ether (any role) can log in to their own account's Park page with their name and PIN. No admin-only
+//     rule."). Per-station access is not built: it goes in Ether's Users & Security only after Jeff approves a screenshot;
 //   · A DEVICE SESSION — a random token the page keeps, stored here only as its sha256. It stays good until Log out,
-//     until that user's PIN changes, until the user is removed, or until they are no longer an admin. All four are
+//     until that user's PIN changes, or until the user is removed. All three are
 //     checked on EVERY request (sessionVerdict), so a change logs the device out at once;
 //   · THE SAME LOCKOUT the Remote page login uses (account_users.failed_attempts / locked_until), its two numbers
 //     now visible settings per account (lockoutRule) instead of constants in code.
@@ -28,13 +28,10 @@ const tokenHash = (token) => sha256(token);
  *  the old PIN is refused. (The PIN itself is never stored here.) */
 const pinFingerprint = (pinHash) => sha256('park-pin:' + String(pinHash || ''));
 
-/** Admins may use every station's Park page. */
-const isAdmin = (user) => !!user && String(user.role || '').toLowerCase() === 'admin';
-
 /**
  * Is this device session still good?
  * @param {{ended_at:any, pin_fp:string, station_uuid:string}|null} session
- * @param {{pin_hash:string, role:string}|null} user   the live account_users row for that username (null = removed)
+ * @param {{pin_hash:string}|null} user   the live account_users row for that username (null = removed)
  * @param {string} stationUuid                 the station the request is for
  * @returns {{ok:true}|{ok:false, reason:string, message:string}}
  */
@@ -44,7 +41,6 @@ function sessionVerdict(session, user, stationUuid) {
   if (session.station_uuid !== stationUuid) return { ok: false, reason: 'other_station', message: 'This login is for a different station. Please log in here.' };
   if (!user) return { ok: false, reason: 'user_removed', message: 'This user was removed. Ask the station manager.' };
   if (pinFingerprint(user.pin_hash) !== session.pin_fp) return { ok: false, reason: 'pin_changed', message: 'Your PIN was changed. Please log in with the new PIN.' };
-  if (!isAdmin(user)) return { ok: false, reason: 'not_admin', message: 'Only admins can use the Park page.' };
   return { ok: true };
 }
 
@@ -70,4 +66,4 @@ function validSettings(body) {
   return { ok: true, maxFails, lockoutMinutes };
 }
 
-module.exports = { newSession, tokenHash, pinFingerprint, isAdmin, sessionVerdict, lockoutRule, afterWrongPin, validSettings, LOCKOUT_START };
+module.exports = { newSession, tokenHash, pinFingerprint, sessionVerdict, lockoutRule, afterWrongPin, validSettings, LOCKOUT_START };

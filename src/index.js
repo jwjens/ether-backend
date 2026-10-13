@@ -5651,7 +5651,7 @@ async function parkActor(req, stationUuid) {
     let user = null;
     if (s) {
       user = (await pool.query(
-        `SELECT id, username, display_name, role, pin_hash FROM account_users
+        `SELECT id, username, display_name, pin_hash FROM account_users
           WHERE license_key_id = $1 AND lower(username) = $2 AND deleted_at IS NULL`, [s.license_key_id, s.username_lower])).rows[0] || null;
     }
     const v = parkAuth.sessionVerdict(s, user, stationUuid);
@@ -5709,7 +5709,6 @@ app.post("/public/ops/:slug/login", authLimiter, async (req, res) => {
     await pool.query(`UPDATE account_users SET failed_attempts = 0, locked_until = NULL, updated_at = NOW() WHERE id = $1`, [user.id]);
     const ul = String(user.username).toLowerCase();
     const name = user.display_name || user.username;
-    if (!parkAuth.isAdmin(user)) return res.status(403).json({ ok: false, error: `Only admins can use the Park page. ${name} is not an admin.` });
 
     const sess = parkAuth.newSession();
     await pool.query(

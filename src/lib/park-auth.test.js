@@ -20,11 +20,8 @@ test('changing the PIN logs every device out', () => {
 test('removing the user logs every device out', () => {
   assert.strictEqual(A.sessionVerdict(live(), null, S).reason, 'user_removed');
 });
-test('admins only: a user who is no longer an admin is logged out', () => {
-  assert.strictEqual(A.sessionVerdict(live(), { pin_hash: PIN_HASH, role: 'user' }, S).reason, 'not_admin');
-  assert.strictEqual(A.isAdmin({ role: 'Admin' }), true);
-  assert.strictEqual(A.isAdmin({ role: 'user' }), false);
-  assert.strictEqual(A.isAdmin(null), false);
+test('any role: a non-admin user stays logged in', () => {
+  assert.deepStrictEqual(A.sessionVerdict(live(), { pin_hash: PIN_HASH, role: 'user' }, S), { ok: true });
 });
 test('a login for one station does not work on another', () => {
   assert.strictEqual(A.sessionVerdict(live(), { pin_hash: PIN_HASH, role: 'admin' }, 'other').reason, 'other_station');
