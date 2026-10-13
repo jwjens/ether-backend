@@ -50,7 +50,8 @@ const jwt        = require('jsonwebtoken');
 const rateLimit  = require('express-rate-limit');
 const { validateSlug } = require("./slug");
 const opsCore = require("./ops-core");   // Park Ops: closing-time resolution + sanity rails
-const { deriveStationState, parseSourceFields, resolveSourceMachineId, sourceFields } = require("./station-state"); // honest state (Slice 1) + source/last_error (Slice 2)
+const { deriveStationState, parseSourceFields, resolveSourceMachineId, sourceFields } = require("./station-state");
+const broadcastOwner = require("./lib/broadcast-owner"); // ONE broadcast owner per station (2026-10-13)
 const cmdBus = require("./lib/cmd-bus");   // web remote slice 2: per-machine delivery (targeted commands)
 const { parkOpsRefusal } = cmdBus;
 const { isStationScopedCommand, stampTarget } = require("./lib/station-commands");   // web remote slice 1: a station control targets the sourcing machine
@@ -513,6 +514,22 @@ async function initDB() {
   await pool.query(`ALTER TABLE station_now_playing ADD COLUMN IF NOT EXISTS source_machine_id_at TIMESTAMPTZ`);
   await pool.query(`ALTER TABLE station_now_playing ADD COLUMN IF NOT EXISTS last_error TEXT`);
   await pool.query(`ALTER TABLE station_now_playing ADD COLUMN IF NOT EXISTS last_error_at TIMESTAMPTZ`);
+  // ONE BROADCAST OWNER (2026-10-13, lib/broadcast-owner.js): source_machine_id IS the owner, source_machine_id_at
+  // its last report; owner_since = when it took the broadcast (an error from before that is history).
+  await pool.query(`ALTER TABLE station_now_playing ADD COLUMN IF NOT EXISTS owner_since TIMESTAMPTZ`);
+  // Every machine that reports for a station, owner or not — the standby list, and each machine's last report
+  // (a gap before a claim is how the server sees "go live").
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS station_report_machines (
+      station_uuid   TEXT NOT NULL REFERENCES stations(uuid) ON DELETE CASCADE,
+      machine_id     TEXT NOT NULL,
+      last_report_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      engine_state   TEXT,
+      playing        BOOLEAN,
+      title          TEXT,
+      PRIMARY KEY (station_uuid, machine_id)
+    )
+  `);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS station_metadata (
       station_uuid    TEXT PRIMARY KEY REFERENCES stations(uuid) ON DELETE CASCADE,
@@ -2508,7 +2525,7 @@ app.get("/api/account/stations", requireAuth, async (req, res) => {
               m.description, m.public_enabled, m.stream_url,
               n.playing, n.title, n.artist, n.deck, n.decks, n.started_at, n.duration_sec, n.queue,
               n.engine_state, COALESCE(n.engine_heartbeat_at, n.updated_at) AS engine_heartbeat_at,
-              n.source_machine_id, n.source_machine_id_at, n.last_error, n.last_error_at,
+              n.source_machine_id, n.source_machine_id_at, n.last_error, n.last_error_at, n.owner_since,
               (SELECT la.machine_name FROM license_activations la
                 WHERE la.machine_id = n.source_machine_id ORDER BY la.last_seen DESC LIMIT 1) AS source_machine_name,
               n.updated_at AS now_playing_updated_at
@@ -2522,6 +2539,7 @@ app.get("/api/account/stations", requireAuth, async (req, res) => {
     // #2b: membership-first station scoping (flagged; null = legacy result, unchanged).
     const filter = await membershipStationFilter(req, req.auth.lk);
     const visible = filter ? rows.filter(r => filter.has(r.uuid)) : rows;
+    const standby = await standbyByStation(visible);
     const stations = visible.map(r => ({
       uuid: r.uuid, name: r.name, nickname: r.nickname, frequency: r.frequency,
       call_letters: r.call_letters, created_at: r.created_at,
@@ -2544,8 +2562,10 @@ app.get("/api/account/stations", requireAuth, async (req, res) => {
         // sticks on a machine that's gone; the friendly name follows the resolved id.
         // Web remote slice 2: the fresh view AND the last sourcer (last_source_machine_id / _name / last_source_at).
         ...sourceFields(r),
-        last_error: r.last_error || null,
-        last_error_at: r.last_error_at || null,
+        // The error of THIS broadcast only — one from before the owner took it, or long recovered, is history.
+        ...shownError(r),
+        // Other machines reporting for this station that do not hold the broadcast ("ovowforestmusic: standby").
+        standby: standby.get(r.uuid) || [],
       } : null,
     }));
     return res.json({ stations });
@@ -2952,7 +2972,7 @@ app.get("/api/accounts/:accountId/stations", requireMember(), async (req, res) =
               m.description, m.public_enabled, m.stream_url,
               n.playing, n.title, n.artist, n.deck, n.decks, n.started_at, n.duration_sec, n.queue,
               n.engine_state, COALESCE(n.engine_heartbeat_at, n.updated_at) AS engine_heartbeat_at,
-              n.source_machine_id, n.source_machine_id_at, n.last_error, n.last_error_at,
+              n.source_machine_id, n.source_machine_id_at, n.last_error, n.last_error_at, n.owner_since,
               (SELECT la.machine_name FROM license_activations la
                 WHERE la.machine_id = n.source_machine_id ORDER BY la.last_seen DESC LIMIT 1) AS source_machine_name,
               n.updated_at AS now_playing_updated_at
@@ -2963,6 +2983,7 @@ app.get("/api/accounts/:accountId/stations", requireMember(), async (req, res) =
         ORDER BY s.created_at ASC`,
       [req.accountId]);
     const visible = scope === null ? rows : rows.filter(r => scope.has(r.uuid));
+    const standby = await standbyByStation(visible);
     const stations = visible.map(r => ({
       uuid: r.uuid, name: r.name, nickname: r.nickname, frequency: r.frequency,
       call_letters: r.call_letters, created_at: r.created_at,
@@ -2983,8 +3004,10 @@ app.get("/api/accounts/:accountId/stations", requireMember(), async (req, res) =
         // sticks on a machine that's gone; the friendly name follows the resolved id.
         // Web remote slice 2: the fresh view AND the last sourcer (last_source_machine_id / _name / last_source_at).
         ...sourceFields(r),
-        last_error: r.last_error || null,
-        last_error_at: r.last_error_at || null,
+        // The error of THIS broadcast only — one from before the owner took it, or long recovered, is history.
+        ...shownError(r),
+        // Other machines reporting for this station that do not hold the broadcast ("ovowforestmusic: standby").
+        standby: standby.get(r.uuid) || [],
       } : null,
     }));
     res.json({ account_id: req.accountId, position: req.member.position, can_edit: !!(req.member.permissions && req.member.permissions.edit_programming), stations });
@@ -5009,6 +5032,40 @@ app.post("/webhook/stripe", async (req, res) => {
 
 // ── Now Playing ───────────────────────────────────────────────
 
+/** The stream error to show on a station card (lib/broadcast-owner.js currentError), as the two list fields. */
+function shownError(r) {
+  const state = deriveStationState(r.engine_state, r.engine_heartbeat_at, r.playing);
+  const e = broadcastOwner.currentError({ last_error: r.last_error, last_error_at: r.last_error_at, owner_since: r.owner_since, state }, Date.now());
+  return { last_error: e ? e.last_error : null, last_error_at: e ? e.last_error_at : null };
+}
+
+/**
+ * Standby machines per station: every machine that reported for it in the last 5 minutes and is NOT the owner,
+ * with its friendly name and what it last said. Shown on the Remote page as "<machine>: standby", never as the source.
+ */
+async function standbyByStation(rows) {
+  const out = new Map();
+  const uuids = rows.map(r => r.uuid).filter(Boolean);
+  if (!uuids.length) return out;
+  const ownerOf = new Map(rows.map(r => [r.uuid, r.source_machine_id || null]));
+  try {
+    const { rows: rep } = await pool.query(
+      `SELECT r.station_uuid, r.machine_id, r.last_report_at, r.engine_state, r.playing,
+              (SELECT la.machine_name FROM license_activations la WHERE la.machine_id = r.machine_id
+                ORDER BY la.last_seen DESC LIMIT 1) AS machine_name
+         FROM station_report_machines r
+        WHERE r.station_uuid = ANY($1) AND r.last_report_at > NOW() - INTERVAL '5 minutes'
+        ORDER BY r.last_report_at DESC`, [uuids]);
+    for (const x of rep) {
+      if (x.machine_id === ownerOf.get(x.station_uuid)) continue;
+      if (!out.has(x.station_uuid)) out.set(x.station_uuid, []);
+      out.get(x.station_uuid).push({ machine_id: x.machine_id, machine_name: x.machine_name || null,
+        last_report_at: x.last_report_at, engine_state: x.engine_state || null, playing: !!x.playing });
+    }
+  } catch (e) { console.warn("[standby] lookup skipped:", e.message); }
+  return out;
+}
+
 // Resolve the license + station_uuid the desktop app sends and upsert the live
 // per-station now-playing row (Listener Platform / Control Center foundation).
 // Keyed on (license_key_id, station_uuid): if the uuid isn't a backend-known
@@ -5055,18 +5112,44 @@ async function upsertStationNowPlaying(rawKey, body) {
   //   - last_error/_at         : COALESCE — the last error survives a later clean report.
   const { source_machine_id, last_error, last_error_at } = parseSourceFields(body);
 
-  await pool.query(
+  // ONE BROADCAST OWNER (2026-10-13). Decide under a row lock whether this report is the owner's (applied) or a
+  // standby machine's (recorded, never applied) — two machines posting a few seconds apart can't both win.
+  const client = await pool.connect();
+  let applied = false;
+  try {
+    await client.query("BEGIN");
+    const cur = (await client.query(
+      `SELECT source_machine_id, source_machine_id_at, engine_state, owner_since FROM station_now_playing WHERE station_uuid = $1 FOR UPDATE`,
+      [body.station_uuid])).rows[0] || null;
+    const prior = source_machine_id ? ((await client.query(
+      `SELECT last_report_at FROM station_report_machines WHERE station_uuid = $1 AND machine_id = $2`,
+      [body.station_uuid, source_machine_id])).rows[0] || null) : null;
+    const owner = cur && cur.source_machine_id
+      ? { machine_id: cur.source_machine_id, seen_at: cur.source_machine_id_at, engine_state: cur.engine_state } : null;
+    const verdict = broadcastOwner.decideReport({ owner, claimant: { machine_id: source_machine_id, engine_state: engineState }, prior, now: Date.now() });
+    if (source_machine_id) {
+      await client.query(
+        `INSERT INTO station_report_machines (station_uuid, machine_id, last_report_at, engine_state, playing, title)
+         VALUES ($1,$2,NOW(),$3,$4,$5)
+         ON CONFLICT (station_uuid, machine_id) DO UPDATE SET last_report_at=NOW(), engine_state=$3, playing=$4, title=$5`,
+        [body.station_uuid, source_machine_id, engineState, playing, body.title ?? null]);
+    }
+    if (verdict.take) console.log(`[now-playing] ${body.station_uuid}: broadcast owner -> ${source_machine_id} (${verdict.reason}; was ${owner ? owner.machine_id : "none"})`);
+    if (verdict.apply) {
+      applied = true;
+      await client.query(
     `INSERT INTO station_now_playing
-       (station_uuid, playing, title, artist, deck, started_at, position_sec, duration_sec, queue, art_url, decks, engine_state, engine_heartbeat_at, source_machine_id, source_machine_id_at, last_error, last_error_at, content_class, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, NOW(), $13::text, CASE WHEN $13::text IS NOT NULL THEN NOW() ELSE NULL END, $14::text, $15::timestamptz, $16::text, NOW())
+       (station_uuid, playing, title, artist, deck, started_at, position_sec, duration_sec, queue, art_url, decks, engine_state, engine_heartbeat_at, source_machine_id, source_machine_id_at, last_error, last_error_at, content_class, updated_at, owner_since)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, NOW(), $13::text, CASE WHEN $13::text IS NOT NULL THEN NOW() ELSE NULL END, $14::text, $15::timestamptz, $16::text, NOW(), NOW())
      ON CONFLICT (station_uuid) DO UPDATE SET
        playing=$2, title=$3, artist=$4, deck=$5, started_at=$6,
        position_sec=$7, duration_sec=$8, queue=$9, art_url=$10, decks=$11,
        engine_state=$12, engine_heartbeat_at=NOW(),
        source_machine_id=COALESCE($13::text, station_now_playing.source_machine_id),
        source_machine_id_at=CASE WHEN $13::text IS NOT NULL THEN NOW() ELSE station_now_playing.source_machine_id_at END,
-       last_error=COALESCE($14::text, station_now_playing.last_error),
-       last_error_at=COALESCE($15::timestamptz, station_now_playing.last_error_at),
+       last_error=CASE WHEN $17::boolean THEN $14::text ELSE COALESCE($14::text, station_now_playing.last_error) END,
+       last_error_at=CASE WHEN $17::boolean THEN $15::timestamptz ELSE COALESCE($15::timestamptz, station_now_playing.last_error_at) END,
+       owner_since=CASE WHEN $17::boolean OR station_now_playing.owner_since IS NULL THEN NOW() ELSE station_now_playing.owner_since END,
        content_class=$16::text,
        updated_at=NOW()`,
     [
@@ -5075,8 +5158,19 @@ async function upsertStationNowPlaying(rawKey, body) {
       JSON.stringify(Array.isArray(body.queue) ? body.queue : []),
       body.art_url ?? null, decksJson, engineState,
       source_machine_id, last_error, last_error_at, contentClass,
+      // A NEW owner starts clean: the old owner's error is not this broadcast's.
+      !!verdict.take,
     ]
   );
+    }
+    await client.query("COMMIT");
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch { /* ignore */ }
+    throw e;
+  } finally {
+    client.release();
+  }
+  if (!applied) return;   // a standby machine's report: recorded above, never shown, never broadcast
 
   // Broadcast to public listeners (Phase 3) — only if this station has a
   // published public slug. now-playing-only per the Phase 3 decision. Wrapped

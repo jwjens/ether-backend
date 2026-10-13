@@ -27,6 +27,7 @@ const STATION_SCOPED = new Set([
   "stream:restart",   // the web's Restart = a stream restart on the target (web remote slice 4)
   "cart:fire",
   "ops:set-closing",
+  "ops:set-level", "ops:set-mute",   // the Park page's sound (2026-10-13) -- aimed at the owner like every control
 ]);
 
 function isStationScopedCommand(cmd) {
