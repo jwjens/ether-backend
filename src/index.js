@@ -52,6 +52,7 @@ const { validateSlug } = require("./slug");
 const opsCore = require("./ops-core");   // Park Ops: closing-time resolution + sanity rails
 const { deriveStationState, parseSourceFields, resolveSourceMachineId, sourceFields } = require("./station-state");
 const broadcastOwner = require("./lib/broadcast-owner"); // ONE broadcast owner per station (2026-10-13)
+const parkAuth = require("./lib/park-auth");             // Park page staff login with the existing username + PIN users
 const cmdBus = require("./lib/cmd-bus");   // web remote slice 2: per-machine delivery (targeted commands)
 const { parkOpsRefusal } = cmdBus;
 const { isStationScopedCommand, stampTarget } = require("./lib/station-commands");   // web remote slice 1: a station control targets the sourcing machine
@@ -66,8 +67,8 @@ if (!process.env.JWT_SECRET) {
   console.warn("[AUTH] JWT_SECRET not set — using an ephemeral per-boot secret (dashboard sessions reset on restart). Set JWT_SECRET in production.");
 }
 const JWT_TTL = "12h";                       // access-token lifetime
-const PIN_MAX_FAILS = 5;                     // wrong PINs before lockout
-const PIN_LOCKOUT_MS = 15 * 60 * 1000;       // lockout duration
+// Wrong-PIN lockout: the account's own settings (account_security_settings; Remote page -> Users -> Login safety),
+// read by lockoutRuleFor. They were constants here (5 tries / 15 min) -- now the values used until an account saves its own.
 
 // multer is optional — install with: npm install multer
 let multer;
@@ -591,6 +592,53 @@ async function initDB() {
   // desktop install's local console users). The install push only ever touches its
   // own 'install' rows, so it can never clobber a dashboard-managed user.
   await pool.query(`ALTER TABLE account_users ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'dashboard'`);
+
+  // ── Park page staff login (2026-10-13, lib/park-auth.js) ───────────────────
+  // The SAME username + PIN users (account_users). Added: the account's lockout numbers as settings (they were
+  // constants: 5 tries / 15 min), who may use which station's Park page, device sessions, and the who-did-what log.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS account_security_settings (
+      license_key_id      INTEGER PRIMARY KEY REFERENCES licenses(id) ON DELETE CASCADE,
+      pin_max_fails       INTEGER NOT NULL,
+      pin_lockout_minutes INTEGER NOT NULL,
+      updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  // Keyed by USERNAME (lower), not account_users.id: an install's user mirror can re-create a row under a new id.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS park_access (
+      license_key_id INTEGER NOT NULL REFERENCES licenses(id) ON DELETE CASCADE,
+      username_lower TEXT NOT NULL,
+      station_uuid   TEXT NOT NULL REFERENCES stations(uuid) ON DELETE CASCADE,
+      granted_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (license_key_id, username_lower, station_uuid)
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS park_sessions (
+      token_hash     TEXT PRIMARY KEY,
+      license_key_id INTEGER NOT NULL REFERENCES licenses(id) ON DELETE CASCADE,
+      username_lower TEXT NOT NULL,
+      station_uuid   TEXT NOT NULL REFERENCES stations(uuid) ON DELETE CASCADE,
+      pin_fp         TEXT NOT NULL,
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_seen_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      ended_at       TIMESTAMPTZ,
+      end_reason     TEXT
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS park_audit (
+      id           SERIAL PRIMARY KEY,
+      station_uuid TEXT NOT NULL REFERENCES stations(uuid) ON DELETE CASCADE,
+      actor        TEXT NOT NULL,
+      via          TEXT NOT NULL,
+      action       TEXT NOT NULL,
+      detail       JSONB,
+      at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_park_audit_station_at ON park_audit (station_uuid, at DESC)`);
 
   // ── Library grants (master-catalog cross-license read access) ──────────────
   // A grant lets the GRANTEE license READ the OWNER license's install-scope music
@@ -2433,13 +2481,13 @@ app.post("/api/auth/login", authLimiter, async (req, res) => {
     }
 
     if (!verifyPin(pin, user.pin_hash)) {
-      const fails = (user.failed_attempts || 0) + 1;
-      const lock = fails >= PIN_MAX_FAILS ? new Date(Date.now() + PIN_LOCKOUT_MS) : null;
+      // The account's lockout settings (Remote page → Users → Login safety) — the Park page login uses the same.
+      const r = parkAuth.afterWrongPin(user.failed_attempts, await lockoutRuleFor(license.id), Date.now());
       await pool.query(
         `UPDATE account_users SET failed_attempts = $1, locked_until = $2, updated_at = NOW() WHERE id = $3`,
-        [lock ? 0 : fails, lock, user.id]
+        [r.failed_attempts, r.locked_until, user.id]
       );
-      if (lock) return res.status(423).json({ error: "locked", until: lock });
+      if (r.locked_until) return res.status(423).json({ error: "locked", until: r.locked_until });
       return res.status(401).json({ error: "invalid_credentials" });
     }
 
@@ -5595,6 +5643,177 @@ app.post("/api/ops/token", async (req, res) => {
 // it stick. And it emits a db:apply on the command bus so the STATION's own database changes, which
 // is what actually governs what airs. emitCommand queues when no install is connected and drains on
 // reconnect, so a change made while the park's machine is off still lands when it comes back.
+// ── Park page staff login (2026-10-13) ─────────────────────────────────────────────────────────────────────────────
+/** The account's lockout rule (Remote page → Users → Login safety); unset = the values that applied before. */
+async function lockoutRuleFor(licenseId) {
+  const { rows } = await pool.query(`SELECT pin_max_fails, pin_lockout_minutes FROM account_security_settings WHERE license_key_id = $1`, [licenseId]);
+  return parkAuth.lockoutRule(rows[0] || null);
+}
+/**
+ * WHO is making this Park page change. A logged-in staff device (x-park-session) — re-checked on every request: logged
+ * out, PIN changed, user removed or Park access taken away all refuse it — or, for now, the long ?k= key (Jeff: keep
+ * it working until he says to remove it). Neither → refused.
+ */
+async function parkActor(req, stationUuid) {
+  const tok = String(req.headers["x-park-session"] || "");
+  if (tok) {
+    const s = (await pool.query(`SELECT * FROM park_sessions WHERE token_hash = $1`, [parkAuth.tokenHash(tok)])).rows[0] || null;
+    let user = null, access = false;
+    if (s) {
+      user = (await pool.query(
+        `SELECT id, username, display_name, pin_hash FROM account_users
+          WHERE license_key_id = $1 AND lower(username) = $2 AND deleted_at IS NULL`, [s.license_key_id, s.username_lower])).rows[0] || null;
+      access = (await pool.query(
+        `SELECT 1 FROM park_access WHERE license_key_id = $1 AND username_lower = $2 AND station_uuid = $3`,
+        [s.license_key_id, s.username_lower, stationUuid])).rows.length > 0;
+    }
+    const v = parkAuth.sessionVerdict(s, user, access, stationUuid);
+    if (!v.ok) {
+      if (s && !s.ended_at) await pool.query(`UPDATE park_sessions SET ended_at = NOW(), end_reason = $2 WHERE token_hash = $1`, [s.token_hash, v.reason]);
+      return { ok: false, status: 401, body: { ok: false, error: v.message, reason: v.reason, logged_out: true } };
+    }
+    await pool.query(`UPDATE park_sessions SET last_seen_at = NOW() WHERE token_hash = $1`, [s.token_hash]);
+    return { ok: true, actor: { name: user.display_name || user.username, username: user.username, via: "login" }, token_hash: s.token_hash };
+  }
+  const supplied = String(req.query.k || req.headers["x-ops-token"] || "");
+  if (supplied) {
+    const { rows } = await pool.query(`SELECT token FROM station_ops_token WHERE station_uuid = $1`, [stationUuid]);
+    if (rows.length && supplied === rows[0].token) return { ok: true, actor: { name: "Staff link (long key)", username: null, via: "key" } };
+  }
+  return { ok: false, status: 403, body: { ok: false, error: "Log in to make changes." } };
+}
+/** The who-did-what log (Remote page → Users → Park page activity). Never blocks the change it records. */
+async function parkAudit(stationUuid, actor, action, detail) {
+  try {
+    await pool.query(`INSERT INTO park_audit (station_uuid, actor, via, action, detail) VALUES ($1,$2,$3,$4,$5)`,
+      [stationUuid, actor.name, actor.via, action, detail ? JSON.stringify(detail) : null]);
+  } catch (e) { console.warn("[park audit] not recorded:", e.message); }
+}
+
+// LOG IN: the station's account, the user's username + PIN, the account's lockout rule, and this user's Park access for
+// THIS station. A device session comes back; the page keeps it until Log out.
+app.post("/public/ops/:slug/login", authLimiter, async (req, res) => {
+  const slug = String(req.params.slug || "").toLowerCase();
+  try {
+    const found = await resolveOpsSlug(slug);
+    if (!found || found.redirect) return res.status(404).json({ ok: false, error: "not_found" });
+    const stationUuid = found.uuid;
+    const { rows: st } = await pool.query(`SELECT license_key_id FROM stations WHERE uuid = $1`, [stationUuid]);
+    if (!st.length) return res.status(404).json({ ok: false, error: "not_found" });
+    const licenseId = st[0].license_key_id;
+    const username = normUsername(req.body?.username);
+    const pin = String(req.body?.pin || "");
+    if (!username || !pin) return res.status(400).json({ ok: false, error: "Enter your username and PIN." });
+
+    const user = (await pool.query(
+      `SELECT * FROM account_users WHERE license_key_id = $1 AND lower(username) = lower($2) AND deleted_at IS NULL`,
+      [licenseId, username])).rows[0];
+    if (!user) return res.status(401).json({ ok: false, error: "Wrong username or PIN." });
+    if (user.locked_until && new Date(user.locked_until) > new Date()) {
+      return res.status(423).json({ ok: false, error: "Too many wrong PINs. Try again later.", until: user.locked_until });
+    }
+    if (!verifyPin(pin, user.pin_hash)) {
+      const r = parkAuth.afterWrongPin(user.failed_attempts, await lockoutRuleFor(licenseId), Date.now());
+      await pool.query(`UPDATE account_users SET failed_attempts = $1, locked_until = $2, updated_at = NOW() WHERE id = $3`,
+        [r.failed_attempts, r.locked_until, user.id]);
+      if (r.locked_until) return res.status(423).json({ ok: false, error: "Too many wrong PINs. Try again later.", until: r.locked_until });
+      return res.status(401).json({ ok: false, error: "Wrong username or PIN." });
+    }
+    await pool.query(`UPDATE account_users SET failed_attempts = 0, locked_until = NULL, updated_at = NOW() WHERE id = $1`, [user.id]);
+    const ul = String(user.username).toLowerCase();
+    const allowed = (await pool.query(`SELECT 1 FROM park_access WHERE license_key_id = $1 AND username_lower = $2 AND station_uuid = $3`,
+      [licenseId, ul, stationUuid])).rows.length > 0;
+    const name = user.display_name || user.username;
+    if (!allowed) return res.status(403).json({ ok: false, error: `${name} isn't allowed on this station's Park page. Ask the station manager.` });
+
+    const sess = parkAuth.newSession();
+    await pool.query(
+      `INSERT INTO park_sessions (token_hash, license_key_id, username_lower, station_uuid, pin_fp) VALUES ($1,$2,$3,$4,$5)`,
+      [sess.tokenHash, licenseId, ul, stationUuid, parkAuth.pinFingerprint(user.pin_hash)]);
+    await parkAudit(stationUuid, { name, via: "login" }, "logged in", null);
+    res.json({ ok: true, token: sess.token, name });
+  } catch (e) {
+    console.error("[public/ops login]", e.message);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+// WHO AM I: the page asks on load and every refresh, so a PIN change / removal / lost access shows at once.
+app.get("/public/ops/:slug/me", async (req, res) => {
+  const slug = String(req.params.slug || "").toLowerCase();
+  try {
+    const found = await resolveOpsSlug(slug);
+    if (!found || found.redirect) return res.status(404).json({ ok: false, error: "not_found" });
+    if (!req.headers["x-park-session"]) return res.json({ ok: false, reason: "no_session" });
+    const a = await parkActor(req, found.uuid);
+    if (!a.ok) return res.status(a.status).json(a.body);
+    res.json({ ok: true, name: a.actor.name });
+  } catch (e) { console.error("[public/ops me]", e.message); res.status(500).json({ ok: false, error: "server_error" }); }
+});
+app.post("/public/ops/:slug/logout", async (req, res) => {
+  const slug = String(req.params.slug || "").toLowerCase();
+  try {
+    const found = await resolveOpsSlug(slug);
+    const tok = String(req.headers["x-park-session"] || "");
+    if (found && found.uuid && tok) {
+      const a = await parkActor(req, found.uuid);
+      await pool.query(`UPDATE park_sessions SET ended_at = NOW(), end_reason = 'log_out' WHERE token_hash = $1 AND ended_at IS NULL`, [parkAuth.tokenHash(tok)]);
+      if (a.ok) await parkAudit(found.uuid, a.actor, "logged out", null);
+    }
+    res.json({ ok: true });
+  } catch (e) { console.error("[public/ops logout]", e.message); res.status(500).json({ ok: false, error: "server_error" }); }
+});
+
+// ── Remote page → Users: Park page access, login safety settings, Park page activity (admin) ───────────────────────
+app.get("/api/account/park", requireAuthAdmin, async (req, res) => {
+  try {
+    const { rows: stations } = await pool.query(
+      `SELECT s.uuid, s.name, m.slug FROM stations s JOIN station_metadata m ON m.station_uuid = s.uuid
+        WHERE s.license_key_id = $1 AND m.public_enabled = true AND m.slug IS NOT NULL ORDER BY s.name`, [req.auth.lk]);
+    const { rows: access } = await pool.query(`SELECT username_lower, station_uuid FROM park_access WHERE license_key_id = $1`, [req.auth.lk]);
+    const { rows: set } = await pool.query(`SELECT pin_max_fails, pin_lockout_minutes FROM account_security_settings WHERE license_key_id = $1`, [req.auth.lk]);
+    const rule = parkAuth.lockoutRule(set[0] || null);
+    res.json({ stations, access, settings: { pin_max_fails: rule.maxFails, pin_lockout_minutes: rule.lockoutMinutes, saved: !!set.length } });
+  } catch (e) { console.error("[account/park]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+app.put("/api/account/users/:id/park-access", requireAuthAdmin, async (req, res) => {
+  try {
+    const u = (await pool.query(`SELECT username FROM account_users WHERE id = $1 AND license_key_id = $2 AND deleted_at IS NULL`, [req.params.id, req.auth.lk])).rows[0];
+    if (!u) return res.status(404).json({ error: "not_found" });
+    const want = Array.isArray(req.body?.stations) ? req.body.stations.map(String) : null;
+    if (!want) return res.status(400).json({ error: "stations_required" });
+    if (want.length) {
+      const { rows } = await pool.query(`SELECT uuid FROM stations WHERE license_key_id = $1 AND uuid = ANY($2)`, [req.auth.lk, want]);
+      if (rows.length !== new Set(want).size) return res.status(400).json({ error: "station_not_in_account" });
+    }
+    const ul = String(u.username).toLowerCase();
+    await pool.query(`DELETE FROM park_access WHERE license_key_id = $1 AND username_lower = $2 AND NOT (station_uuid = ANY($3))`, [req.auth.lk, ul, want]);
+    for (const su of want) await pool.query(
+      `INSERT INTO park_access (license_key_id, username_lower, station_uuid) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [req.auth.lk, ul, su]);
+    res.json({ ok: true, stations: want });
+  } catch (e) { console.error("[account/users park-access]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+app.put("/api/account/security-settings", requireAuthAdmin, async (req, res) => {
+  try {
+    const v = parkAuth.validSettings(req.body);
+    if (!v.ok) return res.status(400).json({ error: v.error });
+    await pool.query(
+      `INSERT INTO account_security_settings (license_key_id, pin_max_fails, pin_lockout_minutes) VALUES ($1,$2,$3)
+       ON CONFLICT (license_key_id) DO UPDATE SET pin_max_fails = $2, pin_lockout_minutes = $3, updated_at = NOW()`,
+      [req.auth.lk, v.maxFails, v.lockoutMinutes]);
+    res.json({ ok: true, settings: { pin_max_fails: v.maxFails, pin_lockout_minutes: v.lockoutMinutes, saved: true } });
+  } catch (e) { console.error("[account/security-settings]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+app.get("/api/account/park-log", requireAuthAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 200));
+    const { rows } = await pool.query(
+      `SELECT a.at, a.actor, a.via, a.action, a.detail, s.name AS station
+         FROM park_audit a JOIN stations s ON s.uuid = a.station_uuid
+        WHERE s.license_key_id = $1 ORDER BY a.at DESC LIMIT $2`, [req.auth.lk, limit]);
+    res.json({ entries: rows });
+  } catch (e) { console.error("[account/park-log]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
 app.put("/public/ops/:slug/closing-time", async (req, res) => {
   const slug = String(req.params.slug || "").toLowerCase();
   try {
@@ -5602,13 +5821,8 @@ app.put("/public/ops/:slug/closing-time", async (req, res) => {
     if (!found || found.redirect) return res.status(404).json({ error: "not_found" });
     const stationUuid = found.uuid;
 
-    const supplied = String(req.query.k || req.headers["x-ops-token"] || "");
-    const { rows: tok } = await pool.query(
-      `SELECT token FROM station_ops_token WHERE station_uuid = $1`, [stationUuid]
-    );
-    if (!supplied || !tok.length || supplied !== tok[0].token) {
-      return res.status(403).json({ ok: false, error: "This copy is view-only. Open the full Park Ops link - the one ending in ?k= - to make changes." });
-    }
+    const who = await parkActor(req, stationUuid);
+    if (!who.ok) return res.status(who.status).json(who.body);
 
     const time = String(req.body?.time || "").trim();
     if (opsCore.hhmmToMin(time) == null) return res.status(400).json({ ok: false, error: "That is not a time." });
@@ -5675,6 +5889,7 @@ app.put("/public/ops/:slug/closing-time", async (req, res) => {
       [stationUuid, JSON.stringify(payload)]
     );
 
+    await parkAudit(stationUuid, who.actor, "changed tonight's closing time", { date: today, time: time.slice(0, 5) });
     const dow = (() => { const d = new Date(`${today}T00:00:00Z`); return isNaN(d) ? new Date().getUTCDay() : d.getUTCDay(); })();
     res.json({ ok: true, scope: "date", date: today, closing: { ...cfg, effective: opsCore.resolveClosing(cfg, today, dow) } });
   } catch (e) {
@@ -5692,11 +5907,8 @@ async function parkSoundWrite(req, res, cmd, body) {
     const found = await resolveOpsSlug(slug);
     if (!found || found.redirect) return res.status(404).json({ ok: false, error: "not_found" });
     const stationUuid = found.uuid;
-    const supplied = String(req.query.k || req.headers["x-ops-token"] || "");
-    const { rows: tok } = await pool.query(`SELECT token FROM station_ops_token WHERE station_uuid = $1`, [stationUuid]);
-    if (!supplied || !tok.length || supplied !== tok[0].token) {
-      return res.status(403).json({ ok: false, error: "This copy is view-only. Open the full Park Ops link - the one ending in ?k= - to make changes." });
-    }
+    const who = await parkActor(req, stationUuid);
+    if (!who.ok) return res.status(who.status).json(who.body);
     const { rows: lic } = await pool.query(`SELECT license_key_id FROM stations WHERE uuid = $1`, [stationUuid]);
     if (!lic.length) return res.status(404).json({ ok: false, error: "station_not_found" });
     const licenseId = String(lic[0].license_key_id);
@@ -5707,6 +5919,8 @@ async function parkSoundWrite(req, res, cmd, body) {
       const r = parkOpsRefusal(cmdBus.targetOffline({ machineId: v.target.machine_id, machineName: v.target.machine_name, offlineSince: v.lastSourceAt }));
       return res.status(r.status).json(r.body);
     }
+    await parkAudit(stationUuid, who.actor, cmd === "ops:set-mute" ? (body.muted ? "muted the park sound" : "turned the park sound back on") : "changed the park sound level",
+      cmd === "ops:set-level" ? { level: body.level, db: body.level > 0 ? Math.round(2000 * Math.log10(body.level)) / 100 : null } : null);
     res.json({ ok: true, cmd_id: sent.cmd_id });
   } catch (e) {
     console.error(`[public/ops ${cmd}]`, e.message);
@@ -5743,13 +5957,8 @@ app.post("/public/ops/:slug/fire", async (req, res) => {
     if (!found || found.redirect) return res.status(404).json({ ok: false, error: "not_found" });
     const stationUuid = found.uuid;
 
-    const supplied = String(req.query.k || req.headers["x-ops-token"] || "");
-    const { rows: tok } = await pool.query(
-      `SELECT token FROM station_ops_token WHERE station_uuid = $1`, [stationUuid]
-    );
-    if (!supplied || !tok.length || supplied !== tok[0].token) {
-      return res.status(403).json({ ok: false, error: "This copy is view-only. Open the full Park Ops link - the one ending in ?k= - to fire a cart." });
-    }
+    const who = await parkActor(req, stationUuid);
+    if (!who.ok) return res.status(who.status).json(who.body);
 
     // The slot must be one this station has mirrored as loaded. Without this an invented number
     // would be forwarded straight to the install.
@@ -5772,6 +5981,7 @@ app.post("/public/ops/:slug/fire", async (req, res) => {
       const r = parkOpsRefusal(cmdBus.targetOffline({ machineId: v.target.machine_id, machineName: v.target.machine_name, offlineSince: v.lastSourceAt }));
       return res.status(r.status).json(r.body);
     }
+    await parkAudit(stationUuid, who.actor, "played a cart", { cart: slot + 1, title: row.title || null });
     res.json({ ok: true, fired: row.title || `Cart ${slot}`, cmd_id: sent.cmd_id });
   } catch (e) {
     console.error("[public/ops fire]", e.message);
