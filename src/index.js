@@ -5610,6 +5610,9 @@ app.get("/public/ops/:slug", async (req, res) => {
         last: (cfgRow.park.last && typeof cfgRow.park.last === "object")
           ? (await parkViewerIsStaff(req, stationUuid) ? cfgRow.park.last : { ...cfgRow.park.last, by: null })
           : null,
+        // The board's fader law and feel (Ether → Preferences → Faders), so the park fader moves like the board's.
+        law: Array.isArray(cfgRow.park.law) ? cfgRow.park.law : null,
+        feel: (cfgRow.park.feel && typeof cfgRow.park.feel === "object") ? cfgRow.park.feel : null,
       } : null,
       // The station's owning machine is connected, so the fader and MUTE can reach it. When false the page keeps the
       // fader on screen, greyed, saying "Station offline" — it never vanishes.
