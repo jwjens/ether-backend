@@ -50,6 +50,11 @@ const hhmmToMin = (s) => {
   return h * 60 + mi;
 };
 
+const secToHms = (n) => {
+  const w = ((Math.round(n) % 86400) + 86400) % 86400;
+  return `${String(Math.floor(w / 3600)).padStart(2, '0')}:${String(Math.floor((w % 3600) / 60)).padStart(2, '0')}:${String(w % 60).padStart(2, '0')}`;
+};
+
 const minToHms = (n) => {
   const w = ((n % 1440) + 1440) % 1440;   // wrap, so "15 minutes after midnight closing" is 00:15
   return `${String(Math.floor(w / 60)).padStart(2, '0')}:${String(w % 60).padStart(2, '0')}:00`;
@@ -90,18 +95,26 @@ function railsFor(row, closingMin, allRows) {
 // never reads a clock and the smoke can pin every branch.
 function buildQueue(scheduleRows, closingMin, dateStr) {
   const queue = (scheduleRows || []).map(r => {
-    const isOffset = r.trigger_type === 'before_close' && closingMin != null;
-    // PREVIEW ONLY. The engine fires `trigger_time`; this derived value is what the row WOULD fire
-    // at if offsets were live. Nothing here changes what airs.
-    const dueTime = isOffset
-      ? minToHms(closingMin + (Number(r.close_offset_min) || 0))
-      : (r.trigger_time ? String(r.trigger_time).slice(0, 8) : null);
+    // THE STATION'S OWN FIRE TIME (2026-10-13). The install sends `due_time`: the clock time its announcement
+    // scheduler WILL fire this row at (electron/main.js dueTimeFor, resolved against tonight's closing time). That is
+    // what the page shows — never a second calculation. The offset arithmetic below is only for an install too old
+    // to send it, and it now reads the station's real type name: rows timed from closing are 'close_offset' (this
+    // looked for 'before_close', matched nothing, fell back to trigger_time — null on such rows — and the page
+    // showed "—"), with v62's seconds taking the minutes' sign.
+    const isOffset = (r.trigger_type === 'close_offset' || r.trigger_type === 'before_close');
+    const offMin = Number(r.close_offset_min) || 0, offSec = Number(r.close_offset_sec) || 0;
+    const offTotalSec = offMin * 60 + (offMin < 0 ? -Math.abs(offSec) : Math.abs(offSec));
+    const derived = (isOffset && closingMin != null) ? secToHms(closingMin * 60 + offTotalSec) : null;
+    const dueTime = typeof r.due_time === 'string' && r.due_time
+      ? String(r.due_time).slice(0, 8)
+      : isOffset ? derived : (r.trigger_time ? String(r.trigger_time).slice(0, 8) : null);
     return {
       uuid: r.uuid,
       title: r.title || '(untitled)',
       dueTime,
-      offsetMin: isOffset ? (Number(r.close_offset_min) || 0) : null,
-      preview: !!isOffset,
+      offsetMin: isOffset ? offMin : null,
+      offsetSec: isOffset ? offTotalSec : null,
+      preview: false,
       ducks: r.duck_music == null ? true : !!r.duck_music,
       alreadyPlayed: !!r.last_played_at && String(r.last_played_at).slice(0, 10) === dateStr,
       rails: [],
@@ -111,4 +124,4 @@ function buildQueue(scheduleRows, closingMin, dateStr) {
   return queue;
 }
 
-module.exports = { parseClosing, resolveClosing, hhmmToMin, minToHms, railsFor, buildQueue };
+module.exports = { parseClosing, resolveClosing, hhmmToMin, minToHms, secToHms, railsFor, buildQueue };

@@ -5398,7 +5398,9 @@ app.get("/public/ops/:slug", async (req, res) => {
     const dow = (() => { const d = new Date(`${dateStr}T00:00:00Z`); return isNaN(d) ? new Date().getUTCDay() : d.getUTCDay(); })();
 
     const cfg = opsCore.parseClosing(cfgRow ? cfgRow.closing : null);
-    const effective = opsCore.resolveClosing(cfg, dateStr, dow);
+    // TONIGHT as the STATION resolves it (its announcement scheduler's own answer, pushed as closing_today); the
+    // backend's own resolution is the fallback for an install too old to send it.
+    const effective = (cfgRow && typeof cfgRow.closing_today === "string" && cfgRow.closing_today) || opsCore.resolveClosing(cfg, dateStr, dow);
     const closingMin = opsCore.hhmmToMin(effective);
 
     const sched = (await ccRows(stationUuid, "announcement_schedule"))
@@ -5432,12 +5434,27 @@ app.get("/public/ops/:slug", async (req, res) => {
       // THE CART WALL. Slot numbers, titles and colours — the install deliberately does not mirror
       // file paths, so there is nothing here to leak and nothing to name but a slot the station
       // filled itself. Ordered by slot so the grid reads the way the desktop wall does.
-      carts: (await ccRows(stationUuid, "cart_slots"))
-        .filter(c => c && Number.isFinite(Number(c.slot_number)))
-        .map(c => ({ slot: Number(c.slot_number), title: c.title || `Cart ${c.slot_number}`, color: c.color || null }))
-        .sort((a, b) => a.slot - b.slot),
+      // EIGHT TILES, ALWAYS (2026-10-13): the station wall's first eight slots — the desktop's 1–8 — in order, an empty
+      // slot as an empty tile, so a tile's number on the phone is the same cart as that key in the studio.
+      carts: await (async () => {
+        const rows = await ccRows(stationUuid, "cart_slots");
+        const bySlot = new Map(rows.filter(c => c && Number.isFinite(Number(c.slot_number))).map(c => [Number(c.slot_number), c]));
+        return Array.from({ length: 8 }, (_, slot) => {
+          const c = bySlot.get(slot);
+          return { slot, title: c ? (c.title || `Cart ${slot + 1}`) : null, color: c ? (c.color || null) : null, empty: !c };
+        });
+      })(),
+      // THE PARK'S SOUND: the station's MONITOR level (linear), its fader maximum in dB (Preferences), and MUTE (read
+      // from the level). Null when the install has not reported it yet — the page says so rather than guessing.
+      park: (cfgRow && cfgRow.park && typeof cfgRow.park === "object") ? {
+        level: Number.isFinite(Number(cfgRow.park.level)) ? Number(cfgRow.park.level) : null,
+        topDb: Number.isFinite(Number(cfgRow.park.top_db)) ? Number(cfgRow.park.top_db) : 0,
+        muted: !!cfgRow.park.muted,
+      } : null,
+      // The cart playing right now, read off the station's cart channel (position at `at`, so the page counts down).
+      cartPlaying: (cfgRow && cfgRow.cart_playing && typeof cfgRow.cart_playing === "object") ? cfgRow.cart_playing : null,
       mirrored,
-      previewOnly: true,
+      previewOnly: false,
     });
   } catch (e) {
     console.error("[public/ops]", e.message);
@@ -5571,6 +5588,43 @@ app.put("/public/ops/:slug/closing-time", async (req, res) => {
     res.status(500).json({ ok: false, error: "server_error" });
   }
 });
+
+// THE PARK'S SOUND (2026-10-13): set the level, or MUTE / unmute. The station's MONITOR level — what the park hears from
+// the studio machine's speakers — through the same command bus, aimed and gated exactly like closing-time and fire. The
+// install applies it through the same calls its own MONITOR strip makes, and pushes the real state back.
+async function parkSoundWrite(req, res, cmd, body) {
+  const slug = String(req.params.slug || "").toLowerCase();
+  try {
+    const found = await resolveOpsSlug(slug);
+    if (!found || found.redirect) return res.status(404).json({ ok: false, error: "not_found" });
+    const stationUuid = found.uuid;
+    const supplied = String(req.query.k || req.headers["x-ops-token"] || "");
+    const { rows: tok } = await pool.query(`SELECT token FROM station_ops_token WHERE station_uuid = $1`, [stationUuid]);
+    if (!supplied || !tok.length || supplied !== tok[0].token) {
+      return res.status(403).json({ ok: false, error: "This copy is view-only. Open the full Park Ops link - the one ending in ?k= - to make changes." });
+    }
+    const { rows: lic } = await pool.query(`SELECT license_key_id FROM stations WHERE uuid = $1`, [stationUuid]);
+    if (!lic.length) return res.status(404).json({ ok: false, error: "station_not_found" });
+    const licenseId = String(lic[0].license_key_id);
+    const v = await stampStationCommand(licenseId, cmd, { cmd, station_uuid: stationUuid, ...body });
+    if (!v.ok) { const r = parkOpsRefusal(v); return res.status(r.status).json(r.body); }
+    const sent = emitCommand(licenseId, cmd, v.body);
+    if (sent.target_connected === false) {
+      const r = parkOpsRefusal(cmdBus.targetOffline({ machineId: v.target.machine_id, machineName: v.target.machine_name, offlineSince: v.lastSourceAt }));
+      return res.status(r.status).json(r.body);
+    }
+    res.json({ ok: true, cmd_id: sent.cmd_id });
+  } catch (e) {
+    console.error(`[public/ops ${cmd}]`, e.message);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+}
+app.put("/public/ops/:slug/level", (req, res) => {
+  const level = Number(req.body?.level);
+  if (!Number.isFinite(level) || level < 0 || level > 4) return res.status(400).json({ ok: false, error: "That is not a level." });
+  return parkSoundWrite(req, res, "ops:set-level", { level });
+});
+app.put("/public/ops/:slug/mute", (req, res) => parkSoundWrite(req, res, "ops:set-mute", { muted: !!req.body?.muted }));
 
 // FIRE A CART. The remote twin of clicking a tile on the desktop cart wall.
 //

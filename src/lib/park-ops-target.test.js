@@ -45,3 +45,15 @@ test("closing time: the display mirror is written only AFTER the command was del
   assert.ok(refusal > 0 && mirror > 0, "both present");
   assert.ok(refusal < mirror, "refusal returns before the mirror write");
 });
+
+// 2026-10-13 — the park's sound (level + MUTE) is a station control like closing time and fire: token-gated, stamped by
+// the one stamping function, and never queued for an offline machine.
+test("the park's sound routes are gated and aimed like every station control", () => {
+  const a = src.indexOf("async function parkSoundWrite(");
+  const body = src.slice(a, src.indexOf("\n}\n", a));
+  assert.ok(body.includes("station_ops_token") && body.includes("403"), "token-gated (view-only copies cannot change it)");
+  assert.ok(body.includes("stampStationCommand(licenseId, cmd"), "stamped by the one stamping function");
+  assert.ok(body.includes("target_connected === false") && body.includes("targetOffline"), "an offline machine is told, never queued");
+  assert.ok(/app\.put\("\/public\/ops\/:slug\/level"[\s\S]*?parkSoundWrite\(req, res, "ops:set-level"/.test(src), "PUT …/level → ops:set-level");
+  assert.ok(/app\.put\("\/public\/ops\/:slug\/mute"[\s\S]*?parkSoundWrite\(req, res, "ops:set-mute"/.test(src), "PUT …/mute → ops:set-mute");
+});

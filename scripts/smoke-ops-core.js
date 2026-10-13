@@ -60,7 +60,8 @@ const off = queue.find(q => q.uuid === 's-off');
 check('the absolute row keeps the time the engine will fire', abs.dueTime, '22:00:00');
 check('the absolute row is not a preview', abs.preview, false);
 check('the offset row is DERIVED from closing time', off.dueTime, '21:45:00');
-check('and is flagged as a preview', off.preview, true);
+// 2026-10-13: the station fires offset rows LIVE (resolved at fire time), so a derived time is no longer a preview.
+check('and is the real fire time, not a preview', off.preview, false);
 check('the offset is reported so the page can say it in words', off.offsetMin, -15);
 check('the source row is NOT mutated — nothing rewrote the stored time',
   rows.find(r => r.uuid === 's-off').trigger_time, '09:00:00');
@@ -101,8 +102,19 @@ check('no closing time → rows still shape, absolute times intact',
   buildQueue(rows, null, dateStr).find(q => q.uuid === 's-abs').dueTime, '22:00:00');
 check('no closing time → an offset row cannot be derived, so it is not a preview',
   buildQueue(rows, null, dateStr).find(q => q.uuid === 's-off').preview, false);
-check('and it falls back to the stored absolute time rather than inventing one',
-  buildQueue(rows, null, dateStr).find(q => q.uuid === 's-off').dueTime, '09:00:00');
+// 2026-10-13: the station REFUSES to fire an offset row with no closing time (electron/main.js dueTimeFor — a stored
+// absolute time on such a row is stale, from before it was converted). The page shows no time, as the station would.
+check('and it has no time — the station would not fire it, so the page does not invent one',
+  buildQueue(rows, null, dateStr).find(q => q.uuid === 's-off').dueTime, null);
+
+console.log("\n── the station's own fire times (2026-10-13) ──");
+// The install sends due_time — the time its scheduler WILL fire the row at. It wins over any arithmetic here.
+check("the station's due_time is shown as is",
+  buildQueue([{ uuid: 'd', title: 'X', trigger_type: 'close_offset', close_offset_min: -15, due_time: '20:44:30', date: dateStr }], closingMin, dateStr)[0].dueTime, '20:44:30');
+// The station's type name is 'close_offset' (this looked for 'before_close' only and showed "—").
+const co = buildQueue([{ uuid: 'c', title: 'X', trigger_type: 'close_offset', close_offset_min: -15, close_offset_sec: 30, date: dateStr }], closingMin, dateStr)[0];
+check("'close_offset' rows are timed from closing (−15 min 30 s before)", co.dueTime, minToHms(closingMin - 16).slice(0, 6) + '30');
+check("and carry their offset", co.offsetMin, -15);
 check('a row with no title still renders', buildQueue([{ uuid: 'n', trigger_time: '20:00:00', trigger_type: 'absolute', date: dateStr }], closingMin, dateStr)[0].title, '(untitled)');
 
 console.log('\n── station scoping: the SHAPE the route relies on ──');
