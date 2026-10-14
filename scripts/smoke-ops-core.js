@@ -79,6 +79,18 @@ check('played today reads as played',
 check('played on another date does not',
   buildQueue([{ uuid: 'p', title: 'T', trigger_time: '20:00:00', trigger_type: 'absolute', date: dateStr, last_played_at: '2026-10-30 20:00:01' }], closingMin, dateStr)[0].alreadyPlayed, false);
 
+// THE INSTALL SENDS UNIX SECONDS (2026-10-13): the 8:29 PM PDT fire on 2026-10-13 is 03:29 UTC the next day.
+{
+  const row = (lp) => buildQueue([{ uuid: 'n', title: 'T', trigger_time: '20:29:00', trigger_type: 'absolute', date: '2026-10-13', last_played_at: lp }], closingMin, '2026-10-13')[0];
+  const sec = (iso) => Math.floor(Date.parse(iso) / 1000);
+  check('seconds: 8:29 PM PDT (03:29 UTC next day) reads as played', row(sec('2026-10-14T03:29:00Z')).alreadyPlayed, true);
+  check('seconds: playedAt is the fire time',                         row(sec('2026-10-14T03:29:00Z')).playedAt, '2026-10-14T03:29:00.000Z');
+  check('seconds as a string reads the same',                         row(String(sec('2026-10-14T03:29:00Z'))).alreadyPlayed, true);
+  check('seconds: a play two days earlier does not',                  row(sec('2026-10-11T03:29:00Z')).alreadyPlayed, false);
+  check('seconds: a play two days later does not',                    row(sec('2026-10-16T03:29:00Z')).alreadyPlayed, false);
+  check('not played -> playedAt null',                                row(null).playedAt, null);
+}
+
 console.log('\n── sanity rails FLAG, and never remove a row ──');
 const early = buildQueue([{ uuid: 's-early', title: 'PARK IS CLOSED', trigger_time: '09:00:00', trigger_type: 'absolute', date: dateStr }], closingMin, dateStr);
 check('the row is still listed', early.length, 1);

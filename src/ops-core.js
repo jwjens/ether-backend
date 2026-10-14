@@ -89,6 +89,33 @@ function railsFor(row, closingMin, allRows) {
   return rails;
 }
 
+// ── did this line play on `dateStr`? ──────────────────────────────────────────
+// THE INSTALL SENDS UNIX SECONDS (2026-10-13). Its fire stamps `Math.floor(Date.now() / 1000)` and the mirror sends
+// it as a number. This compared the first 10 characters to the date ("1791945000" vs "2026-10-13"), never matched,
+// and the page said "not played" for every announcement that had played. A number is read as seconds; a string
+// keeps the old date-prefix reading. The server has no station time zone, but each row is ONE date's line
+// (scope 'date'), so a play within that date in any zone (UTC-14 to UTC+12 around it) is that date's play.
+function playedMs(v) {
+  if (v == null || v === '') return null;
+  const n = Number(v);
+  if (Number.isFinite(n) && n > 0) return n < 1e12 ? n * 1000 : n;   // seconds, or already milliseconds
+  return null;
+}
+function playedOn(v, dateStr) {
+  if (v == null || v === '') return false;
+  const ms = playedMs(v);
+  if (ms == null) return String(v).slice(0, 10) === dateStr;
+  const day = Date.parse(`${dateStr}T00:00:00Z`);
+  if (!Number.isFinite(day)) return false;
+  return ms >= day - 14 * 3600e3 && ms < day + 24 * 3600e3 + 12 * 3600e3;
+}
+function playedIso(v) {
+  const ms = playedMs(v);
+  if (ms != null) return new Date(ms).toISOString();
+  const t = Date.parse(String(v));
+  return Number.isFinite(t) ? new Date(t).toISOString() : null;
+}
+
 // ── the queue the page renders ────────────────────────────────────────────────
 // `scheduleRows` are the mirrored announcement_schedule rows for ONE date, already joined to their
 // announcement title. Pure: the caller supplies the date and the resolved closing time, so this
@@ -116,7 +143,8 @@ function buildQueue(scheduleRows, closingMin, dateStr) {
       offsetSec: isOffset ? offTotalSec : null,
       preview: false,
       ducks: r.duck_music == null ? true : !!r.duck_music,
-      alreadyPlayed: !!r.last_played_at && String(r.last_played_at).slice(0, 10) === dateStr,
+      alreadyPlayed: playedOn(r.last_played_at, dateStr),
+      playedAt: playedOn(r.last_played_at, dateStr) ? playedIso(r.last_played_at) : null,
       rails: [],
     };
   });
@@ -124,4 +152,4 @@ function buildQueue(scheduleRows, closingMin, dateStr) {
   return queue;
 }
 
-module.exports = { parseClosing, resolveClosing, hhmmToMin, minToHms, secToHms, railsFor, buildQueue };
+module.exports = { parseClosing, resolveClosing, hhmmToMin, minToHms, secToHms, railsFor, buildQueue, playedOn };
