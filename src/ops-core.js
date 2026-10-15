@@ -145,6 +145,11 @@ function buildQueue(scheduleRows, closingMin, dateStr) {
       ducks: r.duck_music == null ? true : !!r.duck_music,
       alreadyPlayed: playedOn(r.last_played_at, dateStr),
       playedAt: playedOn(r.last_played_at, dateStr) ? playedIso(r.last_played_at) : null,
+      // SKIPPED and FAILED, each with its time (2026-10-15), so the page shows every line's outcome plainly. Same
+      // reading as playedAt: unix seconds from the install, on this line's date. A failure carries the station's reason.
+      skippedAt: playedOn(r.skipped_at, dateStr) ? playedIso(r.skipped_at) : null,
+      failedAt: playedOn(r.failed_at, dateStr) ? playedIso(r.failed_at) : null,
+      failReason: playedOn(r.failed_at, dateStr) && r.fail_reason ? String(r.fail_reason).slice(0, 300) : null,
       rails: [],
     };
   });
@@ -152,4 +157,21 @@ function buildQueue(scheduleRows, closingMin, dateStr) {
   return queue;
 }
 
-module.exports = { parseClosing, resolveClosing, hhmmToMin, minToHms, secToHms, railsFor, buildQueue, playedOn };
+// ── the announcement on air ───────────────────────────────────────────────────
+// What the install pushed as ops_config.announcement_playing, reduced to the fields the page shows. Anything malformed
+// is null (not shown), never a guess.
+function announcementPlaying(v) {
+  if (!v || typeof v !== 'object' || typeof v.title !== 'string' || !v.title) return null;
+  if (!Number.isFinite(Date.parse(v.at)) || !Number.isFinite(Date.parse(v.started_at))) return null;
+  const dur = Number(v.duration_sec), pos = Number(v.position_sec);
+  return {
+    title: v.title.slice(0, 200),
+    duration_sec: Number.isFinite(dur) && dur > 0 ? dur : 0,
+    position_sec: Number.isFinite(pos) && pos > 0 ? pos : 0,
+    started_at: new Date(Date.parse(v.started_at)).toISOString(),
+    at: new Date(Date.parse(v.at)).toISOString(),
+    entry_uuid: typeof v.entry_uuid === 'string' ? v.entry_uuid : null,
+  };
+}
+
+module.exports = { parseClosing, resolveClosing, hhmmToMin, minToHms, secToHms, railsFor, buildQueue, playedOn, announcementPlaying };

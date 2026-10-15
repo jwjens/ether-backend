@@ -5625,6 +5625,9 @@ app.get("/public/ops/:slug", async (req, res) => {
       },
       // The cart playing right now, read off the station's cart channel (position at `at`, so the page counts down).
       cartPlaying: (cfgRow && cfgRow.cart_playing && typeof cfgRow.cart_playing === "object") ? cfgRow.cart_playing : null,
+      // THE ANNOUNCEMENT ON AIR (2026-10-15): name, length, when it started, and its position at `at`, so the page shows
+      // it with a pulse and counts the seconds down. Park page only (staff/management) — never the listener now-playing.
+      announcementPlaying: opsCore.announcementPlaying(cfgRow ? cfgRow.announcement_playing : null),
       mirrored,
       previewOnly: false,
     });

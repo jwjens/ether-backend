@@ -136,6 +136,31 @@ const forest = buildQueue([{ uuid: 'f-1', title: 'FOREST ONLY', trigger_time: '2
 check('a second station shapes only the rows it was given', forest.map(q => q.uuid), ['f-1']);
 check('and against its OWN closing time', resolveClosing(parseClosing(JSON.stringify({ default: '21:00' })), dateStr, 6), '21:00');
 
+console.log('\n── skipped / failed / the announcement on air (2026-10-15) ──');
+{
+  const { announcementPlaying } = require('../src/ops-core');
+  const d = '2026-10-13';
+  const at829 = Date.parse('2026-10-14T03:29:00Z') / 1000;   // 8:29 PM PDT on the 13th
+  const q = buildQueue([
+    { uuid: 'sk', title: 'S', trigger_time: '20:29:00', trigger_type: 'absolute', date: d, skipped_at: at829 },
+    { uuid: 'fa', title: 'F', trigger_time: '20:29:00', trigger_type: 'absolute', date: d, failed_at: at829, fail_reason: 'No source channel is patched to Announcement' },
+    { uuid: 'ok', title: 'O', trigger_time: '20:29:00', trigger_type: 'absolute', date: d },
+  ], hhmmToMin('21:00'), d);
+  const by = id => q.find(x => x.uuid === id);
+  check('a skipped line carries skippedAt', by('sk').skippedAt, '2026-10-14T03:29:00.000Z');
+  check('a failed line carries failedAt', by('fa').failedAt, '2026-10-14T03:29:00.000Z');
+  check("and the station's reason", by('fa').failReason, 'No source channel is patched to Announcement');
+  check('a line with neither has nulls', [by('ok').skippedAt, by('ok').failedAt, by('ok').failReason], [null, null, null]);
+  check("a failure on another date is not this line's", buildQueue([{ uuid: 'x', trigger_time: '20:00:00', trigger_type: 'absolute', date: d, failed_at: at829 + 3 * 86400, fail_reason: 'r' }], hhmmToMin('21:00'), d)[0].failedAt, null);
+  const ap = announcementPlaying({ title: 'HALLOVEEN 30 MIN', duration_sec: 38.2, started_at: '2026-10-14T03:29:00.000Z', position_sec: 4.5, at: '2026-10-14T03:29:04.500Z', entry_uuid: 'e1' });
+  check('the airing announcement passes through', [ap.title, ap.duration_sec, ap.position_sec, ap.entry_uuid], ['HALLOVEEN 30 MIN', 38.2, 4.5, 'e1']);
+  check('nothing airing is null', announcementPlaying(null), null);
+  check('no title is null, not a blank card', announcementPlaying({ duration_sec: 3, started_at: '2026-10-14T03:29:00Z', at: '2026-10-14T03:29:00Z' }), null);
+  check('a bad time is null', announcementPlaying({ title: 'X', started_at: 'nope', at: 'nope' }), null);
+  check('an unknown length is 0 (no countdown), never negative', announcementPlaying({ title: 'X', duration_sec: -1, started_at: '2026-10-14T03:29:00Z', at: '2026-10-14T03:29:00Z' }).duration_sec, 0);
+}
+
+
 console.log('\n──────────────────────────────');
 console.log(`  Passed: ${pass}  Failed: ${fail}`);
 console.log(`  VERDICT: ${fail === 0 ? 'PASS' : 'FAIL'}`);
