@@ -54,7 +54,7 @@ const { deriveStationState, parseSourceFields, resolveSourceMachineId, sourceFie
 const broadcastOwner = require("./lib/broadcast-owner"); // ONE broadcast owner per station (2026-10-13)
 const parkAuth = require("./lib/park-auth");             // Park page staff login with the existing username + PIN users
 const parkSound = require("./lib/park-sound");
-const { ListenBook, pathOf: listenPathOf, STATION_LEASE_SEC } = require("./lib/park-listen");   // Park page Listen (2026-10-13)           // the Park page fader stays steady (older-build pushes, owner online)
+const { ListenBook, pathOf: listenPathOf, bufferMsOf, STATION_LEASE_SEC } = require("./lib/park-listen");   // Park page Listen (2026-10-13)           // the Park page fader stays steady (older-build pushes, owner online)
 const cmdBus = require("./lib/cmd-bus");   // web remote slice 2: per-machine delivery (targeted commands)
 const { parkOpsRefusal } = cmdBus;
 const { isStationScopedCommand, stampTarget } = require("./lib/station-commands");   // web remote slice 1: a station control targets the sourcing machine
@@ -5621,7 +5621,7 @@ app.get("/public/ops/:slug", async (req, res) => {
       // station chose for the phone. The server's own relay addresses must also be configured (listenRelay).
       listen: {
         ready: !!(cfgRow && cfgRow.listen && cfgRow.listen.ready) && listenRelayConfigured(),
-        buffer_ms: (cfgRow && cfgRow.listen && Number.isFinite(Number(cfgRow.listen.buffer_ms))) ? Number(cfgRow.listen.buffer_ms) : null,
+        buffer_ms: bufferMsOf(cfgRow && cfgRow.listen ? cfgRow.listen.buffer_ms : null),   // 0 is 0; not set is null
       },
       // The cart playing right now, read off the station's cart channel (position at `at`, so the page counts down).
       cartPlaying: (cfgRow && cfgRow.cart_playing && typeof cfgRow.cart_playing === "object") ? cfgRow.cart_playing : null,
@@ -6055,7 +6055,7 @@ app.post("/public/ops/:slug/listen", async (req, res) => {
     }
     await parkAudit(ctx.stationUuid, ctx.who.actor, "started listening", null);
     res.json({ ok: true, ticket: o.ticket, whep: `${String(process.env.PARK_LISTEN_WHEP_BASE).replace(/\/+$/, "")}/${listenPathOf(ctx.stationUuid)}/whep`,
-               buffer_ms: Number.isFinite(Number(cfg.listen.buffer_ms)) ? Number(cfg.listen.buffer_ms) : null });
+               buffer_ms: bufferMsOf(cfg.listen.buffer_ms) });
   } catch (e) { console.error("[public/ops listen]", e.message); res.status(500).json({ ok: false, error: "server_error" }); }
 });
 app.post("/public/ops/:slug/listen/renew", async (req, res) => {

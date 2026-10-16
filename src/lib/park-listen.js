@@ -82,4 +82,12 @@ class ListenBook {
   }
 }
 
-module.exports = { ListenBook, pathOf, TICKET_TTL_MS, RENEW_EVERY_MS, STATION_LEASE_SEC };
+/** The listener buffer the station reported (ms), or null when it has none set. 0 is a value; a missing/blank one is
+ *  null — never 0 (Number(null) and Number("") are both 0, which made "not set" read as 0, 2026-10-16). */
+function bufferMsOf(v) {
+  if (v == null || String(v).trim() === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+module.exports = { ListenBook, pathOf, bufferMsOf, TICKET_TTL_MS, RENEW_EVERY_MS, STATION_LEASE_SEC };

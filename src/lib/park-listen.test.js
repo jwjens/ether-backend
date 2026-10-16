@@ -52,3 +52,14 @@ test('the relay: a reader needs a live ticket for THAT station; a publisher need
   assert.strictEqual(b.canPublish(pathOf('S'), 'nope'), false);
   assert.strictEqual(b.canPublish(pathOf('OTHER'), publishToken), false);
 });
+
+test('the listener buffer: 0 is 0; missing or blank is null, never 0 (2026-10-16)', () => {
+  const { bufferMsOf } = require('./park-listen');
+  assert.strictEqual(bufferMsOf(0), 0);
+  assert.strictEqual(bufferMsOf('0'), 0);
+  assert.strictEqual(bufferMsOf(100), 100);
+  assert.strictEqual(bufferMsOf(null), null);
+  assert.strictEqual(bufferMsOf(undefined), null);
+  assert.strictEqual(bufferMsOf(''), null);
+  assert.strictEqual(bufferMsOf('x'), null);
+});
