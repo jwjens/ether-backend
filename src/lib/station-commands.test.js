@@ -22,7 +22,7 @@ test("the list mirrors the desktop's STATION_SCOPED (cmd-routing.ts:24-40)", () 
     "set_volume", "play_emergency_cart", "mic_on",
     "deck:load", "deck:cue", "deck:crossfade", "deck:off",
     "queue:enqueue", "queue:reorder", "queue:remove", "queue:move", "queue:clear",
-    "stream:start", "stream:stop", "stream:restart", "cart:fire", "ops:set-closing", "ops:set-level", "ops:set-mute", "park:listen", "park:talk",
+    "stream:start", "stream:stop", "stream:restart", "cart:fire", "ops:set-closing", "ops:set-level", "ops:set-mute", "park:listen", "park:talk", "park:warm",
   ];
   assert.deepEqual([...STATION_SCOPED].sort(), expected.sort());
   for (const c of expected) assert.equal(isStationScopedCommand(c), true, c);

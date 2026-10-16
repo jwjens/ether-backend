@@ -55,7 +55,7 @@ const broadcastOwner = require("./lib/broadcast-owner"); // ONE broadcast owner 
 const parkAuth = require("./lib/park-auth");             // Park page staff login with the existing username + PIN users
 const parkSound = require("./lib/park-sound");
 const { ListenBook, pathOf: listenPathOf, bufferMsOf, STATION_LEASE_SEC } = require("./lib/park-listen");
-const { TalkBook: ParkTalkBook, pathOf: talkPathOf, STATION_LEASE_SEC: TALK_LEASE_SEC } = require("./lib/park-talk");   // Hold to talk (2026-10-16)   // Park page Listen (2026-10-13)           // the Park page fader stays steady (older-build pushes, owner online)
+const { TalkBook: ParkTalkBook, warmPathOf, STATION_LEASE_SEC: TALK_LEASE_SEC } = require("./lib/park-talk");   // Hold to talk (2026-10-16)   // Park page Listen (2026-10-13)           // the Park page fader stays steady (older-build pushes, owner online)
 const cmdBus = require("./lib/cmd-bus");   // web remote slice 2: per-machine delivery (targeted commands)
 const { parkOpsRefusal } = cmdBus;
 const { isStationScopedCommand, stampTarget } = require("./lib/station-commands");   // web remote slice 1: a station control targets the sourcing machine
@@ -6100,109 +6100,129 @@ app.post("/public/ops/:slug/listen/stop", async (req, res) => {
 setInterval(() => {
   for (const s of parkListen.sweep()) tellStationListen(s, false).catch(() => {});
 }, 10 * 1000).unref();
-// ── PARK PAGE HOLD TO TALK (2026-10-16; desktop docs/park-mic-build-2026-10-16.md, lib/park-talk.js) ────────────────────
-// A logged-in staff member holds HOLD TO TALK on one of the station's Park mics. This server checks the login, the studio
-// lock, that the station has Hold to talk set up and that Park mic is on a fader, and that nobody else holds that mic;
-// then hands the page a ticket and the WHIP address (the phone publishes its mic to the relay) and tells the station's
-// owning machine to receive it (park:talk on, with a lease). The station checks the lock, the setup and the fader again,
-// and stops by itself at its longest talk and when the lease runs out. The same relay settings as Listen.
+// ── PARK PAGE TALK (2026-10-16; desktop docs/park-mic-build-2026-10-16.md, lib/park-talk.js) ─────────────────────────
+// THE STANDING RULE (Jeff, 2026-10-16): "the user is in charge of on and off. The system never assumes, never listens for
+// talking, never ends a talk because of silence, and never auto-stops. Once green, it stays open until the user taps off,
+// or a person presses STOP / the studio lock in Ether."
+//   · /talk/warm: a logged-in phone's microphone is on → its own relay line (it publishes there, muted, near-silent); the
+//     station keeps reading it (park:warm, renewed while the phone renews). So a tap is instant.
+//   · /talk: a tap ON → the floor for that Park mic (one talker per mic; studio lock; set up; on a fader) → park:talk on
+//     with the phone's line. The station switches that line into the Park mic at once. /talk/stop: the tap OFF.
+//   · Nothing here ends a talk by itself. Ether's STOP and the studio lock end it on the station; the station's report
+//     frees the floor here (seen on the phone's next status read).
 const parkTalk = new ParkTalkBook();
-const PARK_TALK_HOW = { ether: "Stopped in Ether.", locked: PARK_LOCKED + ".", lease: "The connection was lost.",
-                        "no-audio": "No voice reached the park.", shutdown: "Ether closed." };
+const PARK_TALK_HOW = { ether: "Stopped in Ether.", locked: PARK_LOCKED + "." };
 async function talkCfg(stationUuid) {
   const rows = await ccRows(stationUuid, "ops_config");
   const cfg = rows.find(r => r && r.uuid === "ops") || null;
   return { cfg, talk: cfg && cfg.talk && typeof cfg.talk === "object" ? cfg.talk : null };
 }
 function talkMicOf(talk, mic) { return talk && Array.isArray(talk.mics) ? talk.mics.find(m => m && Number(m.mic) === Number(mic)) || null : null; }
-async function tellStationTalk(stationUuid, on, extra) {
+/** Send a Park mic command to the station's owning machine (aimed like every station control). */
+async function tellStationPark(stationUuid, cmd, body) {
   const { rows } = await pool.query(`SELECT license_key_id FROM stations WHERE uuid = $1`, [stationUuid]);
   if (!rows.length) return { ok: false, status: 404, body: { ok: false, error: "station_not_found" } };
   const licenseId = String(rows[0].license_key_id);
-  const body = { cmd: "park:talk", station_uuid: stationUuid, on: !!on, from_park: true, lease_sec: TALK_LEASE_SEC, ...extra };
-  if (on) {
-    const u = new URL(String(process.env.PARK_LISTEN_RTSP_BASE).replace(/\/+$/, "") + "/" + talkPathOf(stationUuid, extra.mic));
-    u.username = "station"; u.password = extra.readToken;
-    body.url = u.toString();
-    delete body.readToken;
-  }
-  const v = await stampStationCommand(licenseId, "park:talk", body);
+  const v = await stampStationCommand(licenseId, cmd, { cmd, station_uuid: stationUuid, from_park: true, ...body });
   if (!v.ok) { const r = parkOpsRefusal(v); return { ok: false, status: r.status, body: r.body }; }
-  const sent = emitCommand(licenseId, "park:talk", v.body);
+  const sent = emitCommand(licenseId, cmd, v.body);
   if (sent.target_connected === false) {
     const r = parkOpsRefusal(cmdBus.targetOffline({ machineId: v.target.machine_id, machineName: v.target.machine_name, offlineSince: v.lastSourceAt }));
     return { ok: false, status: r.status, body: r.body };
   }
   return { ok: true };
 }
-app.post("/public/ops/:slug/talk", async (req, res) => {
+function warmReadUrl(stationUuid, warmId, readToken) {
+  const u = new URL(String(process.env.PARK_LISTEN_RTSP_BASE).replace(/\/+$/, "") + "/" + warmPathOf(stationUuid, warmId));
+  u.username = "station"; u.password = readToken;
+  return u.toString();
+}
+const tellWarm = (stationUuid, warmId, readToken) =>
+  tellStationPark(stationUuid, "park:warm", { on: true, warm_id: warmId, url: warmReadUrl(stationUuid, warmId, readToken), lease_sec: TALK_LEASE_SEC });
+/** What the phone shows for its mic: is it on, and is the line open end to end (the station reports audio arriving)? */
+async function talkStatus(stationUuid, mic, session) {
+  const f = parkTalk.floor(stationUuid, mic);
+  const { talk } = await talkCfg(stationUuid);
+  const m = talkMicOf(talk, mic);
+  if (!f || f.session !== session) {
+    // Ended by a person in Ether (STOP) or the studio lock: say which.
+    const how = m && m.last ? m.last.how : null;
+    return { on: false, ended: how, message: PARK_TALK_HOW[how] || null };
+  }
+  // The station ended it (its report: nobody talking, a last talk newer than this one): free the floor, say how.
+  if (m && !m.talking && m.last && Date.parse(m.last.at) >= Date.parse(new Date(f.since).toISOString()) - 3000 && (m.last.how === "ether" || m.last.how === "locked")) {
+    parkTalk.endedByStation(stationUuid, mic);
+    return { on: false, ended: m.last.how, message: PARK_TALK_HOW[m.last.how] || null };
+  }
+  return { on: true, open: !!(m && m.talking && m.talking.receiving) };
+}
+app.post("/public/ops/:slug/talk/warm", async (req, res) => {
   try {
     const ctx = await listenStation(req, res); if (!ctx) return;   // logged-in staff only (a session, never the ?k= key)
+    if (!listenRelayConfigured()) return res.status(503).json({ ok: false, error: "Talk isn't set up on the server yet." });
+    const w = parkTalk.warm(ctx.stationUuid, ctx.who.token_hash);
+    const t = await tellWarm(ctx.stationUuid, w.warmId, w.readToken);
+    if (!t.ok) { parkTalk.warmClose(w.ticket); return res.status(t.status).json(t.body); }
+    res.json({ ok: true, warm_id: w.warmId, ticket: w.ticket, renew_ms: 5000,
+               whip: `${String(process.env.PARK_LISTEN_WHEP_BASE).replace(/\/+$/, "")}/${warmPathOf(ctx.stationUuid, w.warmId)}/whip` });
+  } catch (e) { console.error("[public/ops talk warm]", e.message); res.status(500).json({ ok: false, error: "server_error" }); }
+});
+app.post("/public/ops/:slug/talk/warm/renew", async (req, res) => {
+  try {
+    const ctx = await listenStation(req, res); if (!ctx) return;
+    const r = parkTalk.warmRenew(String(req.body?.ticket || ""), ctx.who.token_hash);
+    if (!r.ok) return res.status(410).json({ ok: false, error: "Disconnected — tap to reconnect." });
+    if (r.tellStation) { const t = await tellWarm(r.station, r.warmId, r.readToken); if (!t.ok) return res.status(t.status).json(t.body); }
     const mic = Number(req.body?.mic);
-    if (!listenRelayConfigured()) return res.status(503).json({ ok: false, error: "Hold to talk isn't set up on the server yet." });
+    res.json({ ok: true, talk: Number.isFinite(mic) ? await talkStatus(ctx.stationUuid, mic, ctx.who.token_hash) : null });
+  } catch (e) { console.error("[public/ops talk warm renew]", e.message); res.status(500).json({ ok: false, error: "server_error" }); }
+});
+app.post("/public/ops/:slug/talk/warm/stop", async (req, res) => {
+  try {
+    const c = parkTalk.warmClose(String(req.body?.ticket || ""));
+    if (c.ok && !c.kept) await tellStationPark(c.station, "park:warm", { on: false, warm_id: c.warmId }).catch(() => {});
+    res.json({ ok: true });
+  } catch (e) { console.error("[public/ops talk warm stop]", e.message); res.status(500).json({ ok: false, error: "server_error" }); }
+});
+app.post("/public/ops/:slug/talk", async (req, res) => {
+  try {
+    const ctx = await listenStation(req, res); if (!ctx) return;
+    const mic = Number(req.body?.mic), warmId = String(req.body?.warm_id || "");
+    if (!listenRelayConfigured()) return res.status(503).json({ ok: false, error: "Talk isn't set up on the server yet." });
     if (await parkLocked(ctx.stationUuid)) return parkLockedReply(res);
     const { talk } = await talkCfg(ctx.stationUuid);
-    if (!(talk && talk.ready)) return res.status(409).json({ ok: false, error: "Hold to talk isn't set up on this station yet (Ether → Preferences → Park page — Hold to talk)." });
+    if (!(talk && talk.ready)) return res.status(409).json({ ok: false, error: "Talk isn't set up on this station yet (Ether → Preferences → Park page — Talk)." });
     const m = talkMicOf(talk, mic);
     if (!m) return res.status(404).json({ ok: false, error: "No such Park mic." });
     if (!m.fader) return res.status(409).json({ ok: false, error: `${m.name || "That Park mic"} isn't on a fader in Ether.` });
-    const o = parkTalk.open(ctx.stationUuid, mic, ctx.who.token_hash, ctx.who.actor.name);   // no time limit (Jeff, 2026-10-16)
+    const o = parkTalk.open(ctx.stationUuid, mic, ctx.who.token_hash, ctx.who.actor.name, warmId);
     if (o.busy) {
       await parkAudit(ctx.stationUuid, ctx.who.actor, "talk refused: busy", { mic, by: o.by });
       return res.status(409).json({ ok: false, busy: true, error: `${o.by} is talking on ${m.name || "that Park mic"}.` });
     }
-    if (!o.ok) return res.status(400).json({ ok: false, error: o.error || "Could not start." });
-    const t = await tellStationTalk(ctx.stationUuid, true, { mic, readToken: o.readToken, talk_id: o.talkId, by: ctx.who.actor.name });
-    if (!t.ok) { parkTalk.close(o.ticket); return res.status(t.status).json(t.body); }
-    await parkAudit(ctx.stationUuid, ctx.who.actor, "started talking", { mic, name: m.name || null });
-    res.json({ ok: true, ticket: o.ticket, whip: `${String(process.env.PARK_LISTEN_WHEP_BASE).replace(/\/+$/, "")}/${talkPathOf(ctx.stationUuid, mic)}/whip`,
-               echo: talk.echo !== false, noise: talk.noise !== false, agc: talk.agc === true,
-               renew_ms: 2000 });
+    if (!o.ok) return res.status(409).json({ ok: false, error: o.error || "Could not start." });
+    const t = await tellStationPark(ctx.stationUuid, "park:talk", { on: true, mic, warm_id: warmId, talk_id: o.talkId, by: ctx.who.actor.name });
+    if (!t.ok) { parkTalk.close(ctx.stationUuid, mic, ctx.who.token_hash); return res.status(t.status).json(t.body); }
+    if (!o.already) await parkAudit(ctx.stationUuid, ctx.who.actor, "started talking", { mic, name: m.name || null });
+    res.json({ ok: true, talk_id: o.talkId });
   } catch (e) { console.error("[public/ops talk]", e.message); res.status(500).json({ ok: false, error: "server_error" }); }
-});
-app.post("/public/ops/:slug/talk/renew", async (req, res) => {
-  try {
-    const ctx = await listenStation(req, res); if (!ctx) return;
-    const ticket = String(req.body?.ticket || "");
-    const r = parkTalk.renew(ticket, ctx.who.token_hash);
-    if (!r.ok) return res.status(410).json({ ok: false, error: "Talking stopped." });
-    if (await parkLocked(ctx.stationUuid)) {   // the studio locked it while talking: cut within a renewal
-      parkTalk.close(ticket); tellStationTalk(ctx.stationUuid, false, { mic: r.mic, how: "locked" }).catch(() => {});
-      return res.status(423).json({ ok: false, locked: true, error: PARK_LOCKED });
-    }
-    // The station ended it (Stop in Ether, its own limit): its report says nobody is talking and a last talk newer than
-    // this one started. Free the floor and say how.
-    const { talk } = await talkCfg(ctx.stationUuid);
-    const m = talkMicOf(talk, r.mic);
-    const floorSince = (parkTalk.state(ctx.stationUuid)[r.mic] || {}).since;
-    // (3 s of tolerance for the two clocks; a last talk that STARTED 3 s before this one cannot be this one's.)
-    if (m && !m.talking && m.last && floorSince && Date.parse(m.last.at) >= Date.parse(floorSince) - 3000) {
-      parkTalk.close(ticket);
-      return res.status(410).json({ ok: false, ended: m.last.how || null, error: PARK_TALK_HOW[m.last.how] || "Talking stopped." });
-    }
-    if (r.tellStation) {
-      const t = await tellStationTalk(ctx.stationUuid, true, { mic: r.mic, readToken: r.readToken, talk_id: r.talkId, by: r.by });
-      if (!t.ok) return res.status(t.status).json(t.body);
-    }
-    res.json({ ok: true, receiving: !!(m && m.talking && m.talking.receiving) });
-  } catch (e) { console.error("[public/ops talk renew]", e.message); res.status(500).json({ ok: false, error: "server_error" }); }
 });
 app.post("/public/ops/:slug/talk/stop", async (req, res) => {
   try {
-    const found = await resolveOpsSlug(String(req.params.slug || "").toLowerCase());
-    const c = parkTalk.close(String(req.body?.ticket || ""));
+    const ctx = await listenStation(req, res); if (!ctx) return;
+    const mic = Number(req.body?.mic);
+    const c = parkTalk.close(ctx.stationUuid, mic, ctx.who.token_hash);
     if (c.ok) {
-      await tellStationTalk(c.station, false, { mic: c.mic, how: "released" }).catch(() => {});
-      if (found && !found.redirect) await parkAudit(c.station, { name: c.by, via: "login" }, "stopped talking", { mic: c.mic, sec: Math.round(c.sec) });
+      await tellStationPark(ctx.stationUuid, "park:talk", { on: false, mic, how: "released" }).catch(() => {});
+      await parkAudit(ctx.stationUuid, ctx.who.actor, "stopped talking", { mic, sec: Math.round(c.sec) });
     }
     res.json({ ok: true });
   } catch (e) { console.error("[public/ops talk stop]", e.message); res.status(500).json({ ok: false, error: "server_error" }); }
 });
-// Lapsed floors (a phone that vanished, or past the longest talk): stop their stations. The station's own lease and
-// longest-talk timer stop it anyway.
+// Lines nobody talks on whose phone went away: tell the station to stop reading them. Talks are never swept.
 setInterval(() => {
-  for (const f of parkTalk.sweep()) tellStationTalk(f.station, false, { mic: f.mic, how: "lease" }).catch(() => {});
-}, 2 * 1000).unref();
+  for (const l of parkTalk.sweep()) tellStationPark(l.station, "park:warm", { on: false, warm_id: l.warmId }).catch(() => {});
+}, 5 * 1000).unref();
 
 // The relay's question (MediaMTX authMethod: http): 2xx = allowed, anything else = refused.
 app.post("/internal/mediamtx/auth", (req, res) => {
