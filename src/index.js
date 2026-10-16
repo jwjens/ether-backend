@@ -5633,7 +5633,7 @@ app.get("/public/ops/:slug", async (req, res) => {
         const staff = await parkViewerIsStaff(req, stationUuid);
         const floor = parkTalk.state(stationUuid);
         return {
-          ready: !!t.ready && listenRelayConfigured(), maxSec: Number(t.maxSec) || null,
+          ready: !!t.ready && listenRelayConfigured(),
           echo: t.echo !== false, noise: t.noise !== false, agc: t.agc === true,
           mics: (Array.isArray(t.mics) ? t.mics : []).filter(m => m && m.fader).map(m => {
             const holder = floor[m.mic] ? floor[m.mic].by : (m.talking ? m.talking.by : null);
@@ -6107,7 +6107,7 @@ setInterval(() => {
 // owning machine to receive it (park:talk on, with a lease). The station checks the lock, the setup and the fader again,
 // and stops by itself at its longest talk and when the lease runs out. The same relay settings as Listen.
 const parkTalk = new ParkTalkBook();
-const PARK_TALK_HOW = { ether: "Stopped in Ether.", limit: "Time's up.", locked: PARK_LOCKED + ".", lease: "The connection was lost.",
+const PARK_TALK_HOW = { ether: "Stopped in Ether.", locked: PARK_LOCKED + ".", lease: "The connection was lost.",
                         "no-audio": "No voice reached the park.", shutdown: "Ether closed." };
 async function talkCfg(stationUuid) {
   const rows = await ccRows(stationUuid, "ops_config");
@@ -6146,7 +6146,7 @@ app.post("/public/ops/:slug/talk", async (req, res) => {
     const m = talkMicOf(talk, mic);
     if (!m) return res.status(404).json({ ok: false, error: "No such Park mic." });
     if (!m.fader) return res.status(409).json({ ok: false, error: `${m.name || "That Park mic"} isn't on a fader in Ether.` });
-    const o = parkTalk.open(ctx.stationUuid, mic, ctx.who.token_hash, ctx.who.actor.name, Number(talk.maxSec) || 20);
+    const o = parkTalk.open(ctx.stationUuid, mic, ctx.who.token_hash, ctx.who.actor.name);   // no time limit (Jeff, 2026-10-16)
     if (o.busy) {
       await parkAudit(ctx.stationUuid, ctx.who.actor, "talk refused: busy", { mic, by: o.by });
       return res.status(409).json({ ok: false, busy: true, error: `${o.by} is talking on ${m.name || "that Park mic"}.` });
@@ -6156,7 +6156,7 @@ app.post("/public/ops/:slug/talk", async (req, res) => {
     if (!t.ok) { parkTalk.close(o.ticket); return res.status(t.status).json(t.body); }
     await parkAudit(ctx.stationUuid, ctx.who.actor, "started talking", { mic, name: m.name || null });
     res.json({ ok: true, ticket: o.ticket, whip: `${String(process.env.PARK_LISTEN_WHEP_BASE).replace(/\/+$/, "")}/${talkPathOf(ctx.stationUuid, mic)}/whip`,
-               limit_sec: Number(talk.maxSec) || null, echo: talk.echo !== false, noise: talk.noise !== false, agc: talk.agc === true,
+               echo: talk.echo !== false, noise: talk.noise !== false, agc: talk.agc === true,
                renew_ms: 2000 });
   } catch (e) { console.error("[public/ops talk]", e.message); res.status(500).json({ ok: false, error: "server_error" }); }
 });
