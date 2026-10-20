@@ -4839,10 +4839,65 @@ app.get("/audio/list", async (req, res) => {
 // is server-controlled to keep the listing structure predictable). Validated
 // against /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z?$/.
 
+const BACKUP_MACHINE_RE = /^[0-9a-f-]{8,64}$/;
+// Every DB backup of a license, all pages, newest first by timestamp — src/lib/backup-keys.js.
+const listBackupKeys = (licenseId) => require("./lib/backup-keys").listBackupKeys(getR2Client(), R2_BUCKET, licenseId);
+
+// POST /backup/list { license_key } → every DB backup of the account, newest first, with the computer that made it.
+// The restore screen lists them all so the operator can pick the one from just before a mistake (2026-10-20).
+app.post("/backup/list", async (req, res) => {
+  try {
+    const rawKey = (req.body || {}).license_key?.trim();
+    if (!rawKey) return res.status(400).json({ error: "missing_fields", detail: "license_key is required" });
+    const license = await lookupLicense(rawKey);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+    if (!getR2Client()) return res.status(503).json({ error: "r2_not_configured" });
+    const backups = await listBackupKeys(license.id);
+    res.json({ backups });
+  } catch (e) {
+    console.error("[/backup/list]", e.message);
+    res.status(500).json({ error: "internal", detail: e.message });
+  }
+});
+
+// POST /backup/prune { license_key, machine_id, keep } → deletes that COMPUTER's backups beyond the newest `keep` (the
+// .db.gz and its .meta.json). Never touches another computer's folder or the old account-wide keys.
+app.post("/backup/prune", async (req, res) => {
+  try {
+    const { license_key, machine_id, keep } = req.body || {};
+    const rawKey = license_key?.trim();
+    const machine = String(machine_id || "").toLowerCase();
+    const k = Number(keep);
+    if (!rawKey || !BACKUP_MACHINE_RE.test(machine) || !Number.isInteger(k) || k < 1) {
+      return res.status(400).json({ error: "missing_fields", detail: "license_key, machine_id and keep (>= 1) are required" });
+    }
+    const license = await lookupLicense(rawKey);
+    if (!license) return res.status(401).json({ error: "invalid_license_key" });
+    if (!getR2Client()) return res.status(503).json({ error: "r2_not_configured" });
+    const mine = (await listBackupKeys(license.id)).filter(b => b.machine_id === machine);
+    const drop = mine.slice(k);
+    const { DeleteObjectCommand } = require("@aws-sdk/client-s3");
+    for (const b of drop) {
+      await getR2Client().send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: b.key }));
+      await getR2Client().send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: b.key.replace(/\.db\.gz$/, ".meta.json") })).catch(() => {});
+    }
+    console.log(`[Backup/Prune] license:${license.id} machine:${machine} kept ${Math.min(k, mine.length)} removed ${drop.length}`);
+    res.json({ kept: Math.min(k, mine.length), removed: drop.length });
+  } catch (e) {
+    console.error("[/backup/prune]", e.message);
+    res.status(500).json({ error: "internal", detail: e.message });
+  }
+});
+
 app.post("/backup/upload-url", async (req, res) => {
   try {
-    const { license_key, timestamp } = req.body || {};
+    const { license_key, timestamp, machine_id } = req.body || {};
     const rawKey = license_key?.trim();
+    // PER COMPUTER (2026-10-20, Jeff: "I set how often backups run … and how many are kept, on each computer"): with a
+    // machine_id the pair lands in backups/<machine_id>/, so one computer's backups never mix with another's and each
+    // computer prunes only its own. Without one (older desktops) the key is the old account-wide one, unchanged.
+    const machine = machine_id == null || machine_id === "" ? null : String(machine_id).toLowerCase();
+    if (machine && !BACKUP_MACHINE_RE.test(machine)) return res.status(400).json({ error: "invalid_machine_id" });
     if (!rawKey || !timestamp) {
       return res.status(400).json({
         error:  "missing_fields",
@@ -4865,8 +4920,9 @@ app.post("/backup/upload-url", async (req, res) => {
       });
     }
 
-    const dbKey            = `${license.id}/backups/${sanitized.value}.db.gz`;
-    const metaKey          = `${license.id}/backups/${sanitized.value}.meta.json`;
+    const folder           = machine ? `${license.id}/backups/${machine}/` : `${license.id}/backups/`;
+    const dbKey            = `${folder}${sanitized.value}.db.gz`;
+    const metaKey          = `${folder}${sanitized.value}.meta.json`;
     const expiresInSeconds = 15 * 60;
 
     let dbSignedUrl, metaSignedUrl;
@@ -4915,15 +4971,23 @@ app.post("/backup/download-url", async (req, res) => {
     const r2 = getR2Client();
     if (!r2) return res.status(503).json({ error: "r2_not_configured", detail: "Backend R2 credentials not set" });
 
-    const { ListObjectsV2Command } = require("@aws-sdk/client-s3");
+    // A CHOSEN backup (the restore screen, 2026-10-20) — it must be this license's — or else the newest, by its
+    // timestamp across every page (the old single ListObjectsV2 call stopped at 1,000 keys and sorted by key text).
     const prefix = `${license.id}/backups/`;
-    const listed = await r2.send(new ListObjectsV2Command({ Bucket: R2_BUCKET, Prefix: prefix }));
-    const dbKeys = (listed.Contents || []).map(o => o.Key).filter(k => k.endsWith(".db.gz")).sort();
-    if (dbKeys.length === 0) {
-      return res.status(404).json({ error: "no_backup", detail: "No DB backup found for this account" });
+    const wanted = (req.body || {}).key;
+    let latestKey, timestamp;
+    if (wanted) {
+      if (typeof wanted !== "string" || !wanted.startsWith(prefix) || !wanted.endsWith(".db.gz") || wanted.includes("..")) {
+        return res.status(400).json({ error: "invalid_key" });
+      }
+      latestKey = wanted;
+      timestamp = wanted.slice(wanted.lastIndexOf("/") + 1, -".db.gz".length);
+    } else {
+      const all = await listBackupKeys(license.id);
+      if (all.length === 0) return res.status(404).json({ error: "no_backup", detail: "No DB backup found for this account" });
+      latestKey = all[0].key;
+      timestamp = all[0].timestamp;
     }
-    const latestKey = dbKeys[dbKeys.length - 1];
-    const timestamp = latestKey.slice(prefix.length, -".db.gz".length);
     const expiresInSeconds = 15 * 60;
 
     let dbSignedUrl;
