@@ -1158,18 +1158,12 @@ function requireAdmin(req, res, next) {
 }
 
 // ── Control Center auth (Roadmap Item 5, Phase 1) ─────────────────────────────
-// PIN hashing mirrors the desktop scheme (salt:sha256) so install-pushed and
-// web-created PINs verify identically.
-function hashPin(pin) {
-  const salt = crypto.randomBytes(16).toString("hex");
-  return salt + ":" + crypto.createHash("sha256").update(salt + pin).digest("hex");
-}
-function verifyPin(pin, stored) {
-  if (!stored) return false;
-  if (!stored.includes(":")) return pin === stored;        // legacy plaintext
-  const [salt, hash] = stored.split(":");
-  return crypto.createHash("sha256").update(salt + pin).digest("hex") === hash;
-}
+// PIN hashing is the desktop's (src/lib/pin-hash.js = openair electron/pin-hash.js): scrypt for every new PIN (2026-10-20,
+// Jeff: "switch PINs to a slow hash"), and the old salt:sha256 / plain values still verify, so install-pushed and
+// web-created PINs verify identically whatever their age. Both are async (scrypt runs on the libuv pool).
+const PinHash = require("./lib/pin-hash");
+function hashPin(pin) { return PinHash.hashPin(pin); }
+async function verifyPin(pin, stored) { return (await PinHash.verifyPin(pin, stored)).ok; }
 function isValidPin(pin)    { return typeof pin === "string" && /^\d{4}$/.test(pin); }
 function normUsername(u)    { return typeof u === "string" ? u.trim() : ""; }
 function isValidUsername(u) { return /^[A-Za-z0-9 ._-]{1,32}$/.test(u); }
@@ -2441,7 +2435,7 @@ app.post("/api/auth/bootstrap-admin", authLimiter, async (req, res) => {
     const { rows } = await pool.query(
       `INSERT INTO account_users (license_key_id, username, display_name, role, pin_hash)
        VALUES ($1, $2, $2, 'admin', $3) RETURNING *`,
-      [license.id, username, hashPin(pin)]
+      [license.id, username, await hashPin(pin)]
     );
     return res.json({ token: signAccountToken(rows[0]), user: publicUser(rows[0]) });
   } catch (e) {
@@ -2473,7 +2467,7 @@ app.post("/api/auth/login", authLimiter, async (req, res) => {
       return res.status(423).json({ error: "locked", until: user.locked_until });
     }
 
-    if (!verifyPin(pin, user.pin_hash)) {
+    if (!(await verifyPin(pin, user.pin_hash))) {
       // The account's lockout settings (Remote page → Users → Login safety) — the Park page login uses the same.
       const r = parkAuth.afterWrongPin(user.failed_attempts, await lockoutRuleFor(license.id), Date.now());
       await pool.query(
@@ -2731,7 +2725,7 @@ app.post("/api/account/users", requireAuthAdmin, async (req, res) => {
     const { rows } = await pool.query(
       `INSERT INTO account_users (license_key_id, username, display_name, role, pin_hash)
        VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [req.auth.lk, username, display_name, role, hashPin(pin)]
+      [req.auth.lk, username, display_name, role, await hashPin(pin)]
     );
     return res.json({ user: publicUser(rows[0]) });
   } catch (e) {
@@ -2748,7 +2742,7 @@ app.post("/api/account/users/:id/pin", requireAuthAdmin, async (req, res) => {
     const { rowCount } = await pool.query(
       `UPDATE account_users SET pin_hash = $1, failed_attempts = 0, locked_until = NULL, updated_at = NOW()
        WHERE id = $2 AND license_key_id = $3 AND deleted_at IS NULL`,
-      [hashPin(pin), req.params.id, req.auth.lk]
+      [await hashPin(pin), req.params.id, req.auth.lk]
     );
     if (!rowCount) return res.status(404).json({ error: "not_found" });
     return res.json({ ok: true });
@@ -5792,7 +5786,7 @@ app.post("/public/ops/:slug/login", authLimiter, async (req, res) => {
     if (user.locked_until && new Date(user.locked_until) > new Date()) {
       return res.status(423).json({ ok: false, error: "Too many wrong PINs. Try again later.", until: user.locked_until });
     }
-    if (!verifyPin(pin, user.pin_hash)) {
+    if (!(await verifyPin(pin, user.pin_hash))) {
       const r = parkAuth.afterWrongPin(user.failed_attempts, await lockoutRuleFor(licenseId), Date.now());
       await pool.query(`UPDATE account_users SET failed_attempts = $1, locked_until = $2, updated_at = NOW() WHERE id = $3`,
         [r.failed_attempts, r.locked_until, user.id]);
