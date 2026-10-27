@@ -267,20 +267,10 @@ const upload = multer
 
 // ── DB init ───────────────────────────────────────────────────
 
-// Per-plan machine activation limits — used by legacy /validate.
-// A single license can be active on this many machines simultaneously.
-// Users can deactivate machines to free up slots.
-// Machine (seat) cap. Policy: free = 1, every PAYING plan = 5. Only free is listed; every other
-// plan (pro, station, operator, lifetimes, network, enterprise, …) gets 5 via the `?? 5` fallback,
-// so a paid/owner tier is never wrongly capped at 1.
-const PLAN_MACHINE_LIMITS = { free: 1 };
-
-// Seat limit for the onboarding flow (onboarding-spec-v1.md "Core concepts").
-// Uniform across tiers — Stripe is the gate for whether a license exists at
-// all; the seat cap is independent of plan. The /account/* endpoints use this
-// constant rather than PLAN_MACHINE_LIMITS so the onboarding contract is
-// stable even if plan-tier seat math changes later.
-const SEATS_MAX = 5;
+// Machine (seat) limits are DATA: each license resolves to a row of seat_tiers (src/lib/seat-tiers.js), set per license
+// by the platform owner. The two constants that used to decide this (SEATS_MAX = 5 and PLAN_MACHINE_LIMITS = { free: 1 })
+// are gone; the tiers were seeded with exactly their values, so no license's limit changed when they went.
+const SEATS = require("./lib/seat-tiers");
 
 async function initDB() {
   await pool.query(`
@@ -442,6 +432,8 @@ async function initDB() {
   // Handle-change cooldown + history (so promoted links don't rot and freed handles can't be squatted).
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS account_slug_changed_at TIMESTAMPTZ`);
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS account_logo_url TEXT`);
+  // Seat tiers (machines per license) — data the platform owner sets; see src/lib/seat-tiers.js.
+  await SEATS.ensureSeatTiers(pool);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS account_slug_history (
       old_slug       TEXT NOT NULL,
@@ -1697,7 +1689,7 @@ const LICENSE_TIERS = ["free", "pro", "pro_lifetime", "station", "station_lifeti
 app.get("/api/platform/licenses", requirePlatform, async (_req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT l.id, l.email, l.plan, l.active, l.created_at, l.key_prefix, l.last_validated,
+      `SELECT l.id, l.email, l.plan, l.active, l.created_at, l.key_prefix, l.last_validated, l.seat_tier_id,
               (SELECT COUNT(*)::int FROM stations s WHERE s.license_key_id = l.id) AS stations,
               (SELECT COALESCE(array_agg(s.name ORDER BY s.name), '{}')
                  FROM stations s WHERE s.license_key_id = l.id) AS station_names,
@@ -1705,7 +1697,10 @@ app.get("/api/platform/licenses", requirePlatform, async (_req, res) => {
                  WHERE (a.license_key = l.license_key OR a.license_key = 'lic-' || l.id) AND a.deauthorized_at IS NULL) AS activations
          FROM licenses l ORDER BY l.created_at DESC`
     );
-    res.json({ tiers: LICENSE_TIERS, licenses: rows });
+    // Each license's EFFECTIVE seat tier (its own, else its plan's default, else the default) beside the raw column.
+    const { rows: seatTiers } = await pool.query(`SELECT id, name, seat_limit, is_default, default_for_plan FROM seat_tiers`);
+    for (const l of rows) Object.assign(l, SEATS.seatFields(SEATS.pickSeatTier(l, seatTiers)));
+    res.json({ tiers: LICENSE_TIERS, seat_tiers: seatTiers, licenses: rows });
   } catch (e) { console.error("[platform/licenses]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
@@ -1743,6 +1738,150 @@ app.patch("/api/platform/licenses/:id", requirePlatform, async (req, res) => {
     if (!r.rowCount) return res.status(404).json({ error: "not_found" });
     res.json({ ok: true, id, plan });
   } catch (e) { console.error("[platform/licenses:update]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+// ── Seat tiers + machines per license (platform owner) ───────────────────────────────────────
+// Jeff, 2026-10-26: "seat limits are data, not code ... each license has a seat limit, with an Unlimited tier. Owner-only
+// control in the admin dashboard to set any license's tier." Every route here is requirePlatform (the platform-owner
+// token), never a license key. src/lib/seat-tiers.js holds the model.
+
+// A tier's seat_limit from a request body: null/"unlimited" = Unlimited, else a whole number >= 0.
+function parseSeatLimit(v) {
+  if (v === null || v === undefined || String(v).trim().toLowerCase() === "unlimited" || String(v).trim() === "") return { ok: true, value: null };
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 0) return { ok: false };
+  return { ok: true, value: n };
+}
+
+app.get("/api/platform/seat-tiers", requirePlatform, async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT t.id, t.name, t.seat_limit, t.is_default, t.default_for_plan,
+              (SELECT COUNT(*)::int FROM licenses l WHERE l.seat_tier_id = t.id) AS licenses_set
+         FROM seat_tiers t ORDER BY t.seat_limit NULLS LAST, t.name`);
+    res.json({ tiers: rows });
+  } catch (e) { console.error("[platform/seat-tiers]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+app.post("/api/platform/seat-tiers", requirePlatform, async (req, res) => {
+  try {
+    const name = String(req.body?.name || "").trim();
+    const lim = parseSeatLimit(req.body?.seat_limit);
+    if (!name) return res.status(400).json({ error: "name_required" });
+    if (!lim.ok) return res.status(400).json({ error: "invalid_seat_limit", detail: "a whole number of machines, or unlimited" });
+    const { rows } = await pool.query(`INSERT INTO seat_tiers (name, seat_limit) VALUES ($1, $2) RETURNING id, name, seat_limit, is_default, default_for_plan`, [name, lim.value]);
+    console.log(`[platform/seat-tiers] created "${name}" (${lim.value ?? "unlimited"})`);
+    res.json({ ok: true, tier: rows[0] });
+  } catch (e) {
+    if (e.code === "23505") return res.status(409).json({ error: "name_taken" });
+    console.error("[platform/seat-tiers:create]", e.message); res.status(500).json({ error: "server_error" });
+  }
+});
+
+// Edit a tier: name, seat_limit, and/or make it THE default (the one a license with no tier and no plan default gets).
+app.patch("/api/platform/seat-tiers/:id", requirePlatform, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ error: "bad_id" });
+    const sets = [], vals = [];
+    if (req.body?.name !== undefined) {
+      const name = String(req.body.name || "").trim();
+      if (!name) return res.status(400).json({ error: "name_required" });
+      vals.push(name); sets.push(`name = $${vals.length}`);
+    }
+    if (req.body?.seat_limit !== undefined) {
+      const lim = parseSeatLimit(req.body.seat_limit);
+      if (!lim.ok) return res.status(400).json({ error: "invalid_seat_limit", detail: "a whole number of machines, or unlimited" });
+      vals.push(lim.value); sets.push(`seat_limit = $${vals.length}`);
+    }
+    await client.query("BEGIN");
+    if (req.body?.is_default === true) {
+      await client.query(`UPDATE seat_tiers SET is_default = false WHERE is_default AND id <> $1`, [id]);
+      sets.push(`is_default = true`);
+    }
+    if (!sets.length) { await client.query("ROLLBACK"); return res.status(400).json({ error: "nothing_to_change" }); }
+    vals.push(id);
+    const r = await client.query(`UPDATE seat_tiers SET ${sets.join(", ")} WHERE id = $${vals.length} RETURNING id, name, seat_limit, is_default, default_for_plan`, vals);
+    if (!r.rowCount) { await client.query("ROLLBACK"); return res.status(404).json({ error: "not_found" }); }
+    await client.query("COMMIT");
+    console.log(`[platform/seat-tiers] edited ${id} → ${JSON.stringify(r.rows[0])}`);
+    res.json({ ok: true, tier: r.rows[0] });
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    if (e.code === "23505") return res.status(409).json({ error: "name_taken" });
+    console.error("[platform/seat-tiers:update]", e.message); res.status(500).json({ error: "server_error" });
+  } finally { client.release(); }
+});
+
+// Delete a tier only when nothing depends on it: no license set to it, not the default, not a plan's default.
+app.delete("/api/platform/seat-tiers/:id", requirePlatform, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ error: "bad_id" });
+    const { rows } = await pool.query(
+      `SELECT is_default, default_for_plan, (SELECT COUNT(*)::int FROM licenses WHERE seat_tier_id = $1) AS used FROM seat_tiers WHERE id = $1`, [id]);
+    if (!rows.length) return res.status(404).json({ error: "not_found" });
+    const t = rows[0];
+    if (t.is_default || t.default_for_plan || t.used) {
+      return res.status(409).json({ error: "tier_in_use", detail: t.used ? `${t.used} license(s) use it` : "it is a default tier", ...t });
+    }
+    await pool.query(`DELETE FROM seat_tiers WHERE id = $1`, [id]);
+    res.json({ ok: true });
+  } catch (e) { console.error("[platform/seat-tiers:delete]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+// Set a license's seat tier. seat_tier_id null = back to the default for its plan.
+app.patch("/api/platform/licenses/:id/seat-tier", requirePlatform, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ error: "bad_id" });
+    const raw = req.body?.seat_tier_id;
+    const tierId = raw === null || raw === undefined || raw === "" ? null : parseInt(raw, 10);
+    if (raw != null && raw !== "" && !tierId) return res.status(400).json({ error: "bad_seat_tier_id" });
+    if (tierId != null) {
+      const { rows } = await pool.query(`SELECT 1 FROM seat_tiers WHERE id = $1`, [tierId]);
+      if (!rows.length) return res.status(404).json({ error: "tier_not_found" });
+    }
+    const r = await pool.query(`UPDATE licenses SET seat_tier_id = $1 WHERE id = $2 RETURNING id`, [tierId, id]);
+    if (!r.rowCount) return res.status(404).json({ error: "not_found" });
+    const tier = await SEATS.seatTierFor(pool, id);
+    console.log(`[platform/licenses] license:${id} seat tier → ${tier ? `${tier.name} (${tier.seat_limit ?? "unlimited"})` : "none"}${tierId == null ? " (default)" : ""}`);
+    res.json({ ok: true, id, seat_tier_id: tierId, ...SEATS.seatFields(tier) });
+  } catch (e) { console.error("[platform/licenses:seat-tier]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+// The machines a license is signed in on, and removing one (the same deauthorize the desktop's Manage Devices does).
+async function _licenseActivationKeys(id) {
+  const { rows } = await pool.query(`SELECT id, license_key FROM licenses WHERE id = $1`, [id]);
+  if (!rows.length) return null;
+  return [rows[0].license_key, `lic-${id}`].filter(Boolean);
+}
+app.get("/api/platform/licenses/:id/machines", requirePlatform, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ error: "bad_id" });
+    const keys = await _licenseActivationKeys(id);
+    if (!keys) return res.status(404).json({ error: "not_found" });
+    const { rows } = await pool.query(
+      `SELECT machine_id, machine_name, os, activated_at, last_seen, station_uuid
+         FROM license_activations WHERE license_key = ANY($1) AND deauthorized_at IS NULL ORDER BY last_seen DESC`, [keys]);
+    const tier = await SEATS.seatTierFor(pool, id);
+    res.json({ machines: rows, seats_used: rows.length, ...SEATS.seatFields(tier) });
+  } catch (e) { console.error("[platform/licenses:machines]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+app.delete("/api/platform/licenses/:id/machines/:machineId", requirePlatform, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const machineId = String(req.params.machineId || "").trim();
+    if (!id || !machineId) return res.status(400).json({ error: "bad_request" });
+    const keys = await _licenseActivationKeys(id);
+    if (!keys) return res.status(404).json({ error: "not_found" });
+    const r = await pool.query(
+      `UPDATE license_activations SET deauthorized_at = NOW() WHERE license_key = ANY($1) AND machine_id = $2 AND deauthorized_at IS NULL`, [keys, machineId]);
+    console.log(`[platform/licenses] license:${id} machine:${machineId.slice(0, 8)} removed (${r.rowCount})`);
+    res.json({ ok: true, removed: r.rowCount });
+  } catch (e) { console.error("[platform/licenses:machine-remove]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
 // ── Authorized emails per license ─────────────────────────────────────────────
@@ -2347,7 +2486,7 @@ app.post("/api/user/desktop-activate", authLimiter, async (req, res) => {
 
     // Register this machine as a seat (mirrors /validate). Trial keys store a plaintext license_key.
     const activationKey = license.license_key || `lic-${license.id}`;
-    const limit = PLAN_MACHINE_LIMITS[license.plan] ?? 5;
+    const tier = await SEATS.seatTierFor(pool, license);
     const mid = String(req.body.machine_id || "").trim() || `acct-${u.id}`;
     const ip = (req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress || "").trim();
     const existing = await pool.query(
@@ -2359,8 +2498,10 @@ app.post("/api/user/desktop-activate", authLimiter, async (req, res) => {
       const { rows: active } = await pool.query(
         `SELECT machine_id, machine_name, os, activated_at, last_seen FROM license_activations WHERE license_key=$1 AND deauthorized_at IS NULL ORDER BY last_seen DESC`, [activationKey]
       );
-      if (active.length >= limit)
-        return res.status(403).json({ error: "activation_limit_reached", message: `This account is already active on ${active.length} of ${limit} machines. Deactivate one to sign in here.`, limit, activations: active });
+      if (SEATS.atSeatLimit(active.length, tier))
+        return res.status(403).json(tier
+          ? { error: "activation_limit_reached", message: `This account is already active on ${active.length} of ${tier.seat_limit} machines. Deactivate one to sign in here.`, limit: tier.seat_limit, ...SEATS.seatFields(tier), activations: active }
+          : { ...SEATS.seatRefusal(null, active.length), activations: active });
       await pool.query(
         `INSERT INTO license_activations (license_key, machine_id, machine_name, os, ip_address)
          VALUES ($1,$2,$3,$4,$5)
@@ -3829,7 +3970,7 @@ app.post("/validate", async (req, res) => {
     // Activation rows key on the plaintext key for legacy licenses; bcrypt licenses have none, so
     // use a stable per-license token instead (license.id is the PK → guaranteed unique).
     const activationKey = license.license_key || `lic-${license.id}`;
-    const limit = PLAN_MACHINE_LIMITS[license.plan] ?? 5;
+    const tier = await SEATS.seatTierFor(pool, license);
     const ip = (req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress || "").trim();
 
     // 2. Check if this machine is already activated for this license.
@@ -3853,15 +3994,18 @@ app.post("/validate", async (req, res) => {
         [activationKey]
       );
 
-      if (activeList.length >= limit) {
-        return res.status(403).json({
-          valid: false,
-          error: "activation_limit_reached",
-          message: `This license is already active on ${activeList.length} of ${limit} allowed machines. Deactivate one to install here.`,
-          limit,
-          plan: license.plan,
-          activations: activeList,
-        });
+      if (SEATS.atSeatLimit(activeList.length, tier)) {
+        return res.status(403).json(tier
+          ? {
+              valid: false,
+              error: "activation_limit_reached",
+              message: `This license is already active on ${activeList.length} of ${tier.seat_limit} allowed machines. Deactivate one to install here.`,
+              limit: tier.seat_limit,
+              ...SEATS.seatFields(tier),
+              plan: license.plan,
+              activations: activeList,
+            }
+          : { valid: false, ...SEATS.seatRefusal(null, activeList.length), plan: license.plan, activations: activeList });
       }
 
       // 4. Register this machine as a new activation. UPSERT because a prior
@@ -3880,7 +4024,7 @@ app.post("/validate", async (req, res) => {
            deauthorized_at = NULL`,
         [activationKey, mid, machine_name || null, os || null, ip]
       );
-      console.log(`[Activation] ${activationKey} → ${machine_name || mid.slice(0, 8)} (${activeList.length + 1}/${limit})`);
+      console.log(`[Activation] license:${license.id} → ${machine_name || mid.slice(0, 8)} (${activeList.length + 1}/${tier.seat_limit ?? "unlimited"})`);
     }
 
     await pool.query("UPDATE licenses SET last_validated=NOW() WHERE id=$1", [license.id]);
@@ -3888,7 +4032,8 @@ app.post("/validate", async (req, res) => {
       valid: true,
       plan: license.plan,
       email: license.email,
-      machine_limit: limit,
+      machine_limit: tier ? tier.seat_limit : null,
+      ...SEATS.seatFields(tier),
       license_key: license.license_key || license_key.trim(),
     });
   } catch (e) {
@@ -3919,8 +4064,8 @@ app.get("/licenses/:key/activations", async (req, res) => {
       "SELECT machine_id, machine_name, os, ip_address, activated_at, last_seen FROM license_activations WHERE license_key=$1 AND deauthorized_at IS NULL ORDER BY last_seen DESC",
       [key]
     );
-    const limit = PLAN_MACHINE_LIMITS[lic[0].plan] ?? 5;
-    res.json({ plan: lic[0].plan, limit, activations });
+    const tier = await SEATS.seatTierFor(pool, lic[0]);
+    res.json({ plan: lic[0].plan, limit: tier ? tier.seat_limit : null, ...SEATS.seatFields(tier), activations });
   } catch (e) {
     console.error("[/licenses/:key/activations]", e.message);
     res.status(500).json({ error: "Server error" });
@@ -4113,15 +4258,12 @@ app.post("/account/connect", async (req, res) => {
       [activationKey]
     );
     const seatsUsed = activeSeats.length;
+    const tier = await SEATS.seatTierFor(pool, license);
+    const seatCap = tier ? (tier.seat_limit ?? "unlimited") : "no tier";
 
-    if (seatsUsed >= SEATS_MAX && alreadySeated.length === 0) {
-      console.log(`[Account/Connect] license:${license.id} machine:${machine_id.slice(0, 8)} ${machine_name ? `(${machine_name}) ` : ""}seat_limit_reached (${seatsUsed}/${SEATS_MAX})`);
-      return res.status(403).json({
-        error: "seat_limit_reached",
-        seats: activeSeats,
-        seats_used: seatsUsed,
-        seats_max: SEATS_MAX,
-      });
+    if (alreadySeated.length === 0 && SEATS.atSeatLimit(seatsUsed, tier)) {
+      console.log(`[Account/Connect] license:${license.id} machine:${machine_id.slice(0, 8)} ${machine_name ? `(${machine_name}) ` : ""}${tier ? "seat_limit_reached" : "seat_tier_missing"} (${seatsUsed}/${seatCap})`);
+      return res.status(403).json(SEATS.seatRefusal(tier, seatsUsed, { seats: activeSeats }));
     }
 
     const { rows: stations } = await pool.query(
@@ -4129,7 +4271,7 @@ app.post("/account/connect", async (req, res) => {
       [license.id]
     );
 
-    console.log(`[Account/Connect] license:${license.id} machine:${machine_id.slice(0, 8)} ${machine_name ? `(${machine_name}) ` : ""}stations:${stations.length} seats:${seatsUsed}/${SEATS_MAX}`);
+    console.log(`[Account/Connect] license:${license.id} machine:${machine_id.slice(0, 8)} ${machine_name ? `(${machine_name}) ` : ""}stations:${stations.length} seats:${seatsUsed}/${seatCap}`);
     // plan included so OnboardingFlow can write plan_tier to local KV during onboarding;
     // fixes the gap where freshly-onboarded customers defaulted to free until they later
     // ran the SubscriptionPanel /validate flow.
@@ -4142,7 +4284,7 @@ app.post("/account/connect", async (req, res) => {
       stations,
       attachments,
       seats_used: seatsUsed,
-      seats_max:  SEATS_MAX,
+      ...SEATS.seatFields(tier),
       plan:       license.plan ?? "free",
     });
   } catch (e) {
@@ -4213,13 +4355,10 @@ app.post("/account/bind-seat", async (req, res) => {
           "SELECT COUNT(*)::int AS n FROM license_activations WHERE license_key=$1 AND deauthorized_at IS NULL",
           [activationKey]
         );
-        if (countRow[0].n >= SEATS_MAX) {
+        const tier = await SEATS.seatTierFor(client, license);
+        if (SEATS.atSeatLimit(countRow[0].n, tier)) {
           await client.query("ROLLBACK");
-          return res.status(403).json({
-            error: "seat_limit_reached",
-            seats_used: countRow[0].n,
-            seats_max: SEATS_MAX,
-          });
+          return res.status(403).json(SEATS.seatRefusal(tier, countRow[0].n));
         }
       }
 
@@ -4326,13 +4465,10 @@ app.post("/account/add-station", async (req, res) => {
           "SELECT COUNT(*)::int AS n FROM license_activations WHERE license_key=$1 AND deauthorized_at IS NULL",
           [activationKey]
         );
-        if (countRow[0].n >= SEATS_MAX) {
+        const tier = await SEATS.seatTierFor(client, license);
+        if (SEATS.atSeatLimit(countRow[0].n, tier)) {
           await client.query("ROLLBACK");
-          return res.status(403).json({
-            error: "seat_limit_reached",
-            seats_used: countRow[0].n,
-            seats_max: SEATS_MAX,
-          });
+          return res.status(403).json(SEATS.seatRefusal(tier, countRow[0].n));
         }
       }
 
@@ -4545,7 +4681,7 @@ app.get("/account/seats", async (req, res) => {
     res.json({
       seats,
       seats_used: seats.length,
-      seats_max: SEATS_MAX,
+      ...SEATS.seatFields(await SEATS.seatTierFor(pool, license)),
     });
   } catch (e) {
     console.error("[/account/seats]", e.message);
@@ -5026,8 +5162,8 @@ app.post("/account/devices", async (req, res) => {
         WHERE license_key = $1 AND deauthorized_at IS NULL
         ORDER BY last_seen DESC`, [activationKey]
     );
-    const limit = PLAN_MACHINE_LIMITS[license.plan] ?? 5;
-    res.json({ devices: rows, limit, plan: license.plan });
+    const tier = await SEATS.seatTierFor(pool, license);
+    res.json({ devices: rows, limit: tier ? tier.seat_limit : null, ...SEATS.seatFields(tier), plan: license.plan });
   } catch (e) {
     console.error("[/account/devices]", e.message);
     res.status(500).json({ error: "internal", detail: e.message });
