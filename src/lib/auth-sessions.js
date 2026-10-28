@@ -144,6 +144,17 @@ function create({ pool, jwt, secret, now = () => Date.now() }) {
         res.json(out);
       } catch (e) { console.error("[auth/refresh]", e.message); res.status(500).json({ error: "server_error" }); }
     });
+    // UPGRADE: a desktop still holding an old 12 h pass (no session) swaps it, once, for a session while it is valid —
+    // so a computer already set up never needs the sign-in screen to start renewing.
+    r.post("/upgrade", requireUser, async (req, res) => {
+      try {
+        if (req.user.sid) return res.status(400).json({ error: "already_a_session" });
+        const u = (await pool.query(`SELECT * FROM users WHERE id = $1`, [req.user.uid])).rows[0];
+        if (!u) return res.status(401).json({ error: "invalid_token" });
+        const b = req.body || {};
+        res.json(await start(u, { machineId: b.machine_id || null, deviceName: b.machine_name || null, method: "upgrade" }));
+      } catch (e) { console.error("[auth/upgrade]", e.message); res.status(500).json({ error: "server_error" }); }
+    });
     // Sign Out (this computer): by its refresh token, so it works even with an expired access token.
     r.post("/logout", async (req, res) => {
       try {

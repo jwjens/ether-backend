@@ -158,3 +158,15 @@ test("an old pass without a session id keeps working until its own expiry (no fo
     assert.equal((await h.call("GET", "/api/me", { token: old })).status, 200);
   } finally { await h.close(); }
 });
+
+test("upgrade: an old 12 h pass is swapped once for a renewable session; a session pass cannot upgrade", async () => {
+  const h = await harness();
+  try {
+    const old = jwt.sign({ uid: 1, email: "jeff@example.org", typ: "user" }, SECRET, { expiresIn: "12h" });
+    const r = await h.call("POST", "/api/auth/upgrade", { token: old, body: { machine_id: "m-ov", machine_name: "ovowforestmusic" } });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.ok(r.body.refresh_token && r.body.access_token);
+    assert.equal((await h.call("POST", "/api/auth/refresh", { body: { refresh_token: r.body.refresh_token } })).status, 200);
+    assert.equal((await h.call("POST", "/api/auth/upgrade", { token: r.body.access_token, body: {} })).status, 400);
+  } finally { await h.close(); }
+});
