@@ -9,9 +9,16 @@
 //   minutes, ONE use. The receiver types it; this hands the key over once and deletes the code. Only a SHA-256 of the
 //   code is stored, never the code.
 //
-// "The account" = the signed-in user's license (users.license_key_id) plus any license under the same email; its
-// machines are those licenses' active license_activations rows (activation key = licenses.license_key, or "lic-<id>"
-// for a license minted without a plaintext key — index.js uses the same fallback).
+// "The account" = the licenses the signed-in USER belongs to: users.license_key_id, plus the accounts of the user's
+// active memberships. NEVER a license that merely shares the user's email (docs/multitenancy-audit.md H5, closed
+// 2026-10-28: signup never verifies an email, so a stranger who signed up with a customer's purchase email used to
+// get that customer's machines and link keys). Its machines are those licenses' active license_activations rows
+// (activation key = licenses.license_key, or "lic-<id>" for a license minted without a plaintext key).
+//
+// A KEY BELONGS TO (license, machine), never to a machine id alone (audit M1, closed 2026-10-28): machine ids are chosen
+// by the client and survive a move between accounts, so link_account_keys is keyed by both. A key published under one
+// account is invisible to every other account, whatever machine id it names. The old link_keys table (machine id only)
+// is no longer read or written; each Ether machine re-publishes its key at start and hourly, into the new table.
 //
 // Mounted at /api/link behind requireUser (typ:"user" JWT — the desktop's account_jwt). Shared DDL so the pg-mem
 // test runs the exact statements index.js applies. Additive / idempotent.
@@ -44,6 +51,18 @@ const LINK_PAIRING_DDL = [
      created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
    )`,
   `CREATE INDEX IF NOT EXISTS idx_link_pair_codes_machine ON link_pair_codes (machine_id)`,
+  // M1: one key per (license, machine). Replaces link_keys, which is left in place and no longer used.
+  `CREATE TABLE IF NOT EXISTS link_account_keys (
+     license_id     INT  NOT NULL,
+     machine_id     TEXT NOT NULL,
+     machine_name   TEXT,
+     key_hex        TEXT NOT NULL,
+     key_id         INT  NOT NULL,
+     fingerprint    TEXT NOT NULL,
+     published_by   INT,
+     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+     PRIMARY KEY (license_id, machine_id)
+   )`,
 ];
 
 function makeCode(randomInt = crypto.randomInt) {
@@ -70,28 +89,48 @@ const isMachineId = (s) => typeof s === "string" && /^[0-9a-z][0-9a-z._-]{0,63}$
 const inList = (n, from = 1) => Array.from({ length: n }, (_, i) => `$${i + from}`).join(", ");
 const keyIdOf = (v) => { const n = Number(v); return Number.isInteger(n) && n >= 1 && n <= 0x7fffffff ? n : null; };
 
-/** The activation keys of the signed-in user's account. */
-async function accountActivationKeys(pool, user) {
-  const { rows: urows } = await pool.query(`SELECT license_key_id, email FROM users WHERE id = $1`, [user.uid]);
-  const u = urows[0] || {};
-  const email = String(u.email || user.email || "").toLowerCase();
-  const { rows } = await pool.query(
-    `SELECT id, license_key FROM licenses WHERE active = true AND (id = $1 OR LOWER(email) = $2)`, [u.license_key_id ?? -1, email]);
-  return rows.map(l => l.license_key || `lic-${l.id}`);
+/** The signed-in user's licenses: users.license_key_id and the accounts of their active memberships. Never by email. */
+async function accountLicenses(pool, user) {
+  const ids = new Set();
+  const { rows: urows } = await pool.query(`SELECT license_key_id FROM users WHERE id = $1`, [user.uid]);
+  if (urows[0] && urows[0].license_key_id != null) ids.add(Number(urows[0].license_key_id));
+  try {
+    const { rows } = await pool.query(
+      `SELECT account_id FROM memberships WHERE user_id = $1 AND status = 'active' AND deleted_at IS NULL`, [user.uid]);
+    for (const r of rows) ids.add(Number(r.account_id));
+  } catch (e) { if (!/memberships/.test(String(e && e.message))) throw e; }   // no memberships table: the user's license only
+  const list = [...ids].filter(Number.isFinite);
+  if (!list.length) return [];
+  const { rows } = await pool.query(`SELECT id, license_key FROM licenses WHERE active = true AND id IN (${inList(list.length)})`, list);
+  return rows.map(l => ({ id: Number(l.id), activationKey: l.license_key || `lic-${l.id}` }));
 }
-/** The account's machines (active seats), newest-seen first, one row per machine. */
-async function accountMachines(pool, user) {
-  const keys = await accountActivationKeys(pool, user);
-  if (!keys.length) return [];
+/** The account's machines (active seats), newest-seen first, one row per (license, machine). */
+async function accountSeats(pool, user) {
+  const lics = await accountLicenses(pool, user);
+  if (!lics.length) return [];
+  const byKey = new Map(lics.map(l => [l.activationKey, l.id]));
+  const keys = [...byKey.keys()];
   const { rows } = await pool.query(
-    `SELECT machine_id, machine_name, os, last_seen FROM license_activations
+    `SELECT license_key, machine_id, machine_name, os, last_seen FROM license_activations
       WHERE license_key IN (${inList(keys.length)}) AND deauthorized_at IS NULL ORDER BY last_seen DESC`, keys);
+  const seen = new Set(), out = [];
+  for (const r of rows) {
+    const licenseId = byKey.get(r.license_key);
+    const k = `${licenseId}|${r.machine_id}`;
+    if (seen.has(k)) continue;
+    seen.add(k); out.push({ ...r, license_id: licenseId });
+  }
+  return out;
+}
+/** One row per machine for the list (a machine seated under two of the user's licenses is listed once). */
+async function accountMachines(pool, user) {
   const seen = new Map();
-  for (const r of rows) if (!seen.has(r.machine_id)) seen.set(r.machine_id, r);
+  for (const r of await accountSeats(pool, user)) if (!seen.has(r.machine_id)) seen.set(r.machine_id, r);
   return [...seen.values()];
 }
-async function inAccount(pool, user, machineId) {
-  return (await accountMachines(pool, user)).some(m => m.machine_id === machineId);
+/** The user's licenses this machine holds an active seat on (usually one). Empty = not in the account. */
+async function seatLicenses(pool, user, machineId) {
+  return [...new Set((await accountSeats(pool, user)).filter(s => s.machine_id === machineId).map(s => s.license_id))];
 }
 
 function router(pool, requireUser, opts = {}) {
@@ -119,12 +158,16 @@ function router(pool, requireUser, opts = {}) {
   // The account's machines, with whether each has published a key. Never carries a key.
   r.get("/machines", async (req, res) => {
     try {
+      const seats = await accountSeats(pool, req.user);
       const ms = await accountMachines(pool, req.user);
-      const ids = ms.map(m => m.machine_id);
-      const { rows } = ids.length
-        ? await pool.query(`SELECT machine_id, machine_name, key_id, fingerprint, updated_at FROM link_keys WHERE machine_id IN (${inList(ids.length)})`, ids)
+      const lics = [...new Set(seats.map(s => s.license_id))];
+      const { rows } = lics.length
+        ? await pool.query(`SELECT license_id, machine_id, machine_name, key_id, fingerprint, updated_at FROM link_account_keys WHERE license_id IN (${inList(lics.length)}) ORDER BY updated_at DESC`, lics)
         : { rows: [] };
-      const pub = new Map(rows.map(k => [k.machine_id, k]));
+      // Only a key published under the license the machine is seated on in THIS account.
+      const seated = new Set(seats.map(s => `${s.license_id}|${s.machine_id}`));
+      const pub = new Map();
+      for (const k of rows) if (seated.has(`${k.license_id}|${k.machine_id}`) && !pub.has(k.machine_id)) pub.set(k.machine_id, k);
       res.json({ machines: ms.map(m => {
         const k = pub.get(m.machine_id);
         return { machine_id: m.machine_id, machine_name: (k && k.machine_name) || m.machine_name || null, os: m.os || null,
@@ -139,14 +182,18 @@ function router(pool, requireUser, opts = {}) {
     const b = keyBody(req.body || {});
     if (b.err) return fail(res, 400, b.err);
     try {
-      if (!(await inAccount(pool, req.user, b.machineId))) return fail(res, 403, "machine_not_in_account");
+      const lics = await seatLicenses(pool, req.user, b.machineId);
+      if (!lics.length) return fail(res, 403, "machine_not_in_account");
       const fp = fingerprint(b.key);
-      await pool.query(
-        `INSERT INTO link_keys (machine_id, machine_name, key_hex, key_id, fingerprint, published_by, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)
-         ON CONFLICT (machine_id) DO UPDATE SET machine_name = EXCLUDED.machine_name, key_hex = EXCLUDED.key_hex,
-           key_id = EXCLUDED.key_id, fingerprint = EXCLUDED.fingerprint, published_by = EXCLUDED.published_by, updated_at = EXCLUDED.updated_at`,
-        [b.machineId, b.machineName, b.key, b.keyId, fp, req.user.uid, now()]);
+      // Under each of the caller's licenses this machine is seated on — and nowhere else.
+      for (const lic of lics) {
+        await pool.query(
+          `INSERT INTO link_account_keys (license_id, machine_id, machine_name, key_hex, key_id, fingerprint, published_by, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+           ON CONFLICT (license_id, machine_id) DO UPDATE SET machine_name = EXCLUDED.machine_name, key_hex = EXCLUDED.key_hex,
+             key_id = EXCLUDED.key_id, fingerprint = EXCLUDED.fingerprint, published_by = EXCLUDED.published_by, updated_at = EXCLUDED.updated_at`,
+          [lic, b.machineId, b.machineName, b.key, b.keyId, fp, req.user.uid, now()]);
+      }
       res.json({ ok: true, machine_id: b.machineId, key_id: b.keyId, fingerprint: fp });
     } catch (e) { console.error("[link/key put]", e.message); fail(res, 500, "server_error"); }
   });
@@ -155,8 +202,12 @@ function router(pool, requireUser, opts = {}) {
   r.get("/key/:machineId", async (req, res) => {
     const mid = String(req.params.machineId || "");
     try {
-      if (!isMachineId(mid) || !(await inAccount(pool, req.user, mid))) return fail(res, 404, "no_published_key");
-      const { rows } = await pool.query(`SELECT machine_id, machine_name, key_hex, key_id, fingerprint, updated_at FROM link_keys WHERE machine_id = $1`, [mid]);
+      const lics = isMachineId(mid) ? await seatLicenses(pool, req.user, mid) : [];
+      if (!lics.length) return fail(res, 404, "no_published_key");
+      // Only a key published under a license this machine is seated on in the caller's account.
+      const { rows } = await pool.query(
+        `SELECT machine_id, machine_name, key_hex, key_id, fingerprint, updated_at FROM link_account_keys
+          WHERE machine_id = $1 AND license_id IN (${inList(lics.length, 2)}) ORDER BY updated_at DESC`, [mid, ...lics]);
       if (!rows.length) return fail(res, 404, "no_published_key");
       const k = rows[0];
       res.json({ machine_id: k.machine_id, machine_name: k.machine_name, key: k.key_hex, key_id: k.key_id, fingerprint: k.fingerprint, updated_at: k.updated_at });
@@ -169,7 +220,7 @@ function router(pool, requireUser, opts = {}) {
     const b = keyBody(req.body || {});
     if (b.err) return fail(res, 400, b.err);
     try {
-      if (!(await inAccount(pool, req.user, b.machineId))) return fail(res, 403, "machine_not_in_account");
+      if (!(await seatLicenses(pool, req.user, b.machineId)).length) return fail(res, 403, "machine_not_in_account");
       const t = now();
       await pool.query(`DELETE FROM link_pair_codes WHERE machine_id = $1 OR expires_at <= $2`, [b.machineId, t]);
       const code = makeCode();
