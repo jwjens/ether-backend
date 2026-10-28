@@ -60,7 +60,8 @@ const cmdBus = require("./lib/cmd-bus");   // web remote slice 2: per-machine de
 const { parkOpsRefusal } = cmdBus;
 const { isStationScopedCommand, stampTarget } = require("./lib/station-commands");   // web remote slice 1: a station control targets the sourcing machine
 const stripeWebhook = require("./lib/stripe-webhook");   // P0: what a verified platform Stripe event does to licenses
-const { userEntitlement: computeUserEntitlement } = require("./lib/entitlement");   // P0 B6: expiry-aware account entitlement
+const { userEntitlement: computeUserEntitlement } = require("./lib/entitlement");
+const { resolveDesktopLicense } = require("./lib/desktop-license");   // desktop-activate: never a license by email match   // P0 B6: expiry-aware account entitlement
 
 // JWT signing secret for the Control Center dashboard. MUST be set in production
 // (Railway env). Falls back to a per-boot random secret in dev so tokens simply
@@ -2449,28 +2450,16 @@ app.post("/api/user/desktop-activate", authLimiter, async (req, res) => {
     if (!u || !(await bcrypt.compare(password, u.password_hash))) return res.status(401).json({ error: "invalid_credentials" });
 
     const ent = await userEntitlement(u);
-    if (ent.status === "expired" || ent.status === "none")
+    // WHICH LICENSE (src/lib/desktop-license.js; Jeff, 2026-10-28): the user's own, or — verified email only — the
+    // account they were invited to, or a brand-new trial of their own. NEVER an existing license found by email.
+    const pick = await resolveDesktopLicense(pool, u, { generateLicenseKey, entitled: !(ent.status === "expired" || ent.status === "none") });
+    if (!pick)
       return res.status(403).json({ error: "trial_expired", message: "Your free trial has ended. Subscribe to activate Ether, or continue on the free Solo plan." });
-
-    // Resolve the license to activate: the user's paid license if linked, else an existing/new
-    // Network trial license tied to this email (plaintext key so we can always hand it back).
-    let license = null;
-    if (u.license_key_id)
-      license = (await pool.query(`SELECT * FROM licenses WHERE id = $1 AND active = true`, [u.license_key_id])).rows[0] || null;
-    if (!license) {
-      license = (await pool.query(
-        `SELECT * FROM licenses WHERE email = $1 AND expires_at IS NOT NULL AND active = true ORDER BY id DESC LIMIT 1`, [email]
-      )).rows[0] || null;
-      if (!license) {
-        const rawKey = generateLicenseKey("station");
-        license = (await pool.query(
-          `INSERT INTO licenses (email, plan, license_key, key_prefix, expires_at, active)
-           VALUES ($1, 'station', $2, $3, $4, true) RETURNING *`,
-          [email, rawKey, rawKey.slice(0, 12), u.trial_ends_at]
-        )).rows[0];
-      }
-      await pool.query(`UPDATE users SET license_key_id = $1 WHERE id = $2`, [license.id, u.id]);
-    }
+    let license = pick.license;
+    // A member never re-keys the owner's license (the mint below replaces the stored key). A hash-only license has no key
+    // to hand a member: the owner activates once first, which mints it.
+    if (pick.via === "member" && !license.license_key)
+      return res.status(409).json({ error: "account_key_not_ready", message: "This account's owner needs to sign in to Ether on a computer once before members can activate." });
 
     // Admin/bcrypt-issued licenses (created in the platform Licenses screen) store only a hash —
     // no plaintext key to hand back, so the desktop got "No license returned". Mint a real key on
