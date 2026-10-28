@@ -955,6 +955,7 @@ async function initDB() {
   const { LINK_PAIRING_DDL } = require("./lib/link-pairing");
   for (const ddl of LINK_PAIRING_DDL) await pool.query(ddl);
   for (const ddl of AUTH_SESSIONS.AUTH_SESSIONS_DDL) await pool.query(ddl);
+  for (const ddl of require("./lib/link-relay").LINK_RELAY_DDL) await pool.query(ddl);
 
   console.log("[DB] Schema ready");
 }
@@ -7526,6 +7527,9 @@ app.use('/account', attachmentsRouter);
 
 // Remote Link pairing (Jeff's ruling 2026-10-04: the link key is never copied by hand). Same account: machines
 // publish their key and fetch each other's; guests: an 8-character, 10-minute, one-use code. Signed-in user only.
+// Remote Link relay sessions (src/lib/link-relay.js): signed tickets for two machines of one account. Needs the Railway
+// variables ETHER_RELAY_SECRET (same value as the relay's) and ETHER_RELAY_HOST; without them it answers 503.
+app.use('/api/link/relay', require('./lib/link-relay').router(pool, requireUser));
 app.use('/api/link', require('./lib/link-pairing').router(pool, requireUser));
 // Sign-in sessions: renew, sign out, sign out everywhere, my computers, my settings (src/lib/auth-sessions.js).
 AUTH = AUTH_SESSIONS.create({ pool, jwt, secret: JWT_SECRET });

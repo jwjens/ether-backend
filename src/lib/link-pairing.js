@@ -250,4 +250,4 @@ function router(pool, requireUser, opts = {}) {
   return r;
 }
 
-module.exports = { LINK_PAIRING_DDL, CODE_ALPHABET, CODE_TTL_MS, makeCode, formatCode, normalizeCode, fingerprint, router };
+module.exports = { LINK_PAIRING_DDL, CODE_ALPHABET, CODE_TTL_MS, makeCode, formatCode, normalizeCode, fingerprint, router, accountSeats, accountMachines };
