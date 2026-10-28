@@ -61,7 +61,21 @@ const { parkOpsRefusal } = cmdBus;
 const { isStationScopedCommand, stampTarget } = require("./lib/station-commands");   // web remote slice 1: a station control targets the sourcing machine
 const stripeWebhook = require("./lib/stripe-webhook");   // P0: what a verified platform Stripe event does to licenses
 const { userEntitlement: computeUserEntitlement } = require("./lib/entitlement");
-const { resolveDesktopLicense } = require("./lib/desktop-license");   // desktop-activate: never a license by email match   // P0 B6: expiry-aware account entitlement
+const { resolveDesktopLicense } = require("./lib/desktop-license");   // desktop-activate: never a license by email match
+// SIGN-IN SESSIONS (src/lib/auth-sessions.js; Jeff, 2026-10-28): a running station stays signed in forever; a session ends
+// only on Sign Out, a password change, or the computer removed from the account.
+const AUTH_SESSIONS = require("./lib/auth-sessions");
+let AUTH = null;   // created once the pool exists (below)
+/** A computer was removed from license `licenseId`: end its sessions for that license's people (owner + members). */
+async function _endRemovedComputerSessions(licenseId, machineId) {
+  try {
+    if (!AUTH || !licenseId || !machineId) return;
+    const ids = new Set((await pool.query(`SELECT id FROM users WHERE license_key_id = $1`, [licenseId])).rows.map(r => r.id));
+    try { for (const r of (await pool.query(`SELECT user_id FROM memberships WHERE account_id = $1 AND deleted_at IS NULL`, [licenseId])).rows) ids.add(r.user_id); } catch {}
+    const n = await AUTH.revokeMachine(String(machineId), [...ids]);
+    if (n) console.log(`[auth] license:${licenseId} machine:${String(machineId).slice(0, 8)} removed → ${n} session(s) ended`);
+  } catch (e) { console.error("[auth] end removed computer's sessions:", e.message); }
+}   // P0 B6: expiry-aware account entitlement
 
 // JWT signing secret for the Control Center dashboard. MUST be set in production
 // (Railway env). Falls back to a per-boot random secret in dev so tokens simply
@@ -940,6 +954,7 @@ async function initDB() {
   // Remote Link pairing (2026-10-04): published link keys + one-use guest codes. Additive CREATE ... IF NOT EXISTS.
   const { LINK_PAIRING_DDL } = require("./lib/link-pairing");
   for (const ddl of LINK_PAIRING_DDL) await pool.query(ddl);
+  for (const ddl of AUTH_SESSIONS.AUTH_SESSIONS_DDL) await pool.query(ddl);
 
   console.log("[DB] Schema ready");
 }
@@ -1534,6 +1549,7 @@ app.post("/api/platform/users/reset-password", requirePlatform, async (req, res)
     if (u) {
       // Existing login → reset its password.
       await pool.query(`UPDATE users SET password_hash = $1, reset_token = NULL, reset_expires = NULL WHERE id = $2`, [hash, u.id]);
+    if (AUTH) await AUTH.revokeUser(u.id, "password_changed").catch(e => console.error("[auth] end sessions on password change:", e.message));
       return res.json({ ok: true, email: u.email, created: false });
     }
     // No login exists yet → CREATE it (owner-provisioned), linked to the license. This is the one
@@ -1882,6 +1898,7 @@ app.delete("/api/platform/licenses/:id/machines/:machineId", requirePlatform, as
     const r = await pool.query(
       `UPDATE license_activations SET deauthorized_at = NOW() WHERE license_key = ANY($1) AND machine_id = $2 AND deauthorized_at IS NULL`, [keys, machineId]);
     console.log(`[platform/licenses] license:${id} machine:${machineId.slice(0, 8)} removed (${r.rowCount})`);
+    await _endRemovedComputerSessions(id, machineId);
     res.json({ ok: true, removed: r.rowCount });
   } catch (e) { console.error("[platform/licenses:machine-remove]", e.message); res.status(500).json({ error: "server_error" }); }
 });
@@ -2207,11 +2224,15 @@ function requireUser(req, res, next) {
   const h = req.headers["authorization"] || "";
   const token = h.startsWith("Bearer ") ? h.slice(7) : null;
   if (!token) return res.status(401).json({ error: "missing_token" });
+  let p;
   try {
-    const p = jwt.verify(token, JWT_SECRET);
+    p = jwt.verify(token, JWT_SECRET);
     if (p.typ !== "user") return res.status(401).json({ error: "invalid_token" });
-    req.user = p; next();
   } catch { return res.status(401).json({ error: "invalid_token" }); }
+  // A pass from a session that has ended (Sign Out, password change, computer removed) is refused (30 s cache).
+  if (!p.sid || !AUTH) { req.user = p; return next(); }
+  AUTH.guard(p).then(ok => { if (!ok) return res.status(401).json({ error: "session_ended" }); req.user = p; next(); })
+    .catch(() => res.status(503).json({ error: "session_check_failed" }));
 }
 // Current entitlement: an active paid license wins; else an unexpired trial; else expired/none.
 // Expiry-aware since P0/B6 (lib/entitlement.js); lifetime/operator plans never expire.
@@ -2415,6 +2436,7 @@ app.post("/api/user/reset", authLimiter, async (req, res) => {
     if (!u) return res.status(400).json({ error: "invalid_or_expired" });
     const hash = await bcrypt.hash(password, 12);
     await pool.query(`UPDATE users SET password_hash = $1, reset_token = NULL, reset_expires = NULL WHERE id = $2`, [hash, u.id]);
+    if (AUTH) await AUTH.revokeUser(u.id, "password_changed").catch(e => console.error("[auth] end sessions on password change:", e.message));
     res.json({ ok: true });
   } catch (e) { console.error("[user/reset]", e.message); res.status(500).json({ error: "server_error" }); }
 });
@@ -2512,6 +2534,11 @@ app.post("/api/user/desktop-activate", authLimiter, async (req, res) => {
       // RBAC foundation: a user JWT so the desktop can read /api/me/memberships (the accounts +
       // accessible stations this person belongs to). Read-only use; existing clients ignore it.
       token: signUserToken(u),
+      // A desktop that asks for a session (req.body.session === true) gets a renewable sign-in: a short pass and a
+      // refresh token it keeps in protected storage (src/lib/auth-sessions.js). Older desktops ignore it.
+      ...(req.body.session === true && AUTH
+        ? { session: await AUTH.start(u, { machineId: mid, deviceName: req.body.machine_name || null, method: "password" }) }
+        : {}),
     });
   } catch (e) { console.error("[user/desktop-activate]", e.message); res.status(500).json({ error: "server_error" }); }
 });
@@ -4035,6 +4062,7 @@ app.post("/licenses/:key/deactivate", async (req, res) => {
       [key, machine_id.trim()]
     );
     console.log(`[Deactivation] ${key} → ${machine_id.slice(0, 8)} (deauthorized ${rowCount})`);
+    await _endRemovedComputerSessions(lic[0].id, machine_id.trim());
     res.json({ ok: true, removed: rowCount });
   } catch (e) {
     console.error("[/licenses/:key/deactivate]", e.message);
@@ -4582,6 +4610,7 @@ app.post("/account/deauthorize-seat", async (req, res) => {
     );
 
     console.log(`[Account/Deauthorize] license:${license.id} machine:${machine_id.trim().slice(0, 8)} (deauthorized ${rowCount})`);
+    await _endRemovedComputerSessions(license.id, machine_id.trim());
     res.json({ ok: true, removed: rowCount });
   } catch (e) {
     console.error("[/account/deauthorize-seat]", e.message);
@@ -7498,6 +7527,9 @@ app.use('/account', attachmentsRouter);
 // Remote Link pairing (Jeff's ruling 2026-10-04: the link key is never copied by hand). Same account: machines
 // publish their key and fetch each other's; guests: an 8-character, 10-minute, one-use code. Signed-in user only.
 app.use('/api/link', require('./lib/link-pairing').router(pool, requireUser));
+// Sign-in sessions: renew, sign out, sign out everywhere, my computers, my settings (src/lib/auth-sessions.js).
+AUTH = AUTH_SESSIONS.create({ pool, jwt, secret: JWT_SECRET });
+app.use('/api/auth', AUTH.router(requireUser));
 
 // ── Start ─────────────────────────────────────────────────────
 
