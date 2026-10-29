@@ -62,6 +62,7 @@ const { isStationScopedCommand, stampTarget } = require("./lib/station-commands"
 const stripeWebhook = require("./lib/stripe-webhook");   // P0: what a verified platform Stripe event does to licenses
 const { userEntitlement: computeUserEntitlement } = require("./lib/entitlement");
 const { resolveDesktopLicense } = require("./lib/desktop-license");   // desktop-activate: never a license by email match
+const emailVerify = require("./lib/email-verify");   // sign-up confirmation link (24 h); a membership counts once verified
 // SIGN-IN SESSIONS (src/lib/auth-sessions.js; Jeff, 2026-10-28): a running station stays signed in forever; a session ends
 // only on Sign Out, a password change, or the computer removed from the account.
 const AUTH_SESSIONS = require("./lib/auth-sessions");
@@ -369,6 +370,7 @@ async function initDB() {
   // truthful from the first provisioned account, and so a later password-change flow has the state
   // it needs instead of having to guess which passwords were admin-set. See the build report.
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT false`);
+  for (const ddl of emailVerify.VERIFY_DDL) await pool.query(ddl);   // the confirmation link's 24 h expiry
   await pool.query(`UPDATE users SET unsubscribe_token = md5(random()::text || clock_timestamp()::text || id::text) WHERE unsubscribe_token IS NULL`);
   await pool.query(`DELETE FROM guest_presence WHERE joined_at < NOW() - INTERVAL '24 hours'`).catch(() => {});
 
@@ -1204,13 +1206,16 @@ function requireAuthAdmin(req, res, next) {
 // SEPARATE principal with no membership. See docs/account-users-rbac.md.
 async function getMembership(userId, accountId) {
   const { rows } = await pool.query(
-    `SELECT m.id, m.account_id, m.position_id, m.all_stations, m.status,
+    // An unverified email's membership in an account that is not their own license does not count yet (email-verify.js).
+    `SELECT m.id, m.account_id, m.position_id, m.all_stations,
+            CASE WHEN ${emailVerify.MEMBERSHIP_COUNTS_SQL} THEN m.status ELSE 'email_unverified' END AS status,
             p.key AS position, p.rank, p.permissions
-       FROM memberships m JOIN positions p ON p.id = m.position_id
+       FROM memberships m JOIN positions p ON p.id = m.position_id JOIN users u ON u.id = m.user_id
       WHERE m.user_id = $1 AND m.account_id = $2 AND m.deleted_at IS NULL`,
     [userId, accountId]);
   return rows[0] || null;
 }
+const EMAIL_UNVERIFIED = { error: "email_not_verified", message: "Confirm your email address first: open the link we emailed you (it lasts 24 hours), or send a new one." };
 function memberCan(m, perm) { return !!(m && m.status === "active" && m.permissions && m.permissions[perm] === true); }
 // A membership's reachable station scope: null = ALL stations in the account (no restriction);
 // otherwise a Set of the specific station uuids it may touch.
@@ -1305,6 +1310,7 @@ function requireMember(perm) {
       const accountId = Number(req.params.accountId);
       if (!accountId) return res.status(400).json({ error: "bad_account" });
       const m = await getMembership(req.auth.uid, accountId);
+      if (m && m.status === "email_unverified") return res.status(403).json(EMAIL_UNVERIFIED);
       if (!m || m.status !== "active") return res.status(403).json({ error: "not_a_member" });
       if (perm && !memberCan(m, perm)) return res.status(403).json({ error: "forbidden", need: perm });
       req.member = m; req.accountId = accountId; next();
@@ -2264,19 +2270,18 @@ app.post("/api/user/signup", authLimiter, async (req, res) => {
     if (password.length < 8) return res.status(400).json({ error: "weak_password" });
     if ((await pool.query(`SELECT 1 FROM users WHERE email = $1`, [email])).rows[0]) return res.status(409).json({ error: "email_taken" });
     const hash = await bcrypt.hash(password, 12);
-    const verifyToken = crypto.randomBytes(24).toString("base64url");
     const unsubToken = crypto.randomBytes(18).toString("base64url");
     const { rows } = await pool.query(
-      `INSERT INTO users (name, email, password_hash, verify_token, unsubscribe_token, trial_ends_at)
-       VALUES ($1, $2, $3, $4, $5, NOW() + INTERVAL '${TRIAL_DAYS} days') RETURNING *`,
-      [name, email, hash, verifyToken, unsubToken]
+      `INSERT INTO users (name, email, password_hash, unsubscribe_token, trial_ends_at)
+       VALUES ($1, $2, $3, $4, NOW() + INTERVAL '${TRIAL_DAYS} days') RETURNING *`,
+      [name, email, hash, unsubToken]
     );
     const u = rows[0];
+    // Signed in at once: the trial starts on a brand-new license of their own. Joining or claiming anything that already
+    // exists waits for the link (src/lib/email-verify.js).
+    const verifyToken = await emailVerify.issue(pool, u.id);
     const hi = name ? `Welcome, ${escapeHtml(name.split(/\s+/)[0])}` : "Welcome to Ether";
-    sendAccountEmail(email, "Verify your Ether account", hi,
-      `Your ${TRIAL_DAYS}-day free trial has started. Confirm your email address to secure your account and keep your station online.`,
-      { url: `${ACCOUNT_APP_URL}/verify?token=${verifyToken}`, label: "Verify email" },
-      { unsubscribeToken: unsubToken });
+    sendVerifyEmail(email, hi, verifyToken, unsubToken);
     res.json({ token: signUserToken(u), account: publicAccount(u, await userEntitlement(u)) });
   } catch (e) { console.error("[user/signup]", e.message); res.status(500).json({ error: "server_error" }); }
 });
@@ -2300,14 +2305,31 @@ app.get("/api/user/me", requireUser, async (req, res) => {
   } catch (e) { console.error("[user/me]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
-app.post("/api/user/verify", async (req, res) => {
+function sendVerifyEmail(email, heading, verifyToken, unsubToken) {
+  sendAccountEmail(email, "Verify your Ether account", heading,
+    `Your ${TRIAL_DAYS}-day free trial has started. Confirm your email address to join an account you were invited to. This link lasts ${emailVerify.VERIFY_HOURS} hours.`,
+    { url: `${ACCOUNT_APP_URL}/verify?token=${verifyToken}`, label: "Verify email" },
+    unsubToken ? { unsubscribeToken: unsubToken } : {});
+}
+
+// The link from the email (the web page posts its token here). Works once, for 24 hours.
+app.post("/api/user/verify", authLimiter, async (req, res) => {
   try {
-    const token = String(req.body?.token || "");
-    if (!token) return res.status(400).json({ error: "missing_token" });
-    const r = await pool.query(`UPDATE users SET email_verified = true, verify_token = NULL WHERE verify_token = $1 RETURNING id`, [token]);
-    if (!r.rowCount) return res.status(400).json({ error: "invalid_token" });
+    const r = await emailVerify.confirm(pool, String(req.body?.token || ""));
+    if (!r.ok) return res.status(400).json({ error: r.error });
     res.json({ ok: true });
   } catch (e) { console.error("[user/verify]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+// A new link (the old one expired or was lost). The previous link stops working.
+app.post("/api/user/verify/resend", authLimiter, requireUser, async (req, res) => {
+  try {
+    const u = (await pool.query(`SELECT id, email, email_verified, unsubscribe_token FROM users WHERE id = $1`, [req.user.uid])).rows[0];
+    if (!u) return res.status(404).json({ error: "not_found" });
+    if (u.email_verified) return res.json({ ok: true, already_verified: true });
+    sendVerifyEmail(u.email, "Confirm your email", await emailVerify.issue(pool, u.id), u.unsubscribe_token);
+    res.json({ ok: true });
+  } catch (e) { console.error("[user/verify/resend]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
 // ── Account handle (public hub address) ────────────────────────────────────
@@ -2437,6 +2459,7 @@ app.post("/api/user/reset", authLimiter, async (req, res) => {
     if (!u) return res.status(400).json({ error: "invalid_or_expired" });
     const hash = await bcrypt.hash(password, 12);
     await pool.query(`UPDATE users SET password_hash = $1, reset_token = NULL, reset_expires = NULL WHERE id = $2`, [hash, u.id]);
+    await emailVerify.markVerified(pool, u.id);   // the reset link proved the inbox
     if (AUTH) await AUTH.revokeUser(u.id, "password_changed").catch(e => console.error("[auth] end sessions on password change:", e.message));
     res.json({ ok: true });
   } catch (e) { console.error("[user/reset]", e.message); res.status(500).json({ error: "server_error" }); }
@@ -3071,7 +3094,8 @@ app.get("/api/me/memberships", requireAuth, async (req, res) => {
          FROM memberships m
          JOIN positions p ON p.id = m.position_id
          JOIN licenses la ON la.id = m.account_id
-        WHERE m.user_id = $1 AND m.deleted_at IS NULL AND m.status = 'active'
+         JOIN users u ON u.id = m.user_id
+        WHERE m.user_id = $1 AND m.deleted_at IS NULL AND m.status = 'active' AND ${emailVerify.MEMBERSHIP_COUNTS_SQL}
         ORDER BY m.account_id`, [req.auth.uid]);
     for (const r of rows) {
       r.stations = r.all_stations
@@ -3094,6 +3118,7 @@ app.post("/api/me/switch-account/:accountId", requireAuth, async (req, res) => {
     const accountId = Number(req.params.accountId);
     if (!accountId) return res.status(400).json({ error: "bad_account" });
     const m = await getMembership(req.auth.uid, accountId);
+    if (m && m.status === "email_unverified") return res.status(403).json(EMAIL_UNVERIFIED);
     if (!m || m.status !== "active") return res.status(403).json({ error: "not_a_member" });
     const perms = m.permissions || {};
     const role = (perms.manage_stations || perms.manage_users || perms.manage_account) ? "admin" : "user";

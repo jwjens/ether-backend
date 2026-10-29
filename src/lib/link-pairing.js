@@ -24,6 +24,7 @@
 // test runs the exact statements index.js applies. Additive / idempotent.
 const crypto = require("crypto");
 const express = require("express");
+const { MEMBERSHIP_COUNTS_SQL } = require("./email-verify");
 
 /** No 0/O, 1/I/L: a code read off one screen and typed into another. 31 symbols ^ 8 ≈ 2^39.6. */
 const CODE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
@@ -95,8 +96,10 @@ async function accountLicenses(pool, user) {
   const { rows: urows } = await pool.query(`SELECT license_key_id FROM users WHERE id = $1`, [user.uid]);
   if (urows[0] && urows[0].license_key_id != null) ids.add(Number(urows[0].license_key_id));
   try {
+    // a membership counts only once the email is verified, or when it is the user's own license (email-verify.js)
     const { rows } = await pool.query(
-      `SELECT account_id FROM memberships WHERE user_id = $1 AND status = 'active' AND deleted_at IS NULL`, [user.uid]);
+      `SELECT m.account_id FROM memberships m JOIN users u ON u.id = m.user_id
+        WHERE m.user_id = $1 AND m.status = 'active' AND m.deleted_at IS NULL AND ${MEMBERSHIP_COUNTS_SQL}`, [user.uid]);
     for (const r of rows) ids.add(Number(r.account_id));
   } catch (e) { if (!/memberships/.test(String(e && e.message))) throw e; }   // no memberships table: the user's license only
   const list = [...ids].filter(Number.isFinite);

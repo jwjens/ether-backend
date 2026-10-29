@@ -17,7 +17,7 @@ const KEY_A = "a".repeat(64), KEY_A2 = "b".repeat(64), KEY_G = "c".repeat(64);
 async function harness(extraSql = "", afterDdl = "") {
   const db = newDb();
   db.public.none(`
-    CREATE TABLE users (id INT PRIMARY KEY, email TEXT, license_key_id INT);
+    CREATE TABLE users (id INT PRIMARY KEY, email TEXT, license_key_id INT, email_verified BOOLEAN DEFAULT false);
     CREATE TABLE licenses (id INT PRIMARY KEY, email TEXT, license_key TEXT, plan TEXT, active BOOLEAN DEFAULT true);
     CREATE TABLE license_activations (id SERIAL PRIMARY KEY, license_key TEXT NOT NULL, machine_id TEXT NOT NULL, machine_name TEXT,
       os TEXT, last_seen TIMESTAMPTZ DEFAULT NOW(), deauthorized_at TIMESTAMPTZ);
@@ -179,7 +179,7 @@ test("H5: a stranger who signed up with a customer's email gets nothing: no mach
 
 test("an account member (memberships) is in the account; a removed member is not", async () => {
   const h = await harness(`
-    INSERT INTO users VALUES (4, 'pd@example.org', NULL);
+    INSERT INTO users VALUES (4, 'pd@example.org', NULL, true);
     CREATE TABLE memberships (id SERIAL PRIMARY KEY, user_id INT, account_id INT, status TEXT DEFAULT 'active', deleted_at TIMESTAMPTZ);
     INSERT INTO memberships (user_id, account_id) VALUES (4, 10);`);
   try {
@@ -197,6 +197,20 @@ test("an account member (memberships) is in the account; a removed member is not
     const r = await h2.call(4, "GET", "/key/m-ov");
     assert.equal(r.status, 404, "a removed member has no account");
   } finally { await h2.close(); }
+});
+
+test("an invited member whose email is NOT verified is not in the account yet (Jeff, 2026-10-29)", async () => {
+  const h = await harness(`
+    INSERT INTO users VALUES (4, 'pd@example.org', NULL, false);
+    CREATE TABLE memberships (id SERIAL PRIMARY KEY, user_id INT, account_id INT, status TEXT DEFAULT 'active', deleted_at TIMESTAMPTZ);
+    INSERT INTO memberships (user_id, account_id) VALUES (4, 10);`);
+  try {
+    await h.call(1, "PUT", "/key", { machine_id: "m-ov", machine_name: "ovowforestmusic", key: KEY_A, key_id: 2 });
+    let r = await h.call(4, "GET", "/machines");
+    assert.deepEqual(r.body.machines, [], "an unverified member lists the account's machines");
+    r = await h.call(4, "GET", "/key/m-ov");
+    assert.equal(r.status, 404, "an unverified member reads the account's key");
+  } finally { await h.close(); }
 });
 
 test("M1: one machine id seated on two accounts — each account's key is its own; neither reads or replaces the other's", async () => {
