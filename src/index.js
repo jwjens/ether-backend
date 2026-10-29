@@ -43,7 +43,6 @@ const cors       = require("cors");
 const crypto     = require("crypto");
 const path       = require("path");
 const zlib       = require("zlib");
-const { Pool }   = require("pg");
 const { Resend } = require("resend");
 const bcrypt     = require('bcrypt');
 const jwt        = require('jsonwebtoken');
@@ -94,7 +93,7 @@ let multer;
 try { multer = require("multer"); } catch { multer = null; }
 
 const app    = express();
-const pool   = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+const pool   = require("./lib/server-pool").makePool();   // Postgres at DATABASE_URL; a test hands in its own (lib/server-pool.js)
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 // ── R2 client (lazy singleton) ────────────────────────────────
@@ -1432,7 +1431,7 @@ setInterval(() => {
   mutationRetention.pruneSupersededMutations(pool, 2)
     .then((n) => n && console.log(`[retention] pruned ${n} superseded mutations`))
     .catch((e) => console.error("[retention] prune failed:", e.message));
-}, 24 * 60 * 60 * 1000);
+}, 24 * 60 * 60 * 1000).unref();   // the listening server keeps the process alive; a test that loads the app can exit
 
 // One-click "download the latest Ether installer" — resolves the newest GitHub release asset for
 // the OS and 302-redirects to it, so the link is always current (filenames are versioned).
@@ -7562,8 +7561,11 @@ app.use('/api/auth', AUTH.router(requireUser));
 
 // ── Start ─────────────────────────────────────────────────────
 
+// Run as the server (`node src/index.js`, the Procfile) it starts exactly as before. Loaded by a test (require), it only
+// builds the app: the test runs initDB on its own pool and serves `app` itself (lib/server-pool.js).
 const PORT = process.env.PORT || 3000;
-initDB().then(() => {
+function start() {
+return initDB().then(() => {
   app.listen(PORT, () => {
     console.log(`[Ether] API live → port ${PORT}`);
     if (!multer) console.warn("[Ether] multer not installed — backup upload disabled. Run: npm install multer");
@@ -7600,3 +7602,7 @@ initDB().then(() => {
   console.error("[Ether] DB init failed:", e.message);
   process.exit(1);
 });
+}
+if (require.main === module) start();
+
+module.exports = { app, pool, initDB, resend };
