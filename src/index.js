@@ -65,6 +65,8 @@ const { userEntitlement: computeUserEntitlement } = require("./lib/entitlement")
 const PLANS = require("./lib/plans");
 const PLAN_CATALOG = PLANS.load();
 const ENT = require("./lib/entitlements");
+/** What license row `lic` may use now (plan, status, cloud features, limits). Cloud only: nothing local reads it. */
+const entitlementsOf = (lic) => ENT.entitlementsFor(lic || null, { catalog: PLAN_CATALOG });
 const { resolveDesktopLicense } = require("./lib/desktop-license");   // desktop-activate: never a license by email match
 const emailVerify = require("./lib/email-verify");   // sign-up confirmation link (24 h); a membership counts once verified
 // SIGN-IN SESSIONS (src/lib/auth-sessions.js; Jeff, 2026-10-28): a running station stays signed in forever; a session ends
@@ -1142,17 +1144,19 @@ async function lookupLicenseDetailed(rawKey) {
      WHERE (key_prefix = $1 OR license_key = $2) AND active = true`,
     [prefix, rawKey]
   ).catch(() => ({ rows: [] }));
-  let sawExpired = false;
+  let expiredRow = null;
   for (const row of rows) {
     const keyMatches = row.key_hash != null
       ? await bcrypt.compare(rawKey, row.key_hash)
       : rawKey === row.license_key;
     if (!keyMatches) continue;
     // Key matches this row. If it carries a past expires_at, it's a lapsed trial.
-    if (row.expires_at && new Date(row.expires_at).getTime() < Date.now()) { sawExpired = true; continue; }
+    if (row.expires_at && new Date(row.expires_at).getTime() < Date.now()) { expiredRow = expiredRow || row; continue; }
     return { row, reason: "ok" };
   }
-  return { row: null, reason: sawExpired ? "expired" : "notfound" };
+  // expiredRow: the matched row of a lapsed trial, so the caller can say what the account has (entitlements); it is
+  // never treated as a usable license.
+  return { row: null, reason: expiredRow ? "expired" : "notfound", expiredRow };
 }
 
 async function requireLicense(req, res, next) {
@@ -2305,7 +2309,8 @@ app.get("/api/user/me", requireUser, async (req, res) => {
   try {
     const u = (await pool.query(`SELECT * FROM users WHERE id = $1`, [req.user.uid])).rows[0];
     if (!u) return res.status(404).json({ error: "not_found" });
-    res.json({ account: publicAccount(u, await userEntitlement(u)) });
+    const lic = u.license_key_id ? (await pool.query(`SELECT * FROM licenses WHERE id = $1`, [u.license_key_id])).rows[0] : null;
+    res.json({ account: publicAccount(u, await userEntitlement(u)), entitlements: entitlementsOf(lic) });
   } catch (e) { console.error("[user/me]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
@@ -2557,6 +2562,7 @@ app.post("/api/user/desktop-activate", authLimiter, async (req, res) => {
       email: u.email,
       name: u.name || null,
       license_key: license.license_key || null,   // trial keys are plaintext; paid bcrypt keys omit it
+      entitlements: entitlementsOf(license),
       trial: ent.status === "trial",
       trial_ends_at: ent.status === "trial" ? u.trial_ends_at : null,
       // RBAC foundation: a user JWT so the desktop can read /api/me/memberships (the accounts +
@@ -3956,6 +3962,25 @@ app.get("/public/plans", (req, res) => {
   res.json(PLANS.publicCatalog(PLAN_CATALOG));
 });
 
+// What the signed-in account's plan allows right now. A license key (x-license-key; a lapsed trial's key is answered
+// too, so the desktop can show "lapsed") or a signed-in user (Bearer, typ user: their own license).
+app.get("/api/entitlements", async (req, res) => {
+  try {
+    const key = req.headers["x-license-key"];
+    if (key) {
+      const looked = await lookupLicenseDetailed(String(key));
+      const lic = looked.row || looked.expiredRow;
+      if (!lic) return res.status(401).json({ error: "invalid_license_key" });
+      return res.json({ entitlements: entitlementsOf(lic) });
+    }
+    return requireUser(req, res, async () => {
+      const u = (await pool.query(`SELECT license_key_id FROM users WHERE id = $1`, [req.user.uid])).rows[0];
+      const lic = u && u.license_key_id ? (await pool.query(`SELECT * FROM licenses WHERE id = $1`, [u.license_key_id])).rows[0] : null;
+      res.json({ entitlements: entitlementsOf(lic) });
+    });
+  } catch (e) { console.error("[entitlements]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
 // ── License validation ────────────────────────────────────────
 
 app.post("/validate", async (req, res) => {
@@ -4242,7 +4267,8 @@ app.post("/account/connect", async (req, res) => {
     // on renewal. renew_url points the operator at the plan picker.
     const looked = await lookupLicenseDetailed(rawKey);
     if (looked.reason === "expired") {
-      return res.status(401).json({ error: "trial_expired", renew_url: "https://signup.ether-technologies.com" });
+      return res.status(401).json({ error: "trial_expired", renew_url: "https://signup.ether-technologies.com",
+        entitlements: entitlementsOf(looked.expiredRow) });
     }
     const license = looked.row;
     if (!license) return res.status(401).json({ error: "invalid_license_key" });
@@ -4293,6 +4319,8 @@ app.post("/account/connect", async (req, res) => {
       seats_used: seatsUsed,
       ...SEATS.seatFields(tier),
       plan:       license.plan ?? "free",
+      // what this account's plan allows (src/lib/entitlements.js): the desktop shows and gates cloud features from this
+      entitlements: entitlementsOf(license),
     });
   } catch (e) {
     console.error("[/account/connect]", e.message);
