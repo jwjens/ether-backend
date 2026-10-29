@@ -60,6 +60,11 @@ const { parkOpsRefusal } = cmdBus;
 const { isStationScopedCommand, stampTarget } = require("./lib/station-commands");   // web remote slice 1: a station control targets the sourcing machine
 const stripeWebhook = require("./lib/stripe-webhook");   // P0: what a verified platform Stripe event does to licenses
 const { userEntitlement: computeUserEntitlement } = require("./lib/entitlement");
+// THE PLAN CATALOG (config/plans.json): every price, plan name and limit, and which plan carries which cloud feature.
+// Loaded and validated once at boot: a bad catalog stops the server rather than sell the wrong thing.
+const PLANS = require("./lib/plans");
+const PLAN_CATALOG = PLANS.load();
+const ENT = require("./lib/entitlements");
 const { resolveDesktopLicense } = require("./lib/desktop-license");   // desktop-activate: never a license by email match
 const emailVerify = require("./lib/email-verify");   // sign-up confirmation link (24 h); a membership counts once verified
 // SIGN-IN SESSIONS (src/lib/auth-sessions.js; Jeff, 2026-10-28): a running station stays signed in forever; a session ends
@@ -3943,6 +3948,13 @@ app.get("/console",     (req, res) => res.sendFile(path.join(PUBLIC, "console.ht
 app.get("/health", (req, res) =>
   res.json({ ok: true, service: "Ether Technologies API", version: "1.5.2", ts: new Date().toISOString() })
 );
+
+// ── Plans (public) ────────────────────────────────────────────
+// The one place every screen reads prices, plan names and limits from (website, signup, dashboard, desktop).
+app.get("/public/plans", (req, res) => {
+  res.set("Cache-Control", "public, max-age=300");
+  res.json(PLANS.publicCatalog(PLAN_CATALOG));
+});
 
 // ── License validation ────────────────────────────────────────
 
