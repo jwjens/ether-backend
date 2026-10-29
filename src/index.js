@@ -278,6 +278,13 @@ app.use("/webhook/stripe", express.raw({ type: "application/json" }));
 app.use("/webhook/stripe/jukebox", express.raw({ type: "application/json" }));
 app.use(express.json({ limit: "10mb" }));
 app.use(cors({ origin: "*" }));
+// The plan check on every cloud route (src/lib/feature-gate.js): shadow by default (records who WOULD be refused, refuses
+// nobody); PLAN_ENFORCE=1 answers 402 plan_required. Only ever adds a refusal; every route's own sign-in still runs.
+const PLAN_GATE = require("./lib/feature-gate").createFeatureGate({
+  pool, catalog: PLAN_CATALOG, jwt, jwtSecret: JWT_SECRET,
+  lookupKey: async (raw) => { const l = await lookupLicenseDetailed(raw); return l.row || l.expiredRow || null; },
+});
+app.use(PLAN_GATE.middleware);
 
 // Serve landing, mobile.html, companion.html, guest-join.html from public/
 const PUBLIC = path.join(__dirname, "../public");
@@ -1360,6 +1367,10 @@ app.post("/api/platform/login", (req, res) => {
 // Platform-gated config diagnostic. Price IDs aren't secrets; the secret key is never returned.
 // Asks Stripe (with the configured key) which ACCOUNT it belongs to + lists the real prices it
 // can see, so we can see exactly why a checkout price isn't found.
+// Who the plan check has refused, or in shadow mode WOULD refuse, since the server started: license, its email, plan,
+// status, feature, count. Read this before turning PLAN_ENFORCE on.
+app.get("/api/platform/plan-refusals", requirePlatform, (_req, res) => res.json(PLAN_GATE.report()));
+
 app.get("/api/platform/diag", requirePlatform, async (_req, res) => {
   const k = process.env.STRIPE_SECRET_KEY || "";
   const out = {
