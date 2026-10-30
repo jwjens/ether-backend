@@ -50,8 +50,8 @@ function licenseStatus(lic, { catalog, now = Date.now(), sub = null, exemptIds }
     out.status = NEVER_EXPIRES(lic.plan) ? "lifetime" : "exempt";
     out.label = out.status === "lifetime" ? "Lifetime" : "Outside plans";
   } else if (e.status === "active" && String(lic.plan) === "free") {
-    // the old free key: Founding Local (Decision 6) — no charge and never lapses, so never shown as Paid
-    Object.assign(out, { status: "founding", label: "Founding Local" });
+    // the old free key (Jeff, 2026-10-29: "Free (old key)"): no charge and never lapses, so never shown as Paid
+    Object.assign(out, { status: "free_old", label: "Free (old key)" });
   } else if (e.status === "active") {
     Object.assign(out, { status: "paid", label: "Paid" });
   } else if (e.status === "inactive") {

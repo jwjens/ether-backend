@@ -62,10 +62,10 @@ test("off and unknown keys say so", () => {
   assert.equal(st({ plan: "mystery" }).status, "unknown");
 });
 
-test("free is Founding Local (never shown as Paid), Local in the dropdown", () => {
+test("the old free key reads \"Free (old key)\" (never Paid), Local in the dropdown", () => {
   const s = st({ plan: "free", expires_at: iso(now - 100 * day) });
-  assert.equal(s.status, "founding");
-  assert.equal(s.label, "Founding Local");
+  assert.equal(s.status, "free_old");
+  assert.equal(s.label, "Free (old key)");
   assert.equal(s.tier_choice, "local");
 });
 
