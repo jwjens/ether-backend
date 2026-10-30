@@ -32,6 +32,27 @@ const PG_MEM_GAPS = [
       return { rows: [], rowCount: rows.length };
     },
   },
+  {
+    // pg-mem cannot resolve the outer table (`l.`) inside a correlated subquery. The platform license list is read row by
+    // row instead: the same columns, each counted by its own simple query.
+    why: "correlated subqueries (platform license list)",
+    match: (sql) => /SELECT l\.id, l\.email, l\.plan, l\.active, l\.created_at, l\.key_prefix/.test(sql) && /FROM licenses l ORDER BY l\.created_at DESC/.test(sql),
+    run: async (q) => {
+      const lics = (await q(`SELECT * FROM licenses ORDER BY created_at DESC`)).rows;
+      const rows = [];
+      for (const l of lics) {
+        const keys = [l.license_key, `lic-${l.id}`];
+        const st = (await q(`SELECT name FROM stations WHERE license_key_id = $1 ORDER BY name`, [l.id])).rows.map(r => r.name);
+        const acts = (await q(`SELECT last_seen, deauthorized_at FROM license_activations WHERE license_key = $1 OR license_key = $2`, keys)).rows;
+        const seen = [l.last_validated, ...acts.map(a => a.last_seen)].filter(Boolean).map(d => new Date(d).getTime());
+        rows.push({ id: l.id, email: l.email, plan: l.plan, active: l.active, created_at: l.created_at, key_prefix: l.key_prefix,
+          last_validated: l.last_validated, seat_tier_id: l.seat_tier_id, expires_at: l.expires_at, has_stripe: l.stripe_subscription_id != null,
+          last_seen: seen.length ? new Date(Math.max(...seen)) : null, stations: st.length, station_names: st,
+          activations: acts.filter(a => a.deauthorized_at == null).length });
+      }
+      return { rows, rowCount: rows.length };
+    },
+  },
 ];
 
 function registerFunctions(db) {

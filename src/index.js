@@ -1730,10 +1730,30 @@ app.delete("/api/platform/stations/:uuid", requirePlatform, async (req, res) => 
 
 // ── License management (platform owner) — mint comp/promo keys + assign a tier, no payment ──
 const LICENSE_TIERS = ["free", "pro", "pro_lifetime", "station", "station_lifetime", "operator"];
+const LICENSE_STATUS = require("./lib/license-status");
+// Each Stripe-paid license's subscription (renewal date, cancel flag), read from Stripe. Never written anywhere.
+async function stripeSubscriptionsFor(licenseRows) {
+  const out = { byLicense: {}, idOf: {} };
+  const paid = licenseRows.filter(l => l.has_stripe);
+  if (!paid.length) return out;
+  const { rows } = await pool.query(`SELECT id, stripe_subscription_id FROM licenses WHERE id = ANY($1)`, [paid.map(l => l.id)]);
+  for (const r of rows) out.idOf[r.id] = r.stripe_subscription_id;
+  if (!process.env.STRIPE_SECRET_KEY) return out;
+  const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+  const timeout = new Promise((resolve) => setTimeout(resolve, 5000, null));
+  await Promise.allSettled(rows.map(async (r) => {
+    const sub = await Promise.race([stripe.subscriptions.retrieve(r.stripe_subscription_id), timeout]);
+    if (sub) out.byLicense[r.id] = { status: sub.status, current_period_end: sub.current_period_end, cancel_at_period_end: !!sub.cancel_at_period_end };
+  }));
+  return out;
+}
 app.get("/api/platform/licenses", requirePlatform, async (_req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT l.id, l.email, l.plan, l.active, l.created_at, l.key_prefix, l.last_validated, l.seat_tier_id,
+              l.expires_at, l.stripe_subscription_id IS NOT NULL AS has_stripe,
+              GREATEST(l.last_validated, (SELECT MAX(a.last_seen) FROM license_activations a
+                 WHERE a.license_key = l.license_key OR a.license_key = 'lic-' || l.id)) AS last_seen,
               (SELECT COUNT(*)::int FROM stations s WHERE s.license_key_id = l.id) AS stations,
               (SELECT COALESCE(array_agg(s.name ORDER BY s.name), '{}')
                  FROM stations s WHERE s.license_key_id = l.id) AS station_names,
@@ -1744,7 +1764,17 @@ app.get("/api/platform/licenses", requirePlatform, async (_req, res) => {
     // Each license's EFFECTIVE seat tier (its own, else its plan's default, else the default) beside the raw column.
     const { rows: seatTiers } = await pool.query(`SELECT id, name, seat_limit, is_default, default_for_plan FROM seat_tiers`);
     for (const l of rows) Object.assign(l, SEATS.seatFields(SEATS.pickSeatTier(l, seatTiers)));
-    res.json({ tiers: LICENSE_TIERS, seat_tiers: seatTiers, licenses: rows });
+    // Status, the date that applies and how it is paid, from the same plan rules the server enforces
+    // (src/lib/license-status.js). A Stripe subscription's renewal date comes from Stripe; if Stripe does not answer
+    // in 5 s the row still shows "Stripe", without the date.
+    const subs = await stripeSubscriptionsFor(rows);
+    for (const l of rows) {
+      l.plan_status = LICENSE_STATUS.licenseStatus(
+        { id: l.id, plan: l.plan, active: l.active, expires_at: l.expires_at, stripe_subscription_id: l.has_stripe ? subs.idOf[l.id] : null },
+        { catalog: PLAN_CATALOG, sub: subs.byLicense[l.id] || null });
+      delete l.has_stripe;
+    }
+    res.json({ tiers: LICENSE_TIERS, tier_options: LICENSE_STATUS.tierOptions(PLAN_CATALOG), seat_tiers: seatTiers, licenses: rows });
   } catch (e) { console.error("[platform/licenses]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
