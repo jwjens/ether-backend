@@ -1,0 +1,21 @@
+# THE BACKEND'S RELEASE CHECK (stranger tests, step d — docs/link-access-audit-and-email-2026-10-28.md §4.4, desktop repo).
+# A push to main deploys on Railway. With Railway's "Wait for CI" on (service → Settings → Deploy), Railway deploys a
+# commit only after this check passes: the server boots on its real schema, every route is classified, and no stranger
+# test reaches another account's data.
+name: test
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
