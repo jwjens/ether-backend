@@ -10,6 +10,10 @@ const crypto = require("node:crypto");
 
 // Fixed secrets so a test can mint the same tokens the server would.
 const SECRETS = { JWT_SECRET: "test-jwt-secret", ADMIN_SECRET: "test-admin-secret", ETHER_PLATFORM_SECRET: "test-platform-secret" };
+// Dummy R2 settings: signing an upload/download link is computed locally (no request leaves the machine), so routes
+// that hand out R2 links run their real code in a test instead of answering 503 r2_not_configured.
+const R2_TEST_ENV = { R2_ACCOUNT_ID: "testaccount", R2_ACCESS_KEY_ID: "test-access-key", R2_SECRET_ACCESS_KEY: "test-secret-key",
+                      R2_BUCKET: "test-bucket", R2_PUBLIC_BUCKET: "test-public-bucket", R2_PUBLIC_BASE_URL: "https://r2.test.invalid" };
 
 /** Statements pg-mem cannot run, and what the test runs instead. */
 const PG_MEM_GAPS = [
@@ -42,6 +46,7 @@ function registerFunctions(db) {
 /** Boot the real server. Call once per test file (src/index.js is a module: one app per process). */
 async function startServer() {
   for (const [k, v] of Object.entries(SECRETS)) process.env[k] = v;
+  for (const [k, v] of Object.entries(R2_TEST_ENV)) if (!process.env[k]) process.env[k] = v;
   process.env.RESEND_API_KEY = process.env.RESEND_API_KEY || "re_test_never_sent";
   const db = newDb();
   registerFunctions(db);

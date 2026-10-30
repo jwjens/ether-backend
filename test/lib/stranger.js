@@ -28,6 +28,9 @@ async function seedAccount(pool, tag) {
   const pinHash = "salt" + tag + ":" + crypto.createHash("sha256").update("salt" + tag + "1234").digest("hex");
   const opId = (await q(`INSERT INTO account_users (license_key_id, username, display_name, role, pin_hash)
                          VALUES ($1,'admin','Admin ${tag}','admin',$2) RETURNING id`, [lic, pinHash])).rows[0].id;
+  // The owner is a member of their own account (owner position), as the members/positions routes expect.
+  const ownerPos = (await q(`SELECT id FROM positions WHERE key = 'owner' AND account_id IS NULL`)).rows[0].id;
+  await q(`INSERT INTO memberships (user_id, account_id, position_id, all_stations, status) VALUES ($1,$2,$3,true,'active')`, [uid, lic, ownerPos]);
   const uuid = crypto.randomUUID();
   const stationName = `Station-${tag}-${crypto.randomBytes(3).toString("hex")}`;
   const stationId = (await q(`INSERT INTO stations (uuid, license_key_id, name) VALUES ($1,$2,$3) RETURNING id`, [uuid, lic, stationName])).rows[0].id;
@@ -93,7 +96,7 @@ function bodyFor(A) {
   return { station_uuid: A.uuid, stationUuid: A.uuid, uuid: A.uuid, station_id: A.stationId, stationId: A.stationId,
            account_id: A.lic, license_id: A.lic, license_key_id: A.lic, machine_id: A.machine, machineId: A.machine,
            content_hash: A.songHash, slug: A.slug, email: A.email, table: "categories", row_uuid: A.rowUuid, id: A.backupId,
-           filename: `backup-${A.tag}.db`, username: "admin", pin: "1234", target: A.uuid };
+           filename: `backup-${A.tag}.db`, username: "admin", pin: "0000", target: A.uuid };
 }
 
 function markersOf(A) {
@@ -108,6 +111,7 @@ function belongsTo(A, table, row) {
   if (table === "licenses") return v("id") === lic;
   if (table === "users") return v("id") === String(A.uid) || v("license_key_id") === lic;
   if (table === "stations") return v("uuid") === A.uuid;
+  if (table === "auth_sessions") return v("user_id") === String(A.uid);   // a session is its user's, whatever machine label it carries
   for (const c of ["license_key_id", "license_id", "owner_license_id", "account_id"]) if (v(c) === lic) return true;
   if (v("station_uuid") === A.uuid) return true;
   if (v("license_key") === A.key) return true;
@@ -125,11 +129,12 @@ async function snapshot(pool) {
 }
 
 /** A's rows that differ between two snapshots: [{ table, kind: "added"|"removed", row }]. */
-function aChanges(A, before, after) {
+function aChanges(A, before, after, ignoreColumns = {}) {
   const out = [];
+  const strip = (t, r) => { const c = { ...r }; for (const k of ignoreColumns[t] || []) delete c[k]; return JSON.stringify(c); };
   for (const t of new Set([...Object.keys(before), ...Object.keys(after)])) {
-    const b = (before[t] || []).filter(r => belongsTo(A, t, r)).map(r => JSON.stringify(r));
-    const a = (after[t] || []).filter(r => belongsTo(A, t, r)).map(r => JSON.stringify(r));
+    const b = (before[t] || []).filter(r => belongsTo(A, t, r)).map(r => strip(t, r));
+    const a = (after[t] || []).filter(r => belongsTo(A, t, r)).map(r => strip(t, r));
     const count = (xs) => xs.reduce((m, x) => m.set(x, (m.get(x) || 0) + 1), new Map());
     const cb = count(b), ca = count(a);
     for (const [x, n] of cb) if ((ca.get(x) || 0) < n) out.push({ table: t, kind: "removed", row: x });
@@ -166,26 +171,45 @@ function fillPath(route, params) {
 
 /**
  * Aim every B credential at A's resource on `route` ("METHOD /path/:param"). Returns the violations found (empty = pass).
- * opts.params / opts.body override what A's ids are for this route.
+ * opts.params / opts.body / opts.query override what A's ids are for this route. opts.ignoreColumns = { table: [columns] }:
+ * changes B may cause to A's row by design (a wrong PIN counted by the lockout rule), and nothing else on that row.
  */
 async function strangerAttempt(h, A, B, route, opts = {}) {
   const [method, path] = route.split(" ");
   const params = { ...paramsFor(A), ...(opts.params || {}) };
   const markers = markersOf(A);
-  const violations = [];
+  const violations = [], bStatuses = [];
+  // The fields routes validate first (client_id, table, since) carry plausible values, so a request reaches the route's
+  // ownership check instead of stopping at "missing client_id".
+  const query = (who, cred) => new URLSearchParams({ station_uuid: A.uuid, stationUuid: A.uuid, client_id: who.machine, table: "categories",
+                                                     since: "0", ...(cred.query || {}), ...(opts.query || {}) }).toString();
   for (const cred of credentialsOf(B, h.secrets.JWT_SECRET)) {
-    const qs = new URLSearchParams({ station_uuid: A.uuid, stationUuid: A.uuid, ...(cred.query || {}), ...(opts.query || {}) }).toString();
-    const url = `${fillPath(path, params)}?${qs}`;
-    const body = { ...bodyFor(A), ...(cred.body || {}), ...(opts.body || {}) };
+    const url = `${fillPath(path, params)}?${query(B, cred)}`;
+    const body = { ...bodyFor(A), client_id: B.machine, ...(cred.body || {}), ...(opts.body || {}) };
     const before = await snapshot(h.pool);
     const r = await callOnce(h.base, method, url, { headers: cred.headers, body });
     const after = await snapshot(h.pool);
     const leaked = markers.filter(m => r.text.includes(m));
     if (leaked.length) violations.push({ route, cred: cred.name, status: r.status, kind: "leak", detail: leaked.join(", "), sample: r.text.slice(0, 200) });
-    const changed = aChanges(A, before, after);
+    const changed = aChanges(A, before, after, opts.ignoreColumns);
     if (changed.length) violations.push({ route, cred: cred.name, status: r.status, kind: "change", detail: changed.map(c => `${c.kind} ${c.table}`).join(", "), sample: changed[0].row.slice(0, 200) });
+    bStatuses.push(r.status);
   }
-  return violations;
+  // THE PROOF THE ROUTE WAS REACHED: the same request with A's own credentials (A's own key where B's went). A route that
+  // refuses A too (a pg-mem gap, a field the fixture lacks) proves nothing about B — it is reported as NOT PROVEN, never
+  // counted as a pass. The database is put back afterwards, so A's own deletes don't change the fixture.
+  const backup = h.db.backup();
+  const aStatuses = [];
+  try {
+    const ownParams = { ...params, ...(opts.ownParams ? opts.ownParams(A) : {}) };
+    const own = opts.ownCredentials ? opts.ownCredentials(h.secrets.JWT_SECRET) : credentialsOf(A, h.secrets.JWT_SECRET);
+    for (const cred of own) {
+      const body = { ...bodyFor(A), client_id: A.machine, ...(cred.body || {}), ...(opts.body || {}) };
+      const r = await callOnce(h.base, method, `${fillPath(path, ownParams)}?${query(A, cred)}`, { headers: cred.headers, body });
+      aStatuses.push({ cred: cred.name.replace(/^B /, "A "), status: r.status });
+    }
+  } finally { backup.restore(); }
+  return { violations, bStatuses, aStatuses, proven: aStatuses.some(x => x.status >= 200 && x.status < 300) };
 }
 
 module.exports = { seedAccount, tokensFor, credentialsOf, strangerAttempt, snapshot, aChanges, belongsTo, markersOf, callOnce };
@@ -196,12 +220,13 @@ module.exports = { seedAccount, tokensFor, credentialsOf, strangerAttempt, snaps
  * whose ids live elsewhere. `controls` = [route, opts] that A's own credential must succeed on (proves the fixture
  * reaches the route's ownership check — a stranger test that every request fails for the wrong reason proves nothing).
  */
-function runArea(area, { overrides = {}, controls = [] } = {}) {
+function runArea(area, { overrides = {}, controls = [], ...areaOpts } = {}) {
   const test = require("node:test");
   const assert = require("node:assert");
   const { startServer } = require("../server-harness");
   const { ROUTES } = require("../../src/access/route-access");
   const routes = Object.entries(ROUTES).filter(([, v]) => v.access === "account" && v.area === area).map(([k]) => k);
+  const coverage = [];
   let h, A, B;
   test.before(async () => {
     h = await startServer();
@@ -223,10 +248,19 @@ function runArea(area, { overrides = {}, controls = [] } = {}) {
   test(`${area}: ${routes.length} account routes`, () => assert.ok(routes.length > 0));
   for (const route of routes) {
     test(`stranger: B cannot read or change A's data — ${route}`, async () => {
-      const v = await strangerAttempt(h, A, B, route, overrides[route] || {});
-      assert.deepEqual(v, [], `B reached A's data:\n${JSON.stringify(v, null, 2)}`);
+      const ov = overrides[route] || {};
+      const r = await strangerAttempt(h, A, B, route, { ...areaOpts, ...(typeof ov === "function" ? ov(A, B) : ov) });
+      coverage.push({ route, proven: r.proven, a: r.aStatuses.map(x => x.status), b: r.bStatuses });
+      assert.deepEqual(r.violations, [], `B reached A's data:\n${JSON.stringify(r.violations, null, 2)}`);
     });
   }
+  test(`${area}: coverage — the routes A's own credential reached (the rest are NOT PROVEN)`, () => {
+    const notProven = coverage.filter(c => !c.proven);
+    console.log(`[stranger] ${area}: proven ${coverage.length - notProven.length}/${coverage.length}` +
+      (notProven.length ? `; NOT PROVEN (A refused too):\n${notProven.map(c => `  ${c.route}  A:${c.a.join(",")}  B:${c.b.join(",")}`).join("\n")}` : ""));
+    const out = process.env.STRANGER_COVERAGE_DIR;
+    if (out) require("node:fs").writeFileSync(require("node:path").join(out, `stranger-${area}.json`), JSON.stringify(coverage, null, 1));
+  });
 }
 
 module.exports.runArea = runArea;
