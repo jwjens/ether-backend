@@ -42,3 +42,31 @@ test("sign-up through the real route: signed in at once, and a 24-hour link emai
   const me = await h.call("GET", "/api/user/me", { headers: { authorization: `Bearer ${r.body.token}` } });
   assert.equal(me.body.account.email_verified, true);
 });
+
+test("an expired link says so, and 'Send a new link' from that link (not signed in) mails a fresh 24-hour link to the account's own address", async () => {
+  const r = await h.call("POST", "/api/user/signup", { body: { email: "late@example.org", password: "password-1" } });
+  assert.equal(r.status, 200, r.text);
+  const sent = h.emails.length;
+  const old = /verify\?token=([A-Za-z0-9_-]+)/.exec(h.emails[sent - 1].html)[1];
+  await h.pool.query(`UPDATE users SET verify_expires = now() - interval '1 hour' WHERE email = 'late@example.org'`);
+  const v = await h.call("POST", "/api/user/verify", { body: { token: old } });
+  assert.equal(v.status, 400); assert.equal(v.body.error, "expired", "an expired link is told apart from a wrong one");
+
+  const n = await h.call("POST", "/api/user/verify/resend", { body: { token: old } });   // no Authorization header
+  assert.equal(n.status, 200, n.text);
+  assert.equal(h.emails.length, sent + 1, "one new email");
+  assert.deepEqual([].concat(h.emails[sent].to), ["late@example.org"], "sent only to the account's own address");
+  const fresh = /verify\?token=([A-Za-z0-9_-]+)/.exec(h.emails[sent].html)[1];
+  assert.notEqual(fresh, old);
+  assert.equal((await h.call("POST", "/api/user/verify", { body: { token: old } })).body.error, "invalid_token", "the old link stops working");
+  assert.equal((await h.call("POST", "/api/user/verify", { body: { token: fresh } })).status, 200, "the new link confirms");
+  assert.equal((await h.call("POST", "/api/user/verify/resend", { body: { token: fresh } })).status, 400, "a spent link can't send another");
+});
+
+test("'Send a new link' with a made-up link sends nothing; without a link it still needs a sign-in", async () => {
+  const sent = h.emails.length;
+  const bad = await h.call("POST", "/api/user/verify/resend", { body: { token: "not-a-real-link" } });
+  assert.equal(bad.status, 400); assert.equal(bad.body.error, "invalid_token");
+  assert.equal((await h.call("POST", "/api/user/verify/resend", { body: {} })).status, 401);
+  assert.equal(h.emails.length, sent, "nothing sent");
+});

@@ -41,9 +41,17 @@ async function confirm(pool, raw, { now = Date.now() } = {}) {
   return { ok: false, error: stale ? "expired" : "invalid_token" };
 }
 
+/** The not-yet-verified user an (expired) link was sent to, or null. Lets "send a new link" work from the link itself
+ *  without signing in: the new link goes only to that user's own stored address, never to one the request names. */
+async function userForLink(pool, raw) {
+  if (!raw) return null;
+  return (await pool.query(
+    `SELECT id, email, unsubscribe_token FROM users WHERE verify_token = $1 AND email_verified IS NOT TRUE`, [hashToken(raw)])).rows[0] || null;
+}
+
 /** The inbox was proven another way (a password reset link): the email is confirmed; any open link is spent. */
 async function markVerified(pool, userId) {
   await pool.query(`UPDATE users SET email_verified = true, verify_token = NULL, verify_expires = NULL WHERE id = $1`, [userId]);
 }
 
-module.exports = { VERIFY_HOURS, VERIFY_DDL, MEMBERSHIP_COUNTS_SQL, hashToken, issue, confirm, markVerified };
+module.exports = { VERIFY_HOURS, VERIFY_DDL, MEMBERSHIP_COUNTS_SQL, hashToken, issue, confirm, markVerified, userForLink };

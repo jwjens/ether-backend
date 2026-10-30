@@ -2341,8 +2341,18 @@ app.post("/api/user/verify", authLimiter, async (req, res) => {
   } catch (e) { console.error("[user/verify]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
-// A new link (the old one expired or was lost). The previous link stops working.
-app.post("/api/user/verify/resend", authLimiter, requireUser, async (req, res) => {
+// A new link (the old one expired or was lost). The previous link stops working. Two ways in: signed in, or from the
+// expired link itself ({ token }) — the verify page's "Send a new link" button, which works without signing in. Either
+// way the new link goes only to the account's own stored address.
+app.post("/api/user/verify/resend", authLimiter, async (req, res, next) => {
+  if (!req.body?.token) return next();
+  try {
+    const u = await emailVerify.userForLink(pool, String(req.body.token));
+    if (!u) return res.status(400).json({ error: "invalid_token" });
+    sendVerifyEmail(u.email, "Confirm your email", await emailVerify.issue(pool, u.id), u.unsubscribe_token);
+    res.json({ ok: true });
+  } catch (e) { console.error("[user/verify/resend link]", e.message); res.status(500).json({ error: "server_error" }); }
+}, requireUser, async (req, res) => {
   try {
     const u = (await pool.query(`SELECT id, email, email_verified, unsubscribe_token FROM users WHERE id = $1`, [req.user.uid])).rows[0];
     if (!u) return res.status(404).json({ error: "not_found" });
