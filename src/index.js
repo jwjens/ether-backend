@@ -984,6 +984,8 @@ async function initDB() {
 // check — customer ends up worse than free with a fully-issued license.
 const VALID_PLANS = new Set([
   "free", "pro", "pro_lifetime", "station", "station_lifetime", "operator",
+  // Unlimited (Jeff, 2026-10-29): its own key, renewing and expiring like the other paid plans; never stored as operator
+  "unlimited",
 ]);
 
 // Stripe priceId → PlanTier lookup. Used by /webhook/stripe to determine
@@ -1004,6 +1006,8 @@ const PLAN_BY_PRICE_ID = Object.fromEntries(
   [
     [process.env.PRICE_PRO,     "pro"],
     [process.env.PRICE_STATION, "station"],
+    [process.env.PRICE_UNLIMITED_MONTHLY, "unlimited"],
+    [process.env.PRICE_UNLIMITED_ANNUAL,  "unlimited"],
   ].filter(([id]) => !!id)
 );
 
@@ -1022,16 +1026,18 @@ const PLAN_STATION_LIMITS = {
   station:          5,
   station_lifetime: 5,
   operator:        -1,
+  unlimited:       -1,   // the catalog's Unlimited: unlimited hosted streams
 };
 
 // Plans entitled to cloud sync + remote-control features (Studio and up, INCLUDING the lifetime
 // variants and Enterprise/operator). The *_lifetime and operator tiers were historically missing
 // from these gates — which 403'd paying Lifetime/Enterprise customers out of sync. Keep complete.
-const PAID_PLANS = new Set(["pro", "pro_lifetime", "station", "station_lifetime", "operator"]);
+const PAID_PLANS = new Set(["pro", "pro_lifetime", "station", "station_lifetime", "operator", "unlimited"]);
 
 function generateLicenseKey(plan) {
   const prefix = (plan === "station" || plan === "station_lifetime") ? "ETH-STN"
                : plan === "operator" ? "ETH-ENT"
+               : plan === "unlimited" ? "ETH-UNL"
                : "ETH-PRO";   // pro / pro_lifetime / free
   const rand   = crypto.randomBytes(12).toString("hex").toUpperCase();
   return `${prefix}-${rand.slice(0,4)}-${rand.slice(4,8)}-${rand.slice(8,12)}`;
@@ -1091,8 +1097,8 @@ function emailShell({ heading, bodyHtml, button, unsubUrl }) {
 }
 
 async function sendLicenseEmail(email, licenseKey, plan) {
-  const label = plan === "station" ? "Network" : "Studio";
-  const price = plan === "station" ? "$79/mo" : "$19/mo";
+  const label = plan === "unlimited" ? PLAN_CATALOG.plans.unlimited.label : plan === "station" ? "Network" : "Studio";
+  const price = plan === "unlimited" ? `$${PLAN_CATALOG.plans.unlimited.price_monthly}/mo` : plan === "station" ? "$79/mo" : "$19/mo";
   const from  = process.env.FROM_EMAIL || "noreply@ether-technologies.com";
   const bodyHtml = `
     <p style="margin:0 0 18px">Thanks for subscribing to <strong style="color:#18181b">Ether ${label}</strong> (${price}). Save this email — you'll need the key if you ever reinstall.</p>
@@ -1729,7 +1735,7 @@ app.delete("/api/platform/stations/:uuid", requirePlatform, async (req, res) => 
 });
 
 // ── License management (platform owner) — mint comp/promo keys + assign a tier, no payment ──
-const LICENSE_TIERS = ["free", "pro", "pro_lifetime", "station", "station_lifetime", "operator"];
+const LICENSE_TIERS = ["free", "pro", "pro_lifetime", "station", "station_lifetime", "operator", "unlimited"];
 const LICENSE_STATUS = require("./lib/license-status");
 // Each Stripe-paid license's subscription (renewal date, cancel flag), read from Stripe. Never written anywhere.
 async function stripeSubscriptionsFor(licenseRows) {
@@ -5239,7 +5245,7 @@ app.post("/account/devices", async (req, res) => {
     const license = await lookupLicense(rawKey);
     if (!license) return res.status(401).json({ error: "invalid_license_key" });
     // Multi-Device Sync is Network-tier only.
-    if (!["station", "station_lifetime", "operator"].includes(license.plan)) {
+    if (!["station", "station_lifetime", "operator", "unlimited"].includes(license.plan)) {
       return res.status(403).json({ error: "network_plan_required", detail: "Multi-Device Sync requires the Network plan." });
     }
     const activationKey = license.license_key || `lic-${license.id}`;

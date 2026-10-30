@@ -6,9 +6,9 @@ const { entitlementsFor } = require("./entitlements");
 const { NEVER_EXPIRES } = require("./entitlement");
 
 // The Tier dropdown: the catalog's plans plus Lifetime. A choice writes one of the plan keys the server accepts
-// (VALID_PLANS) and the desktop understands (usePlan.tsx), exactly as the dropdown always has. Unlimited has no such key
-// yet (`unlimited` is refused by the server and unknown to the desktop; `operator` never expires), so it writes nothing.
-const TIER_WRITES = { local: "free", station: "station", pro: "pro", unlimited: null, lifetime: "station_lifetime" };
+// (VALID_PLANS) and the desktop understands (usePlan.tsx), exactly as the dropdown always has. Unlimited is its own key
+// (Jeff, 2026-10-29), renewing and expiring like the other paid plans — never operator, which never expires.
+const TIER_WRITES = { local: "free", station: "station", pro: "pro", unlimited: "unlimited", lifetime: "station_lifetime" };
 
 /** Old plan key → the dropdown choice it is now, as the server's rules read it. */
 function tierChoiceOf(plan) {

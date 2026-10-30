@@ -69,14 +69,23 @@ test("free is Founding Local (never shown as Paid), Local in the dropdown", () =
   assert.equal(s.tier_choice, "local");
 });
 
-test("the dropdown: the catalog's plans plus Lifetime; each writes a key the server accepts, Unlimited none yet", () => {
-  const VALID = new Set(["free", "pro", "pro_lifetime", "station", "station_lifetime", "operator"]);
+test("the dropdown: the catalog's plans plus Lifetime; every choice writes a key the server accepts", () => {
+  const VALID = new Set(["free", "pro", "pro_lifetime", "station", "station_lifetime", "operator", "unlimited"]);
   const opts = tierOptions(catalog);
   assert.deepEqual(opts.map(o => o.label), ["Local", "Station", "Pro", "Unlimited", "Lifetime"]);
-  for (const o of opts) if (o.writes !== null) assert.ok(VALID.has(o.writes), o.key);
-  assert.equal(TIER_WRITES.unlimited, null);
+  for (const o of opts) assert.ok(VALID.has(o.writes), o.key);
+  assert.equal(TIER_WRITES.unlimited, "unlimited", "Unlimited is its own key, never operator");
   // every old key shows as a choice, and re-choosing it writes nothing new for the keys that map one to one
   assert.equal(tierChoiceOf("station"), "station");
   assert.equal(tierChoiceOf("pro"), "pro");
   assert.equal(tierChoiceOf("free"), "local");
+});
+
+test("unlimited renews and expires like the other paid plans; it is never Lifetime", () => {
+  assert.equal(tierChoiceOf("unlimited"), "unlimited");
+  assert.equal(st({ plan: "unlimited" }).status, "paid");
+  const t = st({ plan: "unlimited", expires_at: iso(now + 3 * day) });
+  assert.equal(t.status, "trial");
+  assert.equal(st({ plan: "unlimited", expires_at: iso(now - 2 * day) }).status, "grace");
+  assert.equal(st({ plan: "unlimited", expires_at: iso(now - 60 * day) }).status, "lapsed");
 });

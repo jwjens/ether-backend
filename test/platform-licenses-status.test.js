@@ -43,9 +43,22 @@ test("each license: Trial with days left and its end date, Lifetime, Lapsed; las
   assert.deepEqual(after, before, "reading the page changed a license");
 });
 
-test("the Tier dropdown still writes only a key the server accepts", async () => {
+test("the Tier dropdown still refuses a key the server does not know", async () => {
   const id = (await h.pool.query(`SELECT id FROM licenses WHERE email = 'gone@x.test'`)).rows[0].id;
-  const bad = await h.call("PATCH", `/api/platform/licenses/${id}`, { ...auth, body: { plan: "unlimited" } });
+  const bad = await h.call("PATCH", `/api/platform/licenses/${id}`, { ...auth, body: { plan: "enterprise_plus" } });
   assert.equal(bad.status, 400);
   assert.equal((await h.pool.query(`SELECT plan FROM licenses WHERE id = $1`, [id])).rows[0].plan, "station");
+});
+
+test("Unlimited: the dropdown stores the unlimited key, which signs in and reads as Unlimited, not Lifetime", async () => {
+  const id = (await h.pool.query(`SELECT id FROM licenses WHERE email = 'trial@x.test'`)).rows[0].id;
+  const r = await h.call("PATCH", `/api/platform/licenses/${id}`, { ...auth, body: { plan: "unlimited" } });
+  assert.equal(r.status, 200, r.text);
+  assert.equal((await h.pool.query(`SELECT plan FROM licenses WHERE id = $1`, [id])).rows[0].plan, "unlimited");
+  const list = await h.call("GET", "/api/platform/licenses", auth);
+  const l = list.body.licenses.find(x => x.id === id);
+  assert.equal(l.plan_status.tier_choice, "unlimited");
+  assert.equal(l.plan_status.status, "trial", "its trial end still applies: it expires like the other paid plans");
+  assert.ok(list.body.tiers.includes("unlimited"));
+  // (Generating a new key is not run here: pg-mem refuses the NULL license_key that production Postgres stores.)
 });
