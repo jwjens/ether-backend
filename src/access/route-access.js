@@ -1,0 +1,241 @@
+'use strict';
+// THE ROUTE INVENTORY (stranger tests, step b — docs/link-access-audit-and-email-2026-10-28.md §4.2, desktop repo).
+// Every route the server answers is listed here, as one of:
+//   · account — touches one account's data. It needs a stranger test (test/stranger-*.test.js): account B's
+//               credentials on account A's resource are refused, with nothing changed. `area` groups the tests.
+//   · public  — no account's data behind it, or the request's own secret is the only key and it reaches only that
+//               secret's own row. `why` says which, in one line.
+// test/route-inventory.test.js reads every route from the running app and fails on any route missing here (a new route
+// must be classified before it ships) and on any entry here that no longer exists. A ratchet: never delete a line to
+// make it pass; classify the route.
+//
+// Not a security mechanism itself — it changes nothing the server does. It is the list the stranger tests are held to.
+
+const A = (area) => ({ access: "account", area });
+const P = (why) => ({ access: "public", why });
+
+const ROUTES = {
+  // ── platform (operator console; requirePlatform) ───────────────────────────────────────────────────────────────────
+  "POST /api/platform/login": P("operator sign-in: password in, platform token out; no account data"),
+  "GET /api/platform/plan-refusals": A("platform"),
+  "GET /api/platform/diag": A("platform"),
+  "GET /api/platform/db-stats": A("platform"),
+  "POST /api/platform/prune-mutations": A("platform"),
+  "GET /api/platform/accounts": A("platform"),
+  "GET /api/platform/accounts/:id/stations": A("platform"),
+  "DELETE /api/platform/accounts/:id": A("platform"),
+  "POST /api/platform/users/reset-password": A("platform"),
+  "POST /api/platform/account/create": A("platform"),
+  "DELETE /api/platform/stations/:uuid": A("platform"),
+  "GET /api/platform/licenses": A("platform"),
+  "POST /api/platform/licenses": A("platform"),
+  "PATCH /api/platform/licenses/:id": A("platform"),
+  "GET /api/platform/seat-tiers": A("platform"),
+  "POST /api/platform/seat-tiers": A("platform"),
+  "PATCH /api/platform/seat-tiers/:id": A("platform"),
+  "DELETE /api/platform/seat-tiers/:id": A("platform"),
+  "PATCH /api/platform/licenses/:id/seat-tier": A("platform"),
+  "GET /api/platform/licenses/:id/machines": A("platform"),
+  "DELETE /api/platform/licenses/:id/machines/:machineId": A("platform"),
+  "GET /api/platform/licenses/:id/emails": A("platform"),
+  "POST /api/platform/licenses/:id/emails": A("platform"),
+  "DELETE /api/platform/licenses/:id/emails/:email": A("platform"),
+  "GET /api/platform/licenses/:id/library-grants": A("platform"),
+  "POST /api/platform/licenses/:id/library-grants": A("platform"),
+  "DELETE /api/platform/licenses/:id/library-grants/:granteeId": A("platform"),
+  "GET /api/platform/rollup": A("platform"),
+  "GET /api/platform/performances": A("platform"),
+  "GET /admin/licenses": A("platform"),
+  "POST /admin/issue": A("platform"),
+
+  // ── sign-up, sign-in, the email links ──────────────────────────────────────────────────────────────────────────────
+  "POST /api/user/signup": P("creates a new user; returns only that user's own token"),
+  "POST /api/user/login": P("email + password in, that user's own token out"),
+  "POST /api/user/verify": P("the emailed link's token is the only key; confirms only its own user"),
+  "POST /api/user/verify/resend": A("users"),
+  "POST /api/user/forgot": P("mails a reset link to the address's own inbox; same answer whether or not it exists"),
+  "POST /api/user/reset": P("the emailed reset token is the only key; resets only its own user"),
+  "GET /u/:token": P("unsubscribe link: the token is the only key; shows only its own opt-out"),
+  "POST /u/:token": P("unsubscribe link: the token is the only key; changes only its own marketing opt-out"),
+  "POST /api/user/desktop-activate": A("users"),
+  "POST /api/auth/bootstrap-admin": A("users"),
+  "POST /api/auth/login": A("users"),
+  "POST /api/auth/owner-login": P("owner email + password in, that owner's own account token out"),
+  "POST /api/auth/refresh": P("the refresh token is the only key; renews only its own session"),
+  "POST /api/auth/logout": P("the refresh token is the only key; ends only its own session"),
+
+  // ── users, sessions, members (users) ───────────────────────────────────────────────────────────────────────────────
+  "GET /api/user/me": A("users"),
+  "POST /api/user/checkout": A("users"),
+  "GET /api/auth/me": A("users"),
+  "GET /api/account/users": A("users"),
+  "POST /api/account/users": A("users"),
+  "POST /api/account/users/:id/pin": A("users"),
+  "POST /api/account/users/sync": A("users"),
+  "GET /api/accounts/:accountId/members": A("users"),
+  "POST /api/accounts/:accountId/members": A("users"),
+  "DELETE /api/accounts/:accountId/members/:membershipId": A("users"),
+  "GET /api/accounts/:accountId/positions": A("users"),
+  "POST /api/accounts/:accountId/positions": A("users"),
+  "GET /api/me/memberships": A("users"),
+  "POST /api/me/switch-account/:accountId": A("users"),
+  "POST /api/auth/upgrade": A("users"),
+  "POST /api/auth/logout-all": A("users"),
+  "GET /api/auth/sessions": A("users"),
+  "DELETE /api/auth/sessions/:id": A("users"),
+  "GET /api/auth/settings": A("users"),
+  "PUT /api/auth/settings": A("users"),
+  "GET /api/entitlements": A("users"),
+
+  // ── stations (account dashboard, station data, public-page settings) ───────────────────────────────────────────────
+  "GET /api/user/account-slug": A("stations"),
+  "POST /api/user/account-slug": A("stations"),
+  "POST /api/user/account-logo-upload-url": A("stations"),
+  "GET /api/account/stations": A("stations"),
+  "POST /api/account/stations": A("stations"),
+  "DELETE /api/account/stations/:uuid": A("stations"),
+  "GET /api/accounts/:accountId/stations": A("stations"),
+  "POST /api/account/data/sync": A("stations"),
+  "GET /api/account/station/:uuid/data": A("stations"),
+  "GET /api/account/health": A("stations"),
+  "GET /api/account/station/:uuid/staged": A("stations"),
+  "POST /api/account/station/:uuid/staged": A("stations"),
+  "DELETE /api/account/station/:uuid/staged/:table/:rowUuid": A("stations"),
+  "GET /api/account/station/:uuid/staged/pending": A("stations"),
+  "POST /api/account/station/:uuid/staged/mark-imported": A("stations"),
+  "POST /api/account/station/:uuid/staged/clone-categories": A("stations"),
+  "POST /api/account/station/:uuid/staged/clone-programming": A("stations"),
+  "GET /api/station/:uuid/metadata": A("stations"),
+  "POST /api/station/:uuid/metadata": A("stations"),
+  "POST /api/station/:uuid/logo-upload-url": A("stations"),
+  "POST /api/station/:uuid/now-playing-art-upload-url": A("stations"),
+  "POST /api/now-playing": A("stations"),
+
+  // ── analytics, play history, billing ───────────────────────────────────────────────────────────────────────────────
+  "POST /api/account/play-history": A("analytics"),
+  "GET /api/account/station/:uuid/analytics": A("analytics"),
+  "GET /api/account/station/:uuid/affidavit": A("analytics"),
+  "GET /api/account/station/:uuid/listeners": A("analytics"),
+  "GET /api/account/station/:uuid/listenership": A("analytics"),
+  "GET /api/account/billing": A("billing"),
+  "POST /api/account/billing/portal": A("billing"),
+
+  // ── seats, licenses, machines (seats) ──────────────────────────────────────────────────────────────────────────────
+  "POST /validate": A("seats"),
+  "GET /licenses/:key/activations": A("seats"),
+  "POST /licenses/:key/deactivate": A("seats"),
+  "POST /account/create": A("seats"),
+  "POST /account/connect": A("seats"),
+  "POST /account/bind-seat": A("seats"),
+  "POST /account/add-station": A("seats"),
+  "POST /account/register-station": A("seats"),
+  "POST /account/delete-station": A("seats"),
+  "POST /account/deauthorize-seat": A("seats"),
+  "GET /account/seats": A("seats"),
+  "POST /account/devices": A("seats"),
+  "GET /api/account/devices": A("seats"),
+  "POST /account/attach": A("seats"),
+  "POST /account/detach": A("seats"),
+
+  // ── library and audio (library) ────────────────────────────────────────────────────────────────────────────────────
+  "GET /api/account/station/:uuid/borrowed-library": A("library"),
+  "POST /api/account/audio/upload-url": A("library"),
+  "POST /audio/upload-url": A("library"),
+  "POST /audio/delete": A("library"),
+  "POST /audio/download-url": A("library"),
+  "GET /audio/list": A("library"),
+  "GET /library/snapshot": A("library"),
+  "GET /library/changes": A("library"),
+  "POST /library/songs": A("library"),
+  "DELETE /library/songs/:content_hash": A("library"),
+
+  // ── sync ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+  "POST /sync/mutations": A("sync"),
+  "GET /sync/mutations": A("sync"),
+  "GET /sync/pending-count": A("sync"),
+
+  // ── backups ────────────────────────────────────────────────────────────────────────────────────────────────────────
+  "POST /backup/list": A("backups"),
+  "POST /backup/prune": A("backups"),
+  "POST /backup/upload-url": A("backups"),
+  "POST /backup/download-url": A("backups"),
+  "POST /backup/upload": A("backups"),
+  "GET /backup/list": A("backups"),
+  "GET /backup/download/:id": A("backups"),
+  "DELETE /backup/:id": A("backups"),
+
+  // ── web remote (command bus) ───────────────────────────────────────────────────────────────────────────────────────
+  "POST /api/cmd": A("remote"),
+  "POST /api/cmd/ack": A("remote"),
+  "GET /api/cmd/ack/:cmd_id": A("remote"),
+  "GET /api/cmd-stream": A("remote"),
+  "GET /api/pending-cmds": A("remote"),
+
+  // ── Park page (ops) ────────────────────────────────────────────────────────────────────────────────────────────────
+  "POST /api/ops/token": A("park"),
+  "GET /public/ops/:slug": P("the Park page's public face: station name and whether a login is needed"),
+  "POST /public/ops/:slug/login": A("park"),
+  "GET /public/ops/:slug/me": A("park"),
+  "POST /public/ops/:slug/logout": A("park"),
+  "PUT /public/ops/:slug/closing-time": A("park"),
+  "PUT /public/ops/:slug/level": A("park"),
+  "PUT /public/ops/:slug/mute": A("park"),
+  "POST /public/ops/:slug/fire": A("park"),
+  "POST /public/ops/:slug/listen": A("park"),
+  "POST /public/ops/:slug/listen/renew": A("park"),
+  "POST /public/ops/:slug/listen/stop": A("park"),
+  "POST /public/ops/:slug/talk/warm": A("park"),
+  "POST /public/ops/:slug/talk/warm/renew": A("park"),
+  "POST /public/ops/:slug/talk/warm/stop": A("park"),
+  "POST /public/ops/:slug/talk": A("park"),
+  "POST /public/ops/:slug/talk/stop": A("park"),
+  "POST /internal/mediamtx/auth": A("park"),
+
+  // ── jukebox ────────────────────────────────────────────────────────────────────────────────────────────────────────
+  "POST /api/account/jukebox/pool": A("jukebox"),
+  "POST /api/account/jukebox/state": A("jukebox"),
+  "GET /api/account/jukebox/payouts/:uuid": A("jukebox"),
+  "POST /api/account/jukebox/payouts/:uuid/connect": A("jukebox"),
+  "POST /api/account/jukebox/payouts/:uuid/refresh": A("jukebox"),
+  "POST /api/account/jukebox/payouts/:uuid/settings": A("jukebox"),
+  "GET /public/jukebox/:slug/pool": P("the jukebox request page's public song list, as the station published it"),
+  "GET /public/jukebox/:slug/state": P("the jukebox request page's public open/closed state"),
+  "POST /public/jukebox/:slug/request": P("a listener's song request into the station's public jukebox (rate-limited)"),
+
+  // ── Remote Link, Show+ guests ──────────────────────────────────────────────────────────────────────────────────────
+  "POST /api/link/relay/session": A("link"),
+  "GET /api/link/relay/sessions": A("link"),
+  "GET /api/link/machines": A("link"),
+  "PUT /api/link/key": A("link"),
+  "GET /api/link/key/:machineId": A("link"),
+  "POST /api/link/pair-code": A("link"),
+  "POST /api/link/pair-redeem": A("link"),
+  "POST /invite/send": A("link"),
+  "POST /guest/join": A("link"),
+  "POST /guest/leave": A("link"),
+  "GET /guest/status/:token": A("link"),
+
+  // ── public pages and listener data ─────────────────────────────────────────────────────────────────────────────────
+  "GET /health": P("service status; no data"),
+  "GET /public/plans": P("the price list"),
+  "GET /download/:os": P("redirect to the public installer"),
+  "GET /mobile": P("static page"),
+  "GET /companion": P("static page"),
+  "GET /join/:token": P("static page; the token is read by the page's own calls (guest join), which are classified"),
+  "GET /dashboard": P("static page"),
+  "GET /emergency": P("static page"),
+  "GET /console": P("static page"),
+  "GET /public/account/check-slug": P("is a public handle taken (yes/no)"),
+  "GET /api/slugs/check": P("is a public station handle taken (yes/no)"),
+  "GET /public/account/:slug/channels": P("an account's public hub: the stations it publishes"),
+  "GET /public/stations": P("the public station directory"),
+  "GET /public/station/:slug/siblings": P("a public station's sister stations, as published"),
+  "GET /public/station/:slug": P("a public station page"),
+  "GET /public/station/:slug/stream": P("the public listener stream"),
+  "GET /public/station/:slug/recent-plays": P("a public station's recently played list"),
+  "GET /api/now-playing": P("legacy listener read: the last now-playing any station posted (one global value, no account selector)"),
+  "POST /webhook/stripe": P("Stripe's signed webhook; the signature is the key"),
+  "POST /webhook/stripe/jukebox": P("Stripe's signed jukebox webhook; the signature is the key"),
+};
+
+module.exports = { ROUTES };
