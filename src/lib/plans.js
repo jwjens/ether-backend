@@ -7,6 +7,8 @@ const fs = require("fs");
 const path = require("path");
 
 const PLAN_KEYS = ["local", "station", "pro", "unlimited"];
+// What one price covers: the whole account (Local — one price for everything local, Jeff 2026-10-29), one station, or one stream.
+const PER = ["account", "station", "stream"];
 
 function validate(c) {
   const errs = [];
@@ -20,6 +22,7 @@ function validate(c) {
     if (typeof p.label !== "string" || !p.label) errs.push(`plans.${k}.label`);
     if (!num(p.price_monthly)) errs.push(`plans.${k}.price_monthly`);
     if (typeof p.cloud !== "boolean") errs.push(`plans.${k}.cloud`);
+    if (p.per !== undefined && !PER.includes(p.per)) errs.push(`plans.${k}.per`);
   }
   for (const k of Object.keys(c.plans || {})) if (!PLAN_KEYS.includes(k)) errs.push(`plans.${k}: unknown plan`);
   for (const [f, d] of Object.entries(c.features || {})) {
@@ -56,4 +59,4 @@ function priceIndex(c, env = process.env) {
   return out;
 }
 
-module.exports = { PLAN_KEYS, validate, load, publicCatalog, priceIndex };
+module.exports = { PLAN_KEYS, PER, validate, load, publicCatalog, priceIndex };

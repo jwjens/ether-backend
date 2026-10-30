@@ -17,6 +17,7 @@ const at = (ms) => new Date(ms).toISOString();
 test("catalog: the 2026-10-29 prices — no free plan; Local $9/mo or $90/yr; Station $25, Pro $49, Unlimited $79", () => {
   assert.deepEqual(Object.keys(catalog.plans), ["local", "station", "pro", "unlimited"]);
   assert.equal(catalog.plans.local.price_monthly, 9);
+  assert.equal(catalog.plans.local.per, "account", "Local is one price for everything local on the account (Jeff, 2026-10-29)");
   assert.equal(catalog.plans.local.price_annual, 90, "annual = 10 months' price");
   assert.equal(catalog.plans.local.price_annual, catalog.plans.local.price_monthly * catalog.discounts.annual_months_charged);
   assert.equal(catalog.plans.station.price_monthly, 25); assert.equal(catalog.plans.station.per, "stream");
@@ -42,6 +43,8 @@ test("catalog: validation refuses a bad catalog (the server would not boot on it
   assert.ok(P.validate(bad).some(e => /free/.test(e)));
   const bad2 = JSON.parse(JSON.stringify(catalog)); delete bad2.plans.local.price_monthly;
   assert.ok(P.validate(bad2).length);
+  const bad3 = JSON.parse(JSON.stringify(catalog)); bad3.plans.local.per = "seat";
+  assert.ok(P.validate(bad3).some(e => /plans\.local\.per/.test(e)), "a price must say what it covers: account, station or stream");
 });
 
 test("catalog: /public/plans says which prices can be bought, never the Stripe ids or variable names", () => {

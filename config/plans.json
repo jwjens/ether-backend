@@ -5,9 +5,9 @@
   "trial": { "days": 15, "requires_card": false, "level": "unlimited" },
   "plans": {
     "local": {
-      "label": "Local", "price_monthly": 9, "price_annual": 90, "per": "station",
+      "label": "Local", "price_monthly": 9, "price_annual": 90, "per": "account",
       "hosted_streams": 0, "cloud": false, "includes_updates": true,
-      "summary": "Everything local: the full desktop app, your own Icecast, the typed-address Remote Link, and updates. No cloud features."
+      "summary": "Everything local, one price for the whole account: the full desktop app, your own Icecast, the typed-address Remote Link, and updates. No cloud features."
     },
     "station": {
       "label": "Station", "price_monthly": 25, "per": "stream", "includes": ["local"],
