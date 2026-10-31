@@ -67,6 +67,10 @@ const PLAN_CATALOG = PLANS.load();
 const ENT = require("./lib/entitlements");
 /** What license row `lic` may use now (plan, status, cloud features, limits). Cloud only: nothing local reads it. */
 const entitlementsOf = (lic) => ENT.entitlementsFor(lic || null, { catalog: PLAN_CATALOG });
+// THE ONE BILLING NOTICE (src/lib/billing-notice.js): banner/email text for a license (or, with no license yet, the users
+// row's trial). Exempt and lifetime licenses: null. Read by /account/connect, /api/account/billing, /api/user/me.
+const BILLING_NOTICE = require("./lib/billing-notice");
+const noticeOf = (lic, user = null) => BILLING_NOTICE.billingNotice({ license: lic || null, user, catalog: PLAN_CATALOG, accountUrl: ACCOUNT_APP_URL });
 const { resolveDesktopLicense } = require("./lib/desktop-license");   // desktop-activate: never a license by email match
 const emailVerify = require("./lib/email-verify");   // sign-up confirmation link (24 h); a membership counts once verified
 // SIGN-IN SESSIONS (src/lib/auth-sessions.js; Jeff, 2026-10-28): a running station stays signed in forever; a session ends
@@ -2314,6 +2318,14 @@ function requireUser(req, res, next) {
 async function userEntitlement(u) {
   return computeUserEntitlement(pool, u);
 }
+// The account site's billing fields: the one notice, and whether "Update card" can open the Stripe Customer Portal.
+function billingFields(lic, u) {
+  return { billing_notice: noticeOf(lic, lic ? null : u), billing_customer: !!(lic && (lic.stripe_customer_id || lic.stripe_subscription_id)) };
+}
+async function userBilling(u) {
+  const lic = u.license_key_id ? (await pool.query(`SELECT * FROM licenses WHERE id = $1`, [u.license_key_id])).rows[0] : null;
+  return billingFields(lic, u);
+}
 function publicAccount(u, ent) {
   return { id: u.id, name: u.name || null, email: u.email, email_verified: !!u.email_verified, trial_ends_at: u.trial_ends_at, entitlement: ent };
 }
@@ -2361,7 +2373,7 @@ app.post("/api/user/login", authLimiter, async (req, res) => {
     const u = (await pool.query(`SELECT * FROM users WHERE email = $1`, [email])).rows[0];
     if (!u || !(await bcrypt.compare(password, u.password_hash))) return res.status(401).json({ error: "invalid_credentials" });
     await pool.query(`UPDATE users SET last_login_at = NOW() WHERE id = $1`, [u.id]);
-    res.json({ token: signUserToken(u), account: publicAccount(u, await userEntitlement(u)) });
+    res.json({ token: signUserToken(u), account: { ...publicAccount(u, await userEntitlement(u)), ...(await userBilling(u)) } });
   } catch (e) { console.error("[user/login]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
@@ -2370,7 +2382,7 @@ app.get("/api/user/me", requireUser, async (req, res) => {
     const u = (await pool.query(`SELECT * FROM users WHERE id = $1`, [req.user.uid])).rows[0];
     if (!u) return res.status(404).json({ error: "not_found" });
     const lic = u.license_key_id ? (await pool.query(`SELECT * FROM licenses WHERE id = $1`, [u.license_key_id])).rows[0] : null;
-    res.json({ account: publicAccount(u, await userEntitlement(u)), entitlements: entitlementsOf(lic) });
+    res.json({ account: { ...publicAccount(u, await userEntitlement(u)), ...billingFields(lic, u) }, entitlements: entitlementsOf(lic) });
   } catch (e) { console.error("[user/me]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
@@ -3969,7 +3981,7 @@ app.get("/api/account/station/:uuid/listenership", requireAuth, async (req, res)
 // mints a Stripe-hosted Customer Portal session and returns its URL.
 app.get("/api/account/billing", requireAuth, async (req, res) => {
   try {
-    const { rows } = await pool.query(`SELECT plan, stripe_subscription_id, email FROM licenses WHERE id = $1`, [req.auth.lk]);
+    const { rows } = await pool.query(`SELECT * FROM licenses WHERE id = $1`, [req.auth.lk]);
     const lic = rows[0];
     if (!lic) return res.status(404).json({ error: "license_not_found" });
     let status = null, renewsAt = null, cancelAtPeriodEnd = false;
@@ -3982,30 +3994,59 @@ app.get("/api/account/billing", requireAuth, async (req, res) => {
         cancelAtPeriodEnd = !!sub.cancel_at_period_end;
       } catch (e) { console.warn("[account/billing] sub retrieve failed:", e.message); }
     }
-    return res.json({ plan: lic.plan, email: lic.email, manageable: !!lic.stripe_subscription_id, status, renewsAt, cancelAtPeriodEnd });
+    const ent = entitlementsOf(lic);
+    return res.json({
+      plan: lic.plan, email: lic.email, manageable: !!lic.stripe_subscription_id, status, renewsAt, cancelAtPeriodEnd,
+      // billing notices (src/lib/billing-notice.js): the one banner, and the facts behind the Billing card's words
+      notice: noticeOf(lic),
+      entitlement_status: ent.status, trial_ends_at: ent.trial_ends_at, grace_until: ent.grace_until,
+      payment_failed_at: lic.payment_failed_at || null,
+      card: lic.card_last4 ? { brand: lic.card_brand || null, last4: lic.card_last4, exp_month: lic.card_exp_month || null, exp_year: lic.card_exp_year || null } : null,
+    });
   } catch (e) {
     console.error("[account/billing]", e.message);
     return res.status(500).json({ error: "server_error" });
   }
 });
 
+// The Stripe Customer Portal for one license (update card, invoices, change/cancel). The return address is one of our
+// own sites (BILLING_NOTICE.portalReturnUrl: app.ether-cast.com, the account site, …; never an open redirect).
+async function openBillingPortal(lic, origin, fallback) {
+  if (!process.env.STRIPE_SECRET_KEY) return { status: 503, body: { error: "stripe_unconfigured" } };
+  if (!lic || !(lic.stripe_subscription_id || lic.stripe_customer_id)) return { status: 400, body: { error: "no_subscription" } };
+  const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+  let customer = lic.stripe_customer_id || null;
+  if (!customer) {
+    const sub = await stripe.subscriptions.retrieve(lic.stripe_subscription_id);
+    customer = typeof sub.customer === "string" ? sub.customer : sub.customer?.id;
+  }
+  if (!customer) return { status: 400, body: { error: "no_customer" } };
+  const returnUrl = BILLING_NOTICE.portalReturnUrl(origin, { fallback, allowLocalhost: process.env.PORTAL_ALLOW_LOCALHOST === "1" });
+  const session = await stripe.billingPortal.sessions.create({ customer, return_url: returnUrl });
+  return { status: 200, body: { url: session.url } };
+}
+
 app.post("/api/account/billing/portal", requireAuth, async (req, res) => {
   try {
-    if (!process.env.STRIPE_SECRET_KEY) return res.status(503).json({ error: "stripe_unconfigured" });
-    const { rows } = await pool.query(`SELECT stripe_subscription_id FROM licenses WHERE id = $1`, [req.auth.lk]);
-    const subId = rows[0]?.stripe_subscription_id;
-    if (!subId) return res.status(400).json({ error: "no_subscription" });
-    const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
-    const sub = await stripe.subscriptions.retrieve(subId);
-    const customer = typeof sub.customer === "string" ? sub.customer : sub.customer?.id;
-    if (!customer) return res.status(400).json({ error: "no_customer" });
-    // return_url restricted to known dashboard origins (no open redirect).
-    const origin = req.headers.origin || "";
-    const returnUrl = /^https:\/\/(app\.ether-technologies\.com|ether-dashboard\.pages\.dev)$/.test(origin) ? origin : "https://app.ether-technologies.com";
-    const session = await stripe.billingPortal.sessions.create({ customer, return_url: returnUrl });
-    return res.json({ url: session.url });
+    const { rows } = await pool.query(`SELECT stripe_subscription_id, stripe_customer_id FROM licenses WHERE id = $1`, [req.auth.lk]);
+    const out = await openBillingPortal(rows[0], req.headers.origin, "https://app.ether-cast.com");
+    return res.status(out.status).json(out.body);
   } catch (e) {
     console.error("[account/billing/portal]", e.message);
+    return res.status(500).json({ error: "portal_failed", detail: e.message });
+  }
+});
+
+// The account site's "Update card": the same portal, for the signed-in user's own license.
+app.post("/api/user/billing/portal", requireUser, async (req, res) => {
+  try {
+    const u = (await pool.query(`SELECT license_key_id FROM users WHERE id = $1`, [req.user.uid])).rows[0];
+    const lic = u && u.license_key_id
+      ? (await pool.query(`SELECT stripe_subscription_id, stripe_customer_id FROM licenses WHERE id = $1`, [u.license_key_id])).rows[0] : null;
+    const out = await openBillingPortal(lic, req.headers.origin, ACCOUNT_APP_URL);
+    return res.status(out.status).json(out.body);
+  } catch (e) {
+    console.error("[user/billing/portal]", e.message);
     return res.status(500).json({ error: "portal_failed", detail: e.message });
   }
 });
@@ -4338,7 +4379,7 @@ app.post("/account/connect", async (req, res) => {
     const looked = await lookupLicenseDetailed(rawKey);
     if (looked.reason === "expired") {
       return res.status(401).json({ error: "trial_expired", renew_url: "https://signup.ether-technologies.com",
-        entitlements: entitlementsOf(looked.expiredRow) });
+        entitlements: entitlementsOf(looked.expiredRow), billing_notice: noticeOf(looked.expiredRow) });
     }
     const license = looked.row;
     if (!license) return res.status(401).json({ error: "invalid_license_key" });
@@ -4391,6 +4432,8 @@ app.post("/account/connect", async (req, res) => {
       plan:       license.plan ?? "free",
       // what this account's plan allows (src/lib/entitlements.js): the desktop shows and gates cloud features from this
       entitlements: entitlementsOf(license),
+      // the one billing banner to show (src/lib/billing-notice.js), or null. A banner only: never gates anything local.
+      billing_notice: noticeOf(license),
     });
   } catch (e) {
     console.error("[/account/connect]", e.message);

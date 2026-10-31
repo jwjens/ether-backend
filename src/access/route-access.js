@@ -119,6 +119,7 @@ const ROUTES = {
   "GET /api/account/station/:uuid/listenership": A("analytics"),
   "GET /api/account/billing": A("billing"),
   "POST /api/account/billing/portal": A("billing"),
+  "POST /api/user/billing/portal": A("billing"),
 
   // ── seats, licenses, machines (seats) ──────────────────────────────────────────────────────────────────────────────
   "POST /validate": A("seats"),

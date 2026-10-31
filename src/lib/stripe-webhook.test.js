@@ -226,8 +226,8 @@ test("wired: index.js has no phantom stripe_sub_id in SQL and routes the webhook
   const sql = src.split("\n").filter(l => !/^\s*\/\//.test(l)).join("\n");   // ignore comment lines
   assert.ok(!/stripe_sub_id/.test(sql), "no stripe_sub_id outside comments");
   assert.ok(/stripeWebhook\.handlePlatformEvent\(event/.test(src), "webhook uses the module");
-  assert.ok(/SELECT plan, stripe_subscription_id, email FROM licenses/.test(src), "billing reads the real column");
-  assert.ok(/SELECT stripe_subscription_id FROM licenses/.test(src), "portal reads the real column");
+  assert.ok(/manageable: !!lic\.stripe_subscription_id/.test(src), "billing reads the real column");
+  assert.ok(/SELECT stripe_subscription_id, stripe_customer_id FROM licenses/.test(src), "portal reads the real columns");
   assert.ok(/if \(event\.account\) \{/.test(src), "connected-account guard still precedes the handler");
 });
 

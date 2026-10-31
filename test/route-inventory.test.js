@@ -30,8 +30,8 @@ test("each entry is account (with a known area) or public (with a reason)", () =
   }
 });
 
-test("the inventory's size is what was reviewed (194 routes: account and public)", () => {
+test("the inventory's size is what was reviewed (195 routes: account and public)", () => {
   const n = (a) => Object.values(ROUTES).filter(v => v.access === a).length;
-  assert.equal(routes.length, 194);
+  assert.equal(routes.length, 195);
   console.log(`routes ${routes.length}: account ${n("account")}, public ${n("public")}`);
 });
