@@ -14,7 +14,8 @@ async function freshPool() {
   await pool.query(`CREATE TABLE licenses (
     id SERIAL PRIMARY KEY, license_key TEXT, email TEXT NOT NULL DEFAULT '', plan TEXT NOT NULL,
     stripe_customer_id TEXT, stripe_subscription_id TEXT, status TEXT DEFAULT 'active',
-    expires_at TIMESTAMPTZ, active BOOLEAN DEFAULT true, key_prefix TEXT, key_hash TEXT)`);
+    expires_at TIMESTAMPTZ, active BOOLEAN DEFAULT true, key_prefix TEXT, key_hash TEXT,
+    payment_failed_at TIMESTAMPTZ, card_brand TEXT, card_last4 TEXT, card_exp_month INTEGER, card_exp_year INTEGER)`);   // + initDB's billing columns
   await pool.query(`CREATE TABLE users (id SERIAL PRIMARY KEY, email TEXT NOT NULL, license_key_id INTEGER)`);
   return pool;
 }
@@ -228,4 +229,107 @@ test("wired: index.js has no phantom stripe_sub_id in SQL and routes the webhook
   assert.ok(/SELECT plan, stripe_subscription_id, email FROM licenses/.test(src), "billing reads the real column");
   assert.ok(/SELECT stripe_subscription_id FROM licenses/.test(src), "portal reads the real column");
   assert.ok(/if \(event\.account\) \{/.test(src), "connected-account guard still precedes the handler");
+});
+
+// ── Billing state: payment_failed_at and the card on file (billing notices) ─────────────────────────────────────────
+
+const billing = async (pool) => (await pool.query(
+  `SELECT payment_failed_at AS failed, card_brand AS brand, card_last4 AS last4, card_exp_month AS m, card_exp_year AS y, active FROM licenses ORDER BY id`)).rows;
+function fakeStripe({ defaultPm = null, list = [], fail = false } = {}) {
+  const calls = [];
+  return {
+    calls,
+    customers: { retrieve: async (id, opts) => { calls.push(["customers.retrieve", id, opts]); if (fail) throw new Error("boom"); return { id, invoice_settings: { default_payment_method: defaultPm } }; } },
+    paymentMethods: {
+      retrieve: async (id) => { calls.push(["paymentMethods.retrieve", id]); return { id, card: { brand: "mastercard", last4: "4444", exp_month: 3, exp_year: 2028 } }; },
+      list: async (q) => { calls.push(["paymentMethods.list", q]); return { data: list }; },
+    },
+  };
+}
+const pmCard = (brand, last4, m, y) => ({ object: "payment_method", id: "pm_1", customer: "cus_20", card: { brand, last4, exp_month: m, exp_year: y } });
+
+test("billing: invoice.payment_failed sets payment_failed_at (the first failure is kept), access unchanged", async () => {
+  const pool = await freshPool();
+  await pool.query(`INSERT INTO licenses (email, plan, stripe_subscription_id, stripe_customer_id) VALUES ('a@x.com','station','sub_20','cus_20')`);
+  const { d } = deps(pool);
+  await W.handlePlatformEvent({ ...ev("invoice.payment_failed", { object: "invoice", id: "in_1", subscription: "sub_20", customer: "cus_20" }), created: 1793000000 }, d);
+  let r = (await billing(pool))[0];
+  assert.strictEqual(new Date(r.failed).getTime(), 1793000000 * 1000);
+  assert.strictEqual(r.active, true);
+  await W.handlePlatformEvent({ ...ev("invoice.payment_failed", { object: "invoice", id: "in_2", subscription: "sub_20" }), created: 1793500000 }, d);
+  r = (await billing(pool))[0];
+  assert.strictEqual(new Date(r.failed).getTime(), 1793000000 * 1000, "kept, not moved");
+});
+
+test("billing: invoice.payment_succeeded clears payment_failed_at", async () => {
+  const pool = await freshPool();
+  await pool.query(`INSERT INTO licenses (email, plan, stripe_subscription_id, payment_failed_at) VALUES ('b@x.com','station','sub_21', NOW())`);
+  const { d } = deps(pool);
+  await W.handlePlatformEvent(ev("invoice.payment_succeeded", {
+    object: "invoice", customer_email: "b@x.com", subscription: "sub_21", lines: { data: [{ price: { id: PRICE_STATION } }] } }), d);
+  assert.strictEqual((await billing(pool))[0].failed, null);
+});
+
+test("billing: subscription.updated past_due sets it (if unset), active clears it", async () => {
+  const pool = await freshPool();
+  await pool.query(`INSERT INTO licenses (email, plan, stripe_subscription_id) VALUES ('c@x.com','station','sub_22')`);
+  const { d } = deps(pool);
+  const set = (status) => W.handlePlatformEvent(ev("customer.subscription.updated", {
+    object: "subscription", id: "sub_22", status, items: { data: [{ price: { id: PRICE_STATION } }] } }), d);
+  await set("past_due"); const first = (await billing(pool))[0].failed; assert.ok(first);
+  await set("past_due"); assert.strictEqual(new Date((await billing(pool))[0].failed).getTime(), new Date(first).getTime());
+  assert.strictEqual((await billing(pool))[0].active, true, "past_due keeps access");
+  await set("active");   assert.strictEqual((await billing(pool))[0].failed, null);
+});
+
+test("billing: the card on file is recorded from the customer's default payment method", async () => {
+  const pool = await freshPool();
+  await pool.query(`INSERT INTO licenses (email, plan, stripe_subscription_id, stripe_customer_id) VALUES ('d@x.com','station','sub_23','cus_20')`);
+  const stripe = fakeStripe({ defaultPm: { id: "pm_d", card: { brand: "visa", last4: "4242", exp_month: 12, exp_year: 2027 } } });
+  const { d } = deps(pool, { stripe });
+  await W.handlePlatformEvent(ev("customer.updated", { object: "customer", id: "cus_20" }), d);
+  assert.deepStrictEqual((await billing(pool))[0], { failed: null, brand: "visa", last4: "4242", m: 12, y: 2027, active: true });
+  assert.deepStrictEqual(stripe.calls[0], ["customers.retrieve", "cus_20", { expand: ["invoice_settings.default_payment_method"] }]);
+});
+
+test("billing: a default given as an id is fetched; none → the attached card; none → the first saved card", async () => {
+  const pool = await freshPool();
+  await pool.query(`INSERT INTO licenses (email, plan, stripe_customer_id) VALUES ('e@x.com','station','cus_20')`);
+  let { d } = deps(pool, { stripe: fakeStripe({ defaultPm: "pm_str" }) });
+  await W.handlePlatformEvent(ev("customer.updated", { object: "customer", id: "cus_20" }), d);
+  assert.strictEqual((await billing(pool))[0].last4, "4444");
+  ({ d } = deps(pool, { stripe: fakeStripe() }));
+  await W.handlePlatformEvent(ev("payment_method.attached", pmCard("amex", "0005", 1, 2029)), d);
+  assert.strictEqual((await billing(pool))[0].last4, "0005");
+  ({ d } = deps(pool, { stripe: fakeStripe({ list: [{ card: { brand: "visa", last4: "1881", exp_month: 6, exp_year: 2030 } }] }) }));
+  await W.handlePlatformEvent(ev("customer.updated", { object: "customer", id: "cus_20" }), d);
+  assert.strictEqual((await billing(pool))[0].last4, "1881");
+});
+
+test("billing: card reading is guarded — a Stripe error or a hang never fails the webhook; no Stripe client → nothing read", async () => {
+  const pool = await freshPool();
+  await pool.query(`INSERT INTO licenses (email, plan, stripe_customer_id) VALUES ('f@x.com','station','cus_20')`);
+  const out = await W.handlePlatformEvent(ev("customer.updated", { object: "customer", id: "cus_20" }), deps(pool, { stripe: fakeStripe({ fail: true }) }).d);
+  assert.strictEqual(out.status, 200);
+  assert.strictEqual((await billing(pool))[0].last4, null);
+  const slow = { customers: { retrieve: () => new Promise(() => {}) } };
+  const out2 = await W.handlePlatformEvent(ev("customer.updated", { object: "customer", id: "cus_20" }), deps(pool, { stripe: slow, cardTimeoutMs: 20 }).d);
+  assert.strictEqual(out2.status, 200);
+  const out3 = await W.handlePlatformEvent(ev("customer.updated", { object: "customer", id: "cus_20" }), deps(pool).d);
+  assert.strictEqual(out3.status, 200);
+});
+
+test("billing: checkout completed records the card for the new license", async () => {
+  const pool = await freshPool();
+  await pool.query(`INSERT INTO users (email) VALUES ('g@x.com')`);
+  const stripe = fakeStripe({ list: [{ card: { brand: "visa", last4: "4242", exp_month: 9, exp_year: 2031 } }] });
+  const { d } = deps(pool, { stripe });
+  await W.handlePlatformEvent(ev("checkout.session.completed", {
+    client_reference_id: "1", customer_email: "g@x.com", metadata: { plan: "station" }, subscription: "sub_30", customer: "cus_30" }), d);
+  assert.strictEqual((await billing(pool))[0].last4, "4242");
+});
+
+test("wired: the webhook route hands the Stripe client to the module only when a key is set", () => {
+  const src = require("node:fs").readFileSync(require("node:path").join(__dirname, "..", "index.js"), "utf8");
+  assert.ok(/stripe: process\.env\.STRIPE_SECRET_KEY \? stripe : null/.test(src));
 });

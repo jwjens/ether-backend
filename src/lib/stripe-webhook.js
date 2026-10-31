@@ -54,7 +54,7 @@ function activeForStatus(status) {
  * hashKey(key)→Promise<hash>, sendLicenseEmail(email,key,plan)→Promise, log?:{log,warn,error} }.
  * Returns { status, body } — the route sends exactly that.
  */
-async function handlePlatformEvent(event, deps) {
+async function applyLicenseEvent(event, deps) {
   const { pool, validPlans, planByPriceId, generateLicenseKey, hashKey, sendLicenseEmail } = deps;
   const log = deps.log || console;
   const obj = (event && event.data && event.data.object) || {};
@@ -175,4 +175,98 @@ async function handlePlatformEvent(event, deps) {
   return ok();
 }
 
-module.exports = { handlePlatformEvent, subscriptionIdOf, invoicePriceIdOf, subscriptionPriceIdOf, activeForStatus };
+// ── BILLING STATE (billing notices, src/lib/billing-notice.js) ──────────────────────────────────────────────────────
+// After the license work above, two more things a platform event can tell us. Neither changes access (a failed payment
+// keeps access during grace, exactly as before):
+//   · payment_failed_at — set on invoice.payment_failed or a subscription turning past_due (kept if already set, so the
+//     date is the FIRST failure); cleared on invoice.payment_succeeded or the subscription turning active again.
+//   · the card on file — brand, last 4, expiry of the customer's default card, read from Stripe when it is available.
+//     Guarded: a Stripe error or slowness is logged and never fails the webhook.
+const PAYMENT_FAILED = new Set(["invoice.payment_failed"]);
+const PAYMENT_OK = new Set(["invoice.payment_succeeded", "invoice.paid"]);
+const CARD_EVENTS = new Set(["checkout.session.completed", "invoice.payment_succeeded", "invoice.paid", "payment_method.attached", "customer.updated"]);
+
+function eventTime(event) {
+  return event && Number.isFinite(event.created) ? new Date(event.created * 1000) : new Date();
+}
+
+async function setPaymentFailed(pool, { subId, customerId, at }) {
+  if (subId) {
+    const r = await pool.query(`UPDATE licenses SET payment_failed_at = COALESCE(payment_failed_at, $2) WHERE stripe_subscription_id = $1`, [subId, at]);
+    if (r.rowCount || !customerId) return r.rowCount;
+  }
+  if (!customerId) return 0;
+  return (await pool.query(`UPDATE licenses SET payment_failed_at = COALESCE(payment_failed_at, $2) WHERE stripe_customer_id = $1`, [customerId, at])).rowCount;
+}
+async function clearPaymentFailed(pool, { subId, customerId }) {
+  let n = 0;
+  if (subId) n += (await pool.query(`UPDATE licenses SET payment_failed_at = NULL WHERE stripe_subscription_id = $1 AND payment_failed_at IS NOT NULL`, [subId])).rowCount;
+  if (!n && customerId) n += (await pool.query(`UPDATE licenses SET payment_failed_at = NULL WHERE stripe_customer_id = $1 AND payment_failed_at IS NOT NULL`, [customerId])).rowCount;
+  return n;
+}
+
+async function applyPaymentState(event, deps) {
+  const obj = (event && event.data && event.data.object) || {};
+  const subId = subscriptionIdOf(obj);
+  const customerId = customerIdOf(obj);
+  if (PAYMENT_FAILED.has(event.type)) return setPaymentFailed(deps.pool, { subId, customerId, at: eventTime(event) });
+  if (PAYMENT_OK.has(event.type)) return clearPaymentFailed(deps.pool, { subId, customerId });
+  if (event.type === "customer.subscription.updated") {
+    if (obj.status === "past_due") return setPaymentFailed(deps.pool, { subId, customerId: null, at: eventTime(event) });
+    if (obj.status === "active" || obj.status === "trialing") return clearPaymentFailed(deps.pool, { subId, customerId: null });
+  }
+  return 0;
+}
+
+const cardOf = (pm) => (pm && typeof pm === "object" && pm.card
+  ? { brand: pm.card.brand || null, last4: pm.card.last4 || null, exp_month: pm.card.exp_month || null, exp_year: pm.card.exp_year || null }
+  : null);
+
+/** The customer's default card: invoice default, else the event's own payment method, else their first saved card. */
+async function defaultCard(stripe, customerId, eventPm) {
+  const cus = await stripe.customers.retrieve(customerId, { expand: ["invoice_settings.default_payment_method"] });
+  if (!cus || cus.deleted) return null;
+  let pm = cus.invoice_settings && cus.invoice_settings.default_payment_method;
+  if (typeof pm === "string") pm = await stripe.paymentMethods.retrieve(pm);
+  let card = cardOf(pm) || cardOf(eventPm);
+  if (!card) {
+    const list = await stripe.paymentMethods.list({ customer: customerId, type: "card", limit: 1 });
+    card = cardOf(list && list.data && list.data[0]);
+  }
+  return card;
+}
+
+async function recordCard(event, deps) {
+  const log = deps.log || console;
+  if (!deps.stripe || !CARD_EVENTS.has(event.type)) return 0;
+  const obj = (event && event.data && event.data.object) || {};
+  const customerId = obj.object === "customer" ? obj.id : customerIdOf(obj);
+  if (!customerId) return 0;
+  try {
+    const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("stripe timeout")), deps.cardTimeoutMs || 5000).unref());
+    const card = await Promise.race([defaultCard(deps.stripe, customerId, obj.object === "payment_method" ? obj : null), timeout]);
+    if (!card) return 0;
+    const r = await deps.pool.query(
+      `UPDATE licenses SET card_brand = $2, card_last4 = $3, card_exp_month = $4, card_exp_year = $5 WHERE stripe_customer_id = $1`,
+      [customerId, card.brand, card.last4, card.exp_month, card.exp_year]);
+    return r.rowCount;
+  } catch (e) {
+    log.warn(`[Stripe] card on file not recorded for ${customerId} (${event.type}): ${e.message}`);
+    return 0;
+  }
+}
+
+/**
+ * Apply one verified platform event: the license work (applyLicenseEvent), then — when that succeeded — the billing
+ * state (payment_failed_at, card on file). deps as applyLicenseEvent, plus optional `stripe` (a Stripe client; without
+ * it the card is not read).
+ */
+async function handlePlatformEvent(event, deps) {
+  const out = await applyLicenseEvent(event, deps);
+  if (out.status !== 200) return out;
+  await applyPaymentState(event, deps);
+  await recordCard(event, deps);
+  return out;
+}
+
+module.exports = { handlePlatformEvent, applyLicenseEvent, applyPaymentState, recordCard, subscriptionIdOf, invoicePriceIdOf, subscriptionPriceIdOf, activeForStatus };

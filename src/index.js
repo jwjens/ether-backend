@@ -402,6 +402,19 @@ async function initDB() {
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS key_prefix TEXT`);
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS key_hash   TEXT`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_licenses_key_prefix ON licenses(key_prefix)`);
+  // Billing notices (src/lib/billing-notice.js): the day Stripe last failed a payment (cleared when one succeeds) and
+  // the card on file (brand, last 4, expiry) — written only by the Stripe webhook. Banners and emails read them; nothing
+  // else does, and nothing in playout ever does (lapse rule).
+  await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS payment_failed_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS card_brand TEXT`);
+  await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS card_last4 TEXT`);
+  await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS card_exp_month INTEGER`);
+  await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS card_exp_year INTEGER`);
+  // One billing email per kind per period (src/lib/billing-emails.js). license_id 0 = an account with no license yet
+  // (its trial lives on the users row); its period_key then starts with "user:<id>:".
+  await pool.query(`CREATE TABLE IF NOT EXISTS billing_notices_sent (
+    license_id INTEGER NOT NULL, kind TEXT NOT NULL, period_key TEXT NOT NULL, sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (license_id, kind, period_key))`);
   // Drop the stale plan CHECK constraint — it predates the newer tiers (pro_lifetime,
   // station_lifetime, operator) and rejected them. Plan is validated in code against VALID_PLANS.
   await pool.query(`ALTER TABLE licenses DROP CONSTRAINT IF EXISTS licenses_plan_check`);
@@ -5365,6 +5378,7 @@ app.post("/webhook/stripe", async (req, res) => {
     const out = await stripeWebhook.handlePlatformEvent(event, {
       pool, validPlans: VALID_PLANS, planByPriceId: PLAN_BY_PRICE_ID, generateLicenseKey,
       hashKey: (k) => bcrypt.hash(k, 12), sendLicenseEmail,
+      stripe: process.env.STRIPE_SECRET_KEY ? stripe : null,   // reads the card on file (billing notices); guarded
     });
     return res.status(out.status).json(out.body);
   } catch (e) {
