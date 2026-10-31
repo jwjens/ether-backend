@@ -64,8 +64,9 @@ function registerFunctions(db) {
     implementation: (s) => crypto.createHash("md5").update(String(s)).digest("hex") });
 }
 
-/** Boot the real server. Call once per test file (src/index.js is a module: one app per process). */
-async function startServer() {
+/** Boot the real server. Call once per test file (src/index.js is a module: one app per process). opts.port: a fixed
+ *  port instead of an ephemeral one (the local billing test server, scripts/billing-test-server.js). */
+async function startServer(opts = {}) {
   for (const [k, v] of Object.entries(SECRETS)) process.env[k] = v;
   for (const [k, v] of Object.entries(R2_TEST_ENV)) if (!process.env[k]) process.env[k] = v;
   process.env.RESEND_API_KEY = process.env.RESEND_API_KEY || "re_test_never_sent";
@@ -86,7 +87,7 @@ async function startServer() {
   srv.resend.emails.send = async (msg) => { emails.push(msg); return { data: { id: `test-${emails.length}` }, error: null }; };
   await srv.initDB();
   const server = http.createServer(srv.app);
-  await new Promise(r => server.listen(0, "127.0.0.1", r));
+  await new Promise(r => server.listen(opts.port || 0, "127.0.0.1", r));
   const base = `http://127.0.0.1:${server.address().port}`;
 
   /** HTTP call; returns { status, body }. opts: { headers, body }. */
