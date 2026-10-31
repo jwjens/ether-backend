@@ -1135,6 +1135,22 @@ async function sendLicenseEmail(email, licenseKey, plan) {
   if (error) throw new Error(JSON.stringify(error));
 }
 
+// Billing emails (src/lib/billing-emails.js): the notice's own words in the standard shell, its action as the button.
+// Transactional (about the account's own billing), so no unsubscribe link. Sent only by the hourly job, which runs only
+// with BILLING_EMAILS=1.
+async function sendBillingEmail(to, notice) {
+  const from = process.env.FROM_EMAIL || "noreply@ether-technologies.com";
+  const html = emailShell({ heading: escapeHtml(notice.title), bodyHtml: `<p style="margin:0">${escapeHtml(notice.body)}</p>`,
+                            button: notice.action ? { label: escapeHtml(notice.action.label), url: escapeHtml(notice.action.url) } : null, unsubUrl: null });
+  const { error } = await resend.emails.send({ from, to, subject: `Ether: ${notice.title}`, html }) || {};
+  if (error) throw new Error(typeof error === "string" ? error : JSON.stringify(error));
+}
+const BILLING_EMAILS = require("./lib/billing-emails");
+/** One pass of the billing emails (the hourly job; the local billing test server and tests call it directly). */
+function runBillingEmails(opts = {}) {
+  return BILLING_EMAILS.runBillingEmails({ pool, catalog: PLAN_CATALOG, accountUrl: ACCOUNT_APP_URL, send: sendBillingEmail, ...opts });
+}
+
 // ── Auth middleware ───────────────────────────────────────────
 
 // Two-path license lookup per B-12 — shared by requireLicense and cmd-stream.
@@ -7752,6 +7768,14 @@ return initDB().then(() => {
       }));
     } catch (e) { console.warn("[stream-sample]", e.message); }
   }, 60_000);
+
+  // Billing emails: hourly, and ONLY with BILLING_EMAILS=1 (off by default — a deploy sends nothing until it is set).
+  if (BILLING_EMAILS.billingEmailsOn()) {
+    const tick = () => runBillingEmails().catch((e) => console.warn("[billing-emails]", e.message));
+    setTimeout(tick, 120_000).unref();
+    setInterval(tick, 3_600_000);
+    console.log("[billing-emails] on (BILLING_EMAILS=1): checking hourly");
+  }
 }).catch(e => {
   console.error("[Ether] DB init failed:", e.message);
   process.exit(1);
@@ -7759,4 +7783,4 @@ return initDB().then(() => {
 }
 if (require.main === module) start();
 
-module.exports = { app, pool, initDB, resend };
+module.exports = { app, pool, initDB, resend, runBillingEmails };
