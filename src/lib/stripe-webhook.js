@@ -26,18 +26,25 @@ function subscriptionIdOf(obj) {
 }
 
 // Price id on an invoice line (older API: line.price.id; newer: line.pricing.price_details.price).
-function invoicePriceIdOf(obj) {
-  const line = obj && obj.lines && obj.lines.data && obj.lines.data[0];
-  if (!line) return "";
-  return (line.price && line.price.id)
-    || (line.pricing && line.pricing.price_details && line.pricing.price_details.price)
-    || "";
+const linePriceId = (line) => (line && ((line.price && line.price.id)
+  || (line.pricing && line.pricing.price_details && line.pricing.price_details.price))) || "";
+
+// The PLAN price on an invoice. Since 2026-11-01 one subscription can carry add-ons (Network extra stations, +50
+// listeners) beside the plan, and Stripe does not promise the plan is line 0 — so the first line whose price is a plan
+// price wins; with no map, or no plan line, line 0 (the old behaviour, and what the "unknown price" log reports).
+function invoicePriceIdOf(obj, planByPriceId) {
+  const lines = (obj && obj.lines && obj.lines.data) || [];
+  if (!lines.length) return "";
+  const plan = planByPriceId && lines.find((l) => planByPriceId[linePriceId(l)]);
+  return linePriceId(plan || lines[0]);
 }
 
-// Price id on a subscription object (items.data[0].price.id).
-function subscriptionPriceIdOf(sub) {
-  const it = sub && sub.items && sub.items.data && sub.items.data[0];
-  return (it && it.price && it.price.id) || "";
+// The PLAN price on a subscription object (the item whose price is a plan price; else items.data[0], as before).
+function subscriptionPriceIdOf(sub, planByPriceId) {
+  const items = (sub && sub.items && sub.items.data) || [];
+  const id = (it) => (it && it.price && (typeof it.price === "string" ? it.price : it.price.id)) || "";
+  const plan = planByPriceId && items.find((it) => planByPriceId[id(it)]);
+  return id(plan || items[0]);
 }
 
 const customerIdOf = (obj) => (typeof obj?.customer === "string" ? obj.customer : obj?.customer?.id) || null;
@@ -98,7 +105,7 @@ async function applyLicenseEvent(event, deps) {
     const customerId = customerIdOf(obj);
     if (!email) { log.warn("[Stripe] No email"); return ok(); }
     if (!subId) { log.error(`[Stripe] ${event.type} for ${email} carries no subscription id — no license issued`); return ok(); }
-    const priceId = invoicePriceIdOf(obj);
+    const priceId = invoicePriceIdOf(obj, planByPriceId);
     const plan = planByPriceId[priceId];
     if (!plan) {
       log.error(`[Stripe] UNKNOWN priceId "${priceId}" for ${email} (event: ${event.type}, subId: ${subId}) — no license issued. ` +
@@ -136,12 +143,14 @@ async function applyLicenseEvent(event, deps) {
   }
 
   // ── B3: plan / status change (portal upgrade-downgrade, Stripe dunning outcome) ──
-  if (event.type === "customer.subscription.updated") {
+  // customer.subscription.created carries the same shape; it is handled the same way (it changes nothing when the
+  // license does not exist yet — checkout.session.completed makes it and records the add-ons itself).
+  if (event.type === "customer.subscription.updated" || event.type === "customer.subscription.created") {
     const subId = subscriptionIdOf(obj);
     if (!subId) return ok();
-    const priceId = subscriptionPriceIdOf(obj);
+    const priceId = subscriptionPriceIdOf(obj, planByPriceId);
     const plan = priceId ? planByPriceId[priceId] || null : null;
-    if (priceId && !plan) log.error(`[Stripe] subscription.updated ${subId}: UNKNOWN priceId "${priceId}" — plan left unchanged`);
+    if (priceId && !plan) log.error(`[Stripe] ${event.type} ${subId}: UNKNOWN priceId "${priceId}" — plan left unchanged`);
     const active = activeForStatus(obj.status);
     const r = await pool.query(
       `UPDATE licenses
@@ -150,7 +159,7 @@ async function applyLicenseEvent(event, deps) {
               stripe_customer_id = COALESCE($4, stripe_customer_id)
         WHERE stripe_subscription_id = $1`,
       [subId, plan, active, customerIdOf(obj)]);
-    log.log(`[Stripe] subscription.updated ${subId}: status=${obj.status} plan=${plan || "(unchanged)"} active=${active === null ? "(unchanged)" : active} rows=${r.rowCount}`);
+    log.log(`[Stripe] ${event.type} ${subId}: status=${obj.status} plan=${plan || "(unchanged)"} active=${active === null ? "(unchanged)" : active} rows=${r.rowCount}`);
     return ok({ updated: r.rowCount });
   }
 
@@ -258,15 +267,47 @@ async function recordCard(event, deps) {
 
 /**
  * Apply one verified platform event: the license work (applyLicenseEvent), then — when that succeeded — the billing
- * state (payment_failed_at, card on file). deps as applyLicenseEvent, plus optional `stripe` (a Stripe client; without
+ * state (payment_failed_at, card on file) and the add-on quantities. deps as applyLicenseEvent, plus optional `stripe` (a Stripe client; without
  * it the card is not read).
  */
+// ── ADD-ONS (2026-11-01) ────────────────────────────────────────────────────────────────────────────────────────────
+// How many Network extra stations and +50 listener add-ons the subscription carries, written to the license so its
+// limits (entitlements.js) and its station cap (billing-prices.js stationCapFor) follow what the customer pays for.
+// Stripe's subscription is the only source: subscription.created/updated carry the items; for a finished checkout the
+// subscription is read from Stripe (the session carries no items). deps.subscriptionState(sub) → { extra_stations,
+// listener_addons } (billing-prices.js). A Stripe error is logged and never fails the webhook.
+const ADDON_EVENTS = new Set(["customer.subscription.created", "customer.subscription.updated"]);
+
+async function recordAddons(event, deps) {
+  const log = deps.log || console;
+  if (typeof deps.subscriptionState !== "function") return 0;
+  const obj = (event && event.data && event.data.object) || {};
+  let sub = null;
+  if (ADDON_EVENTS.has(event.type)) sub = obj;
+  else if (event.type === "checkout.session.completed" && obj.mode === "subscription" && deps.stripe) {
+    const subId = subscriptionIdOf(obj);
+    if (!subId) return 0;
+    try {
+      const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("stripe timeout")), deps.cardTimeoutMs || 5000).unref());
+      sub = await Promise.race([deps.stripe.subscriptions.retrieve(subId), timeout]);
+    } catch (e) { log.warn(`[Stripe] add-ons not recorded for ${subId}: ${e.message}`); return 0; }
+  }
+  if (!sub || !sub.id) return 0;
+  const st = deps.subscriptionState(sub);
+  const r = await deps.pool.query(
+    `UPDATE licenses SET extra_stations = $2, listener_addons = $3 WHERE stripe_subscription_id = $1`,
+    [sub.id, st.extra_stations || 0, st.listener_addons || 0]);
+  if (r.rowCount) log.log(`[Stripe] add-ons ${sub.id}: extra_stations=${st.extra_stations || 0} listener_addons=${st.listener_addons || 0}`);
+  return r.rowCount;
+}
+
 async function handlePlatformEvent(event, deps) {
   const out = await applyLicenseEvent(event, deps);
   if (out.status !== 200) return out;
   await applyPaymentState(event, deps);
   await recordCard(event, deps);
+  await recordAddons(event, deps);
   return out;
 }
 
-module.exports = { handlePlatformEvent, applyLicenseEvent, applyPaymentState, recordCard, subscriptionIdOf, invoicePriceIdOf, subscriptionPriceIdOf, activeForStatus };
+module.exports = { handlePlatformEvent, applyLicenseEvent, applyPaymentState, recordCard, recordAddons, subscriptionIdOf, invoicePriceIdOf, subscriptionPriceIdOf, activeForStatus };

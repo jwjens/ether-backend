@@ -120,6 +120,8 @@ const ROUTES = {
   "GET /api/account/billing": A("billing"),
   "POST /api/account/billing/portal": A("billing"),
   "POST /api/user/billing/portal": A("billing"),
+  "GET /api/user/subscription/addons": A("billing"),
+  "POST /api/user/subscription/addons": A("billing"),
 
   // ── seats, licenses, machines (seats) ──────────────────────────────────────────────────────────────────────────────
   "POST /validate": A("seats"),

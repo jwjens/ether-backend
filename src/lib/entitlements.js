@@ -49,6 +49,25 @@ function limitsFrom(p) {
 // (Network) 128 kbps, so these keep the limits they had before — catalog.lifetime_limits, today's old Unlimited.
 function frozenLimits(catalog) { return limitsFrom(catalog.lifetime_limits || {}); }
 
+// PAID ADD-ONS (2026-11-01; written to the license by the Stripe webhook from the subscription's items). A Network extra
+// station adds one station and its extra_station.listeners (50) to the pool; a +50 listener add-on adds its listeners
+// to the pool (Network) or to the stream (Live 128 / Live 320). Only on the current-plan branch below — lifetime and
+// platform-made licenses keep their frozen limits.
+function withAddons(r, lic, catalog) {
+  const xs = Math.max(0, Number(lic.extra_stations) || 0);
+  const la = Math.max(0, Number(lic.listener_addons) || 0);
+  if (!r.limits || !r.level || (!xs && !la)) return r;
+  const plan = catalog.plans[r.level] || {};
+  const perAddon = (catalog.addons && catalog.addons.listeners_50 && catalog.addons.listeners_50.listeners) || 0;
+  const extraListeners = (plan.extra_station ? xs * (plan.extra_station.listeners || 0) : 0) + la * perAddon;
+  const l = { ...r.limits, addons: { extra_stations: plan.extra_station ? xs : 0, listener_addons: la } };
+  if (plan.extra_station && l.stations_included != null) l.stations_included += xs;
+  if (plan.extra_station && Number.isFinite(l.hosted_streams)) l.hosted_streams += xs;
+  if (l.listeners && l.listeners.mode === "pool") l.listeners = { ...l.listeners, pool: l.listeners.pool + extraListeners };
+  else if (l.listeners && l.listeners.mode === "per_stream") l.listeners = { ...l.listeners, per_stream: l.listeners.per_stream + la * perAddon };
+  return { ...r, limits: l };
+}
+
 /**
  * @param {object|null} lic  licenses row (id, plan, active, expires_at)
  * @returns {{ license_id, plan, label, level, status, cloud, features, limits, trial_ends_at, legacy, exempt, catalog_version }}
@@ -95,7 +114,7 @@ function entitlementsFor(lic, { catalog, now = Date.now(), exemptIds = exemptIds
     if (ends != null && live) return result(plan, catalog.trial.level, "trial", { trial_ends_at: trialEnds, grace_until: graceUntil });
     if (inGrace) return result(plan, catalog.trial.level, "grace", { trial_ends_at: trialEnds, grace_until: graceUntil });
     if (!live) return result(plan, null, "lapsed", { trial_ends_at: trialEnds, grace_until: graceUntil });
-    return result(plan, plan, "active");
+    return withAddons(result(plan, plan, "active"), lic, catalog);
   }
   return result(null, null, "none");   // an unknown plan key: no cloud, and the account page says so
 }

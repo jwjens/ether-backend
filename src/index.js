@@ -64,6 +64,8 @@ const { userEntitlement: computeUserEntitlement } = require("./lib/entitlement")
 // Loaded and validated once at boot: a bad catalog stops the server rather than sell the wrong thing.
 const PLANS = require("./lib/plans");
 const PLAN_CATALOG = PLANS.load();
+// THE STRIPE PRICES (src/lib/billing-prices.js): price ids from the env variables the catalog names — never hardcoded.
+const BILLING = require("./lib/billing-prices");
 const ENT = require("./lib/entitlements");
 /** What license row `lic` may use now (plan, status, cloud features, limits). Cloud only: nothing local reads it. */
 const entitlementsOf = (lic) => ENT.entitlementsFor(lic || null, { catalog: PLAN_CATALOG });
@@ -414,6 +416,10 @@ async function initDB() {
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS card_last4 TEXT`);
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS card_exp_month INTEGER`);
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS card_exp_year INTEGER`);
+  // Add-ons on the license's Stripe subscription (2026-11-01): Network extra stations and +50 listener add-ons. Written
+  // only by the Stripe webhook (stripe-webhook.js recordAddons) and the add-ons route, from the subscription's items.
+  await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS extra_stations INTEGER DEFAULT 0`);
+  await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS listener_addons INTEGER DEFAULT 0`);
   // One billing email per kind per period (src/lib/billing-emails.js). license_id 0 = an account with no license yet
   // (its trial lives on the users row); its period_key then starts with "user:<id>:".
   await pool.query(`CREATE TABLE IF NOT EXISTS billing_notices_sent (
@@ -1003,6 +1009,9 @@ const VALID_PLANS = new Set([
   "free", "pro", "pro_lifetime", "station", "station_lifetime", "operator",
   // Unlimited (Jeff, 2026-10-29): its own key, renewing and expiring like the other paid plans; never stored as operator
   "unlimited",
+  // Local bought through Stripe (2026-11-01): the catalog key, so it reads "Local" — never "free", which is the old
+  // founding key and reads "Free (old key)" (license 21's name, Jeff 2026-11-01).
+  "local",
 ]);
 
 // Stripe priceId → PlanTier lookup. Used by /webhook/stripe to determine
@@ -1019,14 +1028,10 @@ const VALID_PLANS = new Set([
 // Extending: add a row when a new Stripe product is created. pro_lifetime,
 // station_lifetime, operator have no Stripe products today — they're
 // admin-issued only.
-const PLAN_BY_PRICE_ID = Object.fromEntries(
-  [
-    [process.env.PRICE_PRO,     "pro"],
-    [process.env.PRICE_STATION, "station"],
-    [process.env.PRICE_UNLIMITED_MONTHLY, "unlimited"],
-    [process.env.PRICE_UNLIMITED_ANNUAL,  "unlimited"],
-  ].filter(([id]) => !!id)
-);
+//
+// Since 2026-11-01 the map is built from config/plans.json's stripe_price_env (every plan, monthly and annual) plus the
+// legacy PRICE_PRO / PRICE_STATION (src/lib/billing-prices.js). Unset variables are skipped, as before.
+const PLAN_BY_PRICE_ID = BILLING.planByPriceId(PLAN_CATALOG);
 
 // Per-plan station limits enforced server-side in /account/add-station (EB2).
 // Network tier's differentiator is audio-sync features, not station count —
@@ -1055,6 +1060,7 @@ function generateLicenseKey(plan) {
   const prefix = (plan === "station" || plan === "station_lifetime") ? "ETH-STN"
                : plan === "operator" ? "ETH-ENT"
                : plan === "unlimited" ? "ETH-UNL"
+               : plan === "local" ? "ETH-LOC"
                : "ETH-PRO";   // pro / pro_lifetime / free
   const rand   = crypto.randomBytes(12).toString("hex").toUpperCase();
   return `${prefix}-${rand.slice(0,4)}-${rand.slice(4,8)}-${rand.slice(8,12)}`;
@@ -2679,28 +2685,70 @@ app.post("/api/user/desktop-activate", authLimiter, async (req, res) => {
 
 // Start a Stripe Checkout to convert a trial into a paid subscription. Ties the session to the
 // user (client_reference_id) + plan (metadata) so the webhook can flip THIS account to paid.
+// Body (2026-11-01): { plan: local|station|pro|unlimited, period?: monthly|annual (default monthly),
+// extra_stations?: n (Network only), listener_addons?: n (Live 128, Live 320, Network) } — every price id from the env
+// variables config/plans.json names (src/lib/billing-prices.js). A plan/period whose price is not set up: 400 invalid_plan.
 app.post("/api/user/checkout", requireUser, async (req, res) => {
   try {
     if (!process.env.STRIPE_SECRET_KEY) return res.status(503).json({ error: "stripe_unconfigured" });
-    const plan = String(req.body?.plan || "");
-    const priceId = plan === "station" ? process.env.PRICE_STATION : plan === "pro" ? process.env.PRICE_PRO : null;
-    if (!priceId) return res.status(400).json({ error: "invalid_plan" });
+    const c = BILLING.checkoutItems(PLAN_CATALOG, process.env, req.body || {});
+    if (c.error) return res.status(400).json({ error: c.error });
+    const plan = c.plan;
     const u = (await pool.query(`SELECT id, email FROM users WHERE id = $1`, [req.user.uid])).rows[0];
     if (!u) return res.status(404).json({ error: "not_found" });
     const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
     const base = ACCOUNT_APP_URL.replace(/\/$/, "");
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
-      line_items: [{ price: priceId, quantity: 1 }],
+      line_items: c.items,
       customer_email: u.email,
       client_reference_id: String(u.id),
-      metadata: { user_id: String(u.id), plan },
+      metadata: { user_id: String(u.id), plan, period: c.period },
       success_url: `${base}/?subscribed=1`,
       cancel_url: `${base}/`,
       allow_promotion_codes: true,
     });
     res.json({ url: session.url });
   } catch (e) { console.error("[user/checkout]", e.message); res.status(500).json({ error: "server_error", detail: e.message }); }
+});
+
+// Add-ons on the signed-in account's subscription (2026-11-01): set how many Network extra stations and +50 listener
+// add-ons it carries. Body { extra_stations?, listener_addons? } — the totals wanted, not a delta. Stripe changes the
+// subscription (prorated) and the license takes the quantities from the subscription Stripe returns; the webhook's
+// customer.subscription.updated writes the same numbers again. GET returns the current quantities.
+async function subscriptionForUser(uid) {
+  const u = (await pool.query(`SELECT license_key_id FROM users WHERE id = $1`, [uid])).rows[0];
+  if (!u || !u.license_key_id) return null;
+  return (await pool.query(`SELECT id, plan, stripe_subscription_id, extra_stations, listener_addons FROM licenses WHERE id = $1`, [u.license_key_id])).rows[0] || null;
+}
+app.get("/api/user/subscription/addons", requireUser, async (req, res) => {
+  try {
+    const lic = await subscriptionForUser(req.user.uid);
+    if (!lic || !lic.stripe_subscription_id) return res.status(404).json({ error: "no_subscription" });
+    res.json({ plan: lic.plan, extra_stations: lic.extra_stations || 0, listener_addons: lic.listener_addons || 0, allowed: BILLING.addonsAllowed(PLAN_CATALOG, lic.plan) });
+  } catch (e) { console.error("[user/subscription/addons]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+app.post("/api/user/subscription/addons", requireUser, async (req, res) => {
+  try {
+    if (!process.env.STRIPE_SECRET_KEY) return res.status(503).json({ error: "stripe_unconfigured" });
+    const lic = await subscriptionForUser(req.user.uid);
+    if (!lic || !lic.stripe_subscription_id) return res.status(404).json({ error: "no_subscription" });
+    const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+    const sub = await stripe.subscriptions.retrieve(lic.stripe_subscription_id);
+    const cur = BILLING.subscriptionState(sub, PLAN_CATALOG);
+    const want = {
+      extra_stations: req.body?.extra_stations ?? cur.extra_stations,
+      listener_addons: req.body?.listener_addons ?? cur.listener_addons,
+    };
+    const u = BILLING.addonUpdateItems(sub, PLAN_CATALOG, process.env, want);
+    if (u.error) return res.status(400).json({ error: u.error });
+    const after = u.items.length
+      ? await stripe.subscriptions.update(sub.id, { items: u.items, proration_behavior: "create_prorations" })
+      : sub;
+    const st = BILLING.subscriptionState(after, PLAN_CATALOG);
+    await pool.query(`UPDATE licenses SET extra_stations = $2, listener_addons = $3 WHERE id = $1`, [lic.id, st.extra_stations, st.listener_addons]);
+    res.json({ ok: true, plan: lic.plan, extra_stations: st.extra_stations, listener_addons: st.listener_addons });
+  } catch (e) { console.error("[user/subscription/addons POST]", e.message); res.status(500).json({ error: "server_error", detail: e.message }); }
 });
 
 // First-admin bootstrap: paste license key + pick username + PIN. Allowed only
@@ -4601,7 +4649,7 @@ app.post("/account/add-station", async (req, res) => {
       // row that escaped EB4's /admin/issue validation. Listed BEFORE the
       // seat-limit check so the more informative station_limit_reached
       // fires first if a customer would hit both.
-      const stationCap = PLAN_STATION_LIMITS[license.plan] ?? PLAN_STATION_LIMITS.free;
+      const stationCap = BILLING.stationCapFor(license, PLAN_STATION_LIMITS, PLAN_CATALOG);   // Network: 5 + paid extra stations
       if (stationCap !== -1) {
         const { rows: scRow } = await client.query(
           "SELECT COUNT(*)::int AS n FROM stations WHERE license_key_id=$1",
@@ -4720,7 +4768,7 @@ app.post("/account/register-station", async (req, res) => {
       return res.json({ ok: true, uuid: u, already: true });   // already registered — idempotent
     }
 
-    const stationCap = PLAN_STATION_LIMITS[license.plan] ?? PLAN_STATION_LIMITS.free;
+    const stationCap = BILLING.stationCapFor(license, PLAN_STATION_LIMITS, PLAN_CATALOG);
     if (stationCap !== -1) {
       const { rows } = await pool.query("SELECT COUNT(*)::int AS n FROM stations WHERE license_key_id=$1", [license.id]);
       if (rows[0].n >= stationCap) {
@@ -5438,6 +5486,7 @@ app.post("/webhook/stripe", async (req, res) => {
   try {
     const out = await stripeWebhook.handlePlatformEvent(event, {
       pool, validPlans: VALID_PLANS, planByPriceId: PLAN_BY_PRICE_ID, generateLicenseKey,
+      subscriptionState: (sub) => BILLING.subscriptionState(sub, PLAN_CATALOG),   // add-on quantities → the license
       hashKey: (k) => bcrypt.hash(k, 12), sendLicenseEmail,
       stripe: process.env.STRIPE_SECRET_KEY ? stripe : null,   // reads the card on file (billing notices); guarded
     });
