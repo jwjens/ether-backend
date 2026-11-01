@@ -1,28 +1,37 @@
 {
-  "version": 1,
+  "version": 2,
   "currency": "usd",
-  "source": "docs/paywall-entitlements-plan.md (desktop repo): price table, §4.2, Decisions 2026-10-05, Rulings 2026-10-29",
+  "source": "docs/paywall-entitlements-plan.md (desktop repo): price table, §4.2, Decisions 2026-10-05, Rulings 2026-10-29; new pricing 2026-10-31 (docs/pricing-2026-10-31-before-build.md)",
   "trial": { "days": 15, "requires_card": false, "level": "unlimited" },
   "plans": {
     "local": {
-      "label": "Local", "price_monthly": 9, "price_annual": 90, "per": "account",
+      "label": "Local", "price_monthly": 20, "price_annual": 200, "per": "account",
       "hosted_streams": 0, "cloud": false, "includes_updates": true,
       "summary": "Everything local, one price for the whole account: the full desktop app, your own Icecast, the typed-address Remote Link, and updates. No cloud features."
     },
     "station": {
-      "label": "Station", "price_monthly": 25, "per": "stream", "includes": ["local"],
-      "hosted_streams": 1, "max_bitrate_kbps": 128, "listeners_per_stream": 50, "r2_quota_gb": 100, "cloud": true
+      "label": "Live 128", "price_monthly": 25, "price_annual": 250, "per": "station", "includes": ["local"],
+      "hosted_streams": 1, "max_bitrate_kbps": 128, "listeners_per_stream": 50, "r2_quota_gb": 100, "cloud": true,
+      "summary": "One hosted station on Ether's cloud: 128 kbps, 50 listeners, and every cloud feature."
     },
     "pro": {
-      "label": "Pro", "price_monthly": 49, "per": "stream", "includes": ["local"],
+      "label": "Live 320", "price_monthly": 49, "price_annual": 490, "per": "station", "includes": ["local"],
       "hosted_streams": 1, "max_bitrate_kbps": 320, "listeners_per_stream": 150, "r2_quota_gb": 250, "cloud": true,
-      "priority_support": true
+      "priority_support": true,
+      "summary": "One hosted station on Ether's cloud: 320 kbps, 150 listeners, every cloud feature, and priority support."
     },
     "unlimited": {
-      "label": "Unlimited", "price_monthly": 79, "includes": ["local"],
-      "hosted_streams": "unlimited", "max_bitrate_kbps": 320, "listener_pool": 250, "r2_quota_gb": 500, "cloud": true,
-      "priority_support": true
+      "label": "Network", "price_monthly": 79, "price_annual": 790, "per": "account", "includes": ["local"],
+      "hosted_streams": 5, "stations_included": 5, "max_bitrate_kbps": 128, "listener_pool": 250, "r2_quota_gb": 500, "cloud": true,
+      "priority_support": true,
+      "extra_station": { "price_monthly": 15, "listeners": 50 },
+      "summary": "Five hosted stations at 128 kbps sharing 250 listeners, and every cloud feature. Each extra station is $15/mo and adds 50 listeners to the pool."
     }
+  },
+  "lifetime_limits": {
+    "note": "Lifetime and platform-made licenses are never modified (Rulings 2026-10-05): they keep exactly the limits they had before the 2026-10-31 prices.",
+    "label_suffix": " (Lifetime)",
+    "hosted_streams": "unlimited", "max_bitrate_kbps": 320, "listener_pool": 250, "r2_quota_gb": 500, "priority_support": true
   },
   "features": {
     "public_page":    { "label": "Public listener page, account hub, embeds", "plans": ["local", "station", "pro", "unlimited"] },
@@ -44,7 +53,7 @@
   "addons": {
     "listeners_50": { "label": "+50 listeners", "price_monthly": 10, "listeners": 50, "plans": ["station", "pro", "unlimited"] }
   },
-  "discounts": { "multi_station": { "min_stations": 3, "percent": 20 }, "annual_months_charged": 10 },
+  "discounts": { "annual_months_charged": 10 },
   "grace": { "past_due_days": 7, "suspended_days": 30, "retention_days": 90 },
   "lapse": { "banner": true, "updates_stop": true, "never_stop_audio": true },
   "stripe_price_env": {
@@ -52,6 +61,7 @@
     "station_monthly": "PRICE_STATION_MONTHLY", "station_annual": "PRICE_STATION_ANNUAL",
     "pro_monthly": "PRICE_PRO_MONTHLY", "pro_annual": "PRICE_PRO_ANNUAL",
     "unlimited_monthly": "PRICE_UNLIMITED_MONTHLY", "unlimited_annual": "PRICE_UNLIMITED_ANNUAL",
+    "network_extra_station_monthly": "PRICE_NETWORK_EXTRA_STATION_MONTHLY",
     "listeners_50_monthly": "PRICE_LISTENERS_50_MONTHLY"
   }
 }

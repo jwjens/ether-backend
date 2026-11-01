@@ -31,6 +31,9 @@ function featuresOf(catalog, planKey) {
 }
 function limitsOf(catalog, planKey) {
   const p = catalog.plans[planKey] || {};
+  return limitsFrom(p);
+}
+function limitsFrom(p) {
   return {
     hosted_streams: p.hosted_streams ?? 0,
     max_bitrate_kbps: p.max_bitrate_kbps ?? null,
@@ -38,8 +41,13 @@ function limitsOf(catalog, planKey) {
              : p.listeners_per_stream != null ? { mode: "per_stream", per_stream: p.listeners_per_stream } : null,
     r2_quota_gb: p.r2_quota_gb ?? null,
     priority_support: !!p.priority_support,
+    ...(p.stations_included != null ? { stations_included: p.stations_included } : {}),
+    ...(p.extra_station ? { extra_station: { ...p.extra_station } } : {}),
   };
 }
+// Lifetime and platform-made licenses are never modified (Rulings 2026-10-05): the 2026-10-31 prices made the top plan
+// (Network) 128 kbps, so these keep the limits they had before — catalog.lifetime_limits, today's old Unlimited.
+function frozenLimits(catalog) { return limitsFrom(catalog.lifetime_limits || {}); }
 
 /**
  * @param {object|null} lic  licenses row (id, plan, active, expires_at)
@@ -61,11 +69,15 @@ function entitlementsFor(lic, { catalog, now = Date.now(), exemptIds = exemptIds
   if (lic.active === false) return result(null, null, "inactive");
 
   const plan = String(lic.plan || "");
-  if (NEVER_EXPIRES(plan)) return result("unlimited", "unlimited", "exempt", { exempt: true, legacy: true });
+  if (NEVER_EXPIRES(plan)) {
+    const r = result("unlimited", "unlimited", "exempt", { exempt: true, legacy: true, lifetime: true });
+    return { ...r, label: r.label + ((catalog.lifetime_limits && catalog.lifetime_limits.label_suffix) || ""), limits: frozenLimits(catalog) };
+  }
   if (exemptIds.has(Number(lic.id))) {
     // outside the tier system: exactly today's access (a paid plan key has every cloud feature; free has none)
     const level = plan === "free" || plan === "local" ? "local" : "unlimited";
-    return result(level === "local" ? "local" : "unlimited", level, "exempt", { exempt: true, legacy: true });
+    const r = result(level === "local" ? "local" : "unlimited", level, "exempt", { exempt: true, legacy: true });
+    return level === "unlimited" ? { ...r, limits: frozenLimits(catalog) } : r;
   }
 
   const ends = lic.expires_at ? new Date(lic.expires_at).getTime() : null;
@@ -76,7 +88,8 @@ function entitlementsFor(lic, { catalog, now = Date.now(), exemptIds = exemptIds
   const inGrace = ends != null && !live && now < ends + graceMs;
   const graceUntil = ends != null ? new Date(ends + graceMs).toISOString() : null;
 
-  if (plan === "free") return result("local", "local", "active", { legacy: true });   // Founding Local (Decision 6)
+  // Founding Local (Decision 6); its name stays "Free (old key)" (Jeff, 2026-11-01 — license 21 is never changed)
+  if (plan === "free") return { ...result("local", "local", "active", { legacy: true }), label: "Free (old key)" };
   if (catalog.plans[plan]) {
     // a current plan key: an expires_at on it is a trial (or a paid period's end); past it, Local lapsed
     if (ends != null && live) return result(plan, catalog.trial.level, "trial", { trial_ends_at: trialEnds, grace_until: graceUntil });

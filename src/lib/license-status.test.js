@@ -72,7 +72,7 @@ test("the old free key reads \"Free (old key)\" (never Paid), Local in the dropd
 test("the dropdown: the catalog's plans plus Lifetime; every choice writes a key the server accepts", () => {
   const VALID = new Set(["free", "pro", "pro_lifetime", "station", "station_lifetime", "operator", "unlimited"]);
   const opts = tierOptions(catalog);
-  assert.deepEqual(opts.map(o => o.label), ["Local", "Station", "Pro", "Unlimited", "Lifetime"]);
+  assert.deepEqual(opts.map(o => o.label), ["Local", "Live 128", "Live 320", "Network", "Lifetime"]);
   for (const o of opts) assert.ok(VALID.has(o.writes), o.key);
   assert.equal(TIER_WRITES.unlimited, "unlimited", "Unlimited is its own key, never operator");
   // every old key shows as a choice, and re-choosing it writes nothing new for the keys that map one to one

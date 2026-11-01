@@ -1114,8 +1114,10 @@ function emailShell({ heading, bodyHtml, button, unsubUrl }) {
 }
 
 async function sendLicenseEmail(email, licenseKey, plan) {
-  const label = plan === "unlimited" ? PLAN_CATALOG.plans.unlimited.label : plan === "station" ? "Network" : "Studio";
-  const price = plan === "unlimited" ? `$${PLAN_CATALOG.plans.unlimited.price_monthly}/mo` : plan === "station" ? "$79/mo" : "$19/mo";
+  // the plan's name and price come from config/plans.json (the catalog), never typed here
+  const cp = PLAN_CATALOG.plans[plan] || PLAN_CATALOG.plans.station;
+  const label = cp.label;
+  const price = `$${cp.price_monthly}/mo`;
   const from  = process.env.FROM_EMAIL || "noreply@ether-technologies.com";
   const bodyHtml = `
     <p style="margin:0 0 18px">Thanks for subscribing to <strong style="color:#18181b">Ether ${label}</strong> (${price}). Save this email — you'll need the key if you ever reinstall.</p>

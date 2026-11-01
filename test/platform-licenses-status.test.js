@@ -37,7 +37,7 @@ test("each license: Trial with days left and its end date, Lifetime, Lapsed; las
   assert.equal(by["gone@x.test"].plan_status.status, "lapsed");
   assert.equal(by["gone@x.test"].last_seen, null);
 
-  assert.deepEqual(r.body.tier_options.map(o => o.label), ["Local", "Station", "Pro", "Unlimited", "Lifetime"]);
+  assert.deepEqual(r.body.tier_options.map(o => o.label), ["Local", "Live 128", "Live 320", "Network", "Lifetime"]);
   assert.ok(!("stripe_subscription_id" in by["trial@x.test"]), "subscription id is not sent to the page");
   const after = (await h.pool.query(`SELECT id, plan, active, expires_at FROM licenses ORDER BY id`)).rows;
   assert.deepEqual(after, before, "reading the page changed a license");

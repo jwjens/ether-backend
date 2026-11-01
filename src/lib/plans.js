@@ -25,6 +25,15 @@ function validate(c) {
     if (p.per !== undefined && !PER.includes(p.per)) errs.push(`plans.${k}.per`);
   }
   for (const k of Object.keys(c.plans || {})) if (!PLAN_KEYS.includes(k)) errs.push(`plans.${k}: unknown plan`);
+  // annual = 10 months' price (Jeff, 2026-10-31): an annual price that disagrees with the rule is a typo, not a deal
+  const months = c.discounts && c.discounts.annual_months_charged;
+  for (const k of PLAN_KEYS) {
+    const p = c.plans && c.plans[k];
+    if (p && p.price_annual !== undefined && (!num(months) || p.price_annual !== p.price_monthly * months)) errs.push(`plans.${k}.price_annual`);
+    if (p && p.extra_station !== undefined && !(num(p.extra_station.price_monthly) && num(p.extra_station.listeners))) errs.push(`plans.${k}.extra_station`);
+  }
+  const ll = c.lifetime_limits;
+  if (!ll || !num(ll.max_bitrate_kbps) || !num(ll.listener_pool)) errs.push("lifetime_limits");
   for (const [f, d] of Object.entries(c.features || {})) {
     if (!Array.isArray(d.plans) || d.plans.some(p => !PLAN_KEYS.includes(p))) errs.push(`features.${f}.plans`);
     // a plan with no cloud never carries a cloud-only feature; Local's are the listener page + now-playing (Decision 2)
