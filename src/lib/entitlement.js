@@ -22,9 +22,18 @@ function licenseExpired(row, now = Date.now()) {
 /** { status: active|trial|expired|none, plan, trial_days_left } for a users row. */
 async function userEntitlement(pool, u, now = Date.now()) {
   if (u.license_key_id) {
-    const { rows } = await pool.query(`SELECT plan, active, expires_at FROM licenses WHERE id = $1`, [u.license_key_id]);
+    const { rows } = await pool.query(`SELECT plan, active, expires_at, stripe_subscription_id FROM licenses WHERE id = $1`, [u.license_key_id]);
     const lic = rows[0];
-    if (lic && lic.active && !licenseExpired(lic, now)) return { status: "active", plan: lic.plan, trial_days_left: 0 };
+    if (lic && lic.active && !licenseExpired(lic, now)) {
+      // A future expires_at with no Stripe subscription is the trial key desktop-activate mints (expires_at = trial end;
+      // nothing writes expires_at on a paid license). It read "active", so the account page said "Subscribed" and hid
+      // the plans from every trial user (2026-11-01). It is a trial, with its days left — the same rule as entitlements.js.
+      if (lic.expires_at && !NEVER_EXPIRES(lic.plan) && !lic.stripe_subscription_id) {
+        const ms = new Date(lic.expires_at).getTime() - now;
+        return { status: "trial", plan: "trial", trial_days_left: Math.ceil(ms / 86400000) };
+      }
+      return { status: "active", plan: lic.plan, trial_days_left: 0 };
+    }
   }
   if (u.trial_ends_at) {
     const ms = new Date(u.trial_ends_at).getTime() - now;

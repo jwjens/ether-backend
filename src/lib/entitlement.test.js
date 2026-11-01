@@ -9,10 +9,10 @@ const { userEntitlement, licenseExpired } = require("./entitlement");
 const NOW = Date.parse("2026-10-05T12:00:00Z");
 const PAST = new Date(NOW - 5 * 86400000), FUTURE = new Date(NOW + 5 * 86400000);
 
-async function poolWith(plan, active, expires) {
+async function poolWith(plan, active, expires, sub = null) {
   const pool = new (newDb().adapters.createPg().Pool)();
-  await pool.query(`CREATE TABLE licenses (id SERIAL PRIMARY KEY, plan TEXT NOT NULL, active BOOLEAN, expires_at TIMESTAMPTZ)`);
-  await pool.query(`INSERT INTO licenses (plan, active, expires_at) VALUES ($1,$2,$3)`, [plan, active, expires]);
+  await pool.query(`CREATE TABLE licenses (id SERIAL PRIMARY KEY, plan TEXT NOT NULL, active BOOLEAN, expires_at TIMESTAMPTZ, stripe_subscription_id TEXT)`);
+  await pool.query(`INSERT INTO licenses (plan, active, expires_at, stripe_subscription_id) VALUES ($1,$2,$3,$4)`, [plan, active, expires, sub]);
   return pool;
 }
 
@@ -22,9 +22,16 @@ test("B6: an active trial license past its expires_at no longer reads active (fa
   assert.strictEqual(e.status, "expired");
 });
 
-test("B6: before expiry it still reads active", async () => {
+test("a trial key before its end (expires_at ahead, no Stripe subscription) reads as a trial with its days left, never Subscribed", async () => {
   const pool = await poolWith("station", true, FUTURE);
-  assert.strictEqual((await userEntitlement(pool, { license_key_id: 1 }, NOW)).status, "active");
+  const e = await userEntitlement(pool, { license_key_id: 1 }, NOW);
+  assert.strictEqual(e.status, "trial"); assert.strictEqual(e.plan, "trial"); assert.strictEqual(e.trial_days_left, 5);
+});
+
+test("a license with a Stripe subscription reads active even with an expires_at ahead", async () => {
+  const pool = await poolWith("station", true, FUTURE, "sub_123");
+  const e = await userEntitlement(pool, { license_key_id: 1 }, NOW);
+  assert.strictEqual(e.status, "active"); assert.strictEqual(e.plan, "station");
 });
 
 test("B6: a paid license with expires_at NULL is active (perpetual until Stripe cancels)", async () => {
