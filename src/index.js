@@ -1154,6 +1154,18 @@ async function sendLicenseEmail(email, licenseKey, plan) {
   if (error) throw new Error(JSON.stringify(error));
 }
 
+// The thank-you email after a purchase (src/lib/purchase-email.js): plan, Mac / Windows downloads (the account site's
+// links), how to start, the account site. Sent once per subscription by the Stripe webhook.
+async function sendPurchaseEmail(email, { plan, period, licenseKey = null, hasAccount = true }) {
+  const from = process.env.FROM_EMAIL || "noreply@ether-technologies.com";
+  const m = require("./lib/purchase-email").purchaseEmail({ catalog: PLAN_CATALOG, plan, period, licenseKey, hasAccount,
+    accountUrl: ACCOUNT_APP_URL, apiUrl: API_PUBLIC_URL });
+  const html = emailShell({ heading: escapeHtml(m.heading), bodyHtml: m.bodyHtml,
+    button: { label: escapeHtml(m.button.label), url: escapeHtml(m.button.url) }, unsubUrl: null });
+  const { error } = await resend.emails.send({ from, to: email, subject: m.subject, html }) || {};
+  if (error) throw new Error(JSON.stringify(error));
+}
+
 // Billing emails (src/lib/billing-emails.js): the notice's own words in the standard shell, its action as the button.
 // Transactional (about the account's own billing), so no unsubscribe link. Sent only by the hourly job, which runs only
 // with BILLING_EMAILS=1.
@@ -5505,6 +5517,7 @@ app.post("/webhook/stripe", async (req, res) => {
       subscriptionState: (sub) => BILLING.subscriptionState(sub, PLAN_CATALOG),   // add-on quantities → the license
       graceDays: PLAN_CATALOG.grace.past_due_days,   // a failed or ended subscription → grace_until
       hashKey: (k) => bcrypt.hash(k, 12), sendLicenseEmail,
+      sendPurchaseEmail, priceInfo: BILLING.priceMap(PLAN_CATALOG),   // the thank-you email (plan, period)
       stripe: process.env.STRIPE_SECRET_KEY ? stripe : null,   // reads the card on file (billing notices); guarded
     });
     return res.status(out.status).json(out.body);

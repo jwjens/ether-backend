@@ -493,3 +493,33 @@ test("order: Stripe unreachable → 503 and nothing written (Stripe delivers it 
   assert.strictEqual(out.status, 503);
   assert.ok((await graceRow(pool)).g, "unchanged");
 });
+
+// ── The thank-you email (2026-11-01): once per subscription, from the branch that makes the license ──────────────────
+test("thank-you email: exactly one per purchase, whichever message arrives first; account buyers get no key", async () => {
+  for (const order of [[checkoutEv, invoiceEv], [invoiceEv, checkoutEv]]) {
+    const pool = await poolWithIndex();
+    await pool.query(`INSERT INTO users (email) VALUES ('r@x.com')`);
+    const mails = [];
+    const { d, sent } = deps(pool, { hashKey: async (k) => { await new Promise((r) => setTimeout(r, 20)); return `hash:${k}`; },
+      sendPurchaseEmail: async (email, o) => { mails.push({ email, ...o }); }, priceInfo: { [PRICE_STATION]: { period: "monthly" } } });
+    await Promise.all(order.map((e) => W.handlePlatformEvent(e(), d)));
+    assert.strictEqual(mails.length, 1, `one thank-you email, got ${mails.length}`);
+    assert.strictEqual(sent.length, 0, "the old key email is not sent");
+    assert.strictEqual(mails[0].email, "r@x.com"); assert.strictEqual(mails[0].plan, "station"); assert.strictEqual(mails[0].hasAccount, true);
+  }
+});
+
+test("thank-you email: a payment-link buyer with no account gets it with the key; a failed send on the account path never undoes the purchase", async () => {
+  const pool = await poolWithIndex();
+  const mails = [];
+  const { d } = deps(pool, { sendPurchaseEmail: async (email, o) => { mails.push({ email, ...o }); }, priceInfo: { [PRICE_STATION]: { period: "annual" } } });
+  await W.handlePlatformEvent(invoiceEv(), d);
+  assert.strictEqual(mails.length, 1); assert.strictEqual(mails[0].hasAccount, false); assert.ok(mails[0].licenseKey); assert.strictEqual(mails[0].period, "annual");
+
+  const pool2 = await poolWithIndex();
+  await pool2.query(`INSERT INTO users (email) VALUES ('r@x.com')`);
+  const { d: d2 } = deps(pool2, { sendPurchaseEmail: async () => { throw new Error("resend down"); } });
+  const out = await W.handlePlatformEvent(checkoutEv(), d2);
+  assert.strictEqual(out.status, 200);
+  assert.strictEqual((await pool2.query(`SELECT license_key_id FROM users WHERE id = 1`)).rows[0].license_key_id, 1, "still linked");
+});

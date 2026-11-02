@@ -86,7 +86,7 @@ async function applyLicenseEvent(event, deps) {
       "UPDATE licenses SET active = true, plan = $1, email = $2, stripe_customer_id = COALESCE($3, stripe_customer_id) WHERE id = $4",
       [plan, email || null, customerId, id]);
     const { rows: existing } = await pool.query("SELECT id FROM licenses WHERE stripe_subscription_id = $1", [subId]);
-    let licId;
+    let licId, madeHere = false;
     if (existing.length) {
       await update(existing[0].id);
       licId = existing[0].id;
@@ -99,7 +99,7 @@ async function applyLicenseEvent(event, deps) {
         `INSERT INTO licenses (email, plan, stripe_subscription_id, stripe_customer_id, key_prefix, key_hash)
          VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING RETURNING id`,
         [email || null, plan, subId, customerId, key.slice(0, 12), await hashKey(key)]);
-      if (r.rows.length) licId = r.rows[0].id;
+      if (r.rows.length) { licId = r.rows[0].id; madeHere = true; }
       else {
         licId = (await pool.query("SELECT id FROM licenses WHERE stripe_subscription_id = $1", [subId])).rows[0].id;
         await update(licId);
@@ -107,6 +107,12 @@ async function applyLicenseEvent(event, deps) {
     }
     await pool.query("UPDATE users SET license_key_id = $1 WHERE id = $2", [licId, userId]);
     log.log(`[Stripe] account subscription: user ${userId} → license ${licId} (${plan})`);
+    // THE THANK-YOU EMAIL (src/lib/purchase-email.js): once, from the branch that made the license. A failed send is
+    // logged and never undoes the purchase.
+    if (madeHere && email && typeof deps.sendPurchaseEmail === "function") {
+      try { await deps.sendPurchaseEmail(email, { plan, period: obj.metadata?.period === "annual" ? "annual" : "monthly", hasAccount: true }); }
+      catch (e) { log.error(`[Stripe] thank-you email to ${email} failed: ${e.message}`); }
+    }
     return ok();
   }
 
@@ -152,7 +158,15 @@ async function applyLicenseEvent(event, deps) {
         log.log(`[License] ${subId} already has license ${won[0].id} (made at the same moment) — no second license, no email`);
         return ok();
       }
-      await sendLicenseEmail(email, licenseKey, plan);
+      // THE THANK-YOU EMAIL (src/lib/purchase-email.js) — the key shown only to a buyer with no account yet. A failed
+      // send rolls the license back so Stripe delivers again (as the key email always did).
+      if (typeof deps.sendPurchaseEmail === "function") {
+        const hasAccount = (await tx.query("SELECT 1 FROM users WHERE lower(email) = $1 LIMIT 1", [email])).rows.length > 0;
+        const period = (deps.priceInfo && deps.priceInfo[priceId] && deps.priceInfo[priceId].period) === "annual" ? "annual" : "monthly";
+        await deps.sendPurchaseEmail(email, { plan, period, licenseKey, hasAccount });
+      } else {
+        await sendLicenseEmail(email, licenseKey, plan);
+      }
       await tx.query("COMMIT");
       log.log(`[License] Issued: ${licenseKey.slice(0, 12)}... → ${email} (${plan})`);
       return ok();
