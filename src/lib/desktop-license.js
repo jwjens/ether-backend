@@ -11,7 +11,11 @@ const { licenseExpired } = require("./entitlement");
 //   1. the user's own license (users.license_key_id — set when they claimed it with its key, or when it was issued to
 //      them here);
 //   2. the account they were INVITED to (an active membership), only if their email is verified;
-//   3. otherwise a BRAND-NEW trial license of their own. Never an existing license found by email.
+//   3. otherwise a BRAND-NEW trial license of their own. Never an existing license found by email here.
+//
+// Jeff, 2026-11-01: a license ISSUED IN THE PLATFORM to an email links to the account with that email once the email is
+// CONFIRMED — never on an unconfirmed one (the 10/28 rule where it matters). That link is made before this runs, by
+// src/lib/issued-license.js (on confirm, at desktop sign-in, on the account page); this function is unchanged.
 
 /**
  * Resolve (and if needed create) the license for user `u`. `generateLicenseKey(plan)` makes a new plaintext key.

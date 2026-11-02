@@ -28,6 +28,7 @@ const ROUTES = {
   "POST /api/platform/account/create": A("platform"),
   "DELETE /api/platform/stations/:uuid": A("platform"),
   "GET /api/platform/licenses": A("platform"),
+  "POST /api/platform/licenses/preview": A("platform"),
   "POST /api/platform/licenses": A("platform"),
   "PATCH /api/platform/licenses/:id": A("platform"),
   "GET /api/platform/seat-tiers": A("platform"),

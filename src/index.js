@@ -67,6 +67,7 @@ const PLAN_CATALOG = PLANS.load();
 // THE STRIPE PRICES (src/lib/billing-prices.js): price ids from the env variables the catalog names — never hardcoded.
 const BILLING = require("./lib/billing-prices");
 const ENT = require("./lib/entitlements");
+const ISSUED = require("./lib/issued-license");   // a license issued to an email: the preview, the issue, the automatic link
 /** What license row `lic` may use now (plan, status, cloud features, limits). Cloud only: nothing local reads it. */
 const entitlementsOf = (lic) => ENT.entitlementsFor(lic || null, { catalog: PLAN_CATALOG });
 // THE ONE BILLING NOTICE (src/lib/billing-notice.js): banner/email text for a license (or, with no license yet, the users
@@ -1134,29 +1135,21 @@ function emailShell({ heading, bodyHtml, button, unsubUrl }) {
 </body></html>`;
 }
 
-async function sendLicenseEmail(email, licenseKey, plan) {
-  // the plan's name and price come from config/plans.json (the catalog), never typed here
-  const cp = PLAN_CATALOG.plans[plan] || PLAN_CATALOG.plans.station;
-  const label = cp.label;
-  const price = `$${cp.price_monthly}/mo`;
-  const from  = process.env.FROM_EMAIL || "noreply@ether-technologies.com";
-  const bodyHtml = `
-    <p style="margin:0 0 18px">Thanks for subscribing to <strong style="color:#18181b">Ether ${label}</strong> (${price}). Save this email — you'll need the key if you ever reinstall.</p>
-    <div style="background:#f7f6fc;border:1px solid #e6e1f7;border-radius:10px;padding:18px;text-align:center;margin:0 0 20px">
-      <div style="font-size:10px;color:#8a8a96;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:8px">License Key</div>
-      <div style="font-family:'Courier New',monospace;font-size:18px;font-weight:800;color:#6040C0;letter-spacing:2px">${escapeHtml(licenseKey)}</div>
-    </div>
-    <div style="font-size:13px;font-weight:700;color:#18181b;margin:0 0 8px">How to activate</div>
-    <ol style="color:#52525b;font-size:13px;line-height:2;padding-left:20px;margin:0">
-      <li>Open <strong style="color:#18181b">Ether</strong> on your computer</li>
-      <li>Click the <strong style="color:#18181b">Studio</strong> button in the top toolbar</li>
-      <li>Click <strong style="color:#18181b">Enter License Key</strong></li>
-      <li>Enter your email and the key above</li>
-    </ol>`;
-  const html = emailShell({ heading: `Your ${label} license key`, bodyHtml, button: null, unsubUrl: null });
-  const { error } = await resend.emails.send({ from, to: email, subject: `Your Ether ${label} License Key`, html });
+// THE EMAIL FOR A LICENSE ISSUED IN THE PLATFORM (Jeff, 2026-11-01): the email is the license -- no key. A new license:
+// "Your Ether license is ready. Create your account at ... with this email address, confirm it, then install Ether and sign
+// in." An existing account that now has the plan: "Your Ether account is now on the ... plan. Open Ether and sign in with
+// this email address." (src/lib/purchase-email.js issuedLicenseEmail)
+async function sendIssuedEmail(email, plan, { accountExists = false } = {}) {
+  const from = process.env.FROM_EMAIL || "noreply@ether-technologies.com";
+  const m = require("./lib/purchase-email").issuedLicenseEmail({ catalog: PLAN_CATALOG, planLabel: issuedPlanLabel(plan), accountExists,
+    accountUrl: ACCOUNT_APP_URL, apiUrl: API_PUBLIC_URL });
+  const html = emailShell({ heading: escapeHtml(m.heading), bodyHtml: m.bodyHtml,
+    button: m.button ? { label: escapeHtml(m.button.label), url: escapeHtml(m.button.url) } : null, unsubUrl: null });
+  const { error } = await resend.emails.send({ from, to: email, subject: m.subject, html }) || {};
   if (error) throw new Error(JSON.stringify(error));
 }
+// A plan key's name as customers read it (lifetime / operator keys read as their Network names).
+const issuedPlanLabel = (plan) => ENT.entitlementsFor({ id: 0, plan, active: true }, { catalog: PLAN_CATALOG, exemptIds: new Set() }).label || plan;
 
 // The thank-you email after a purchase (src/lib/purchase-email.js): plan, Mac / Windows downloads (the account site's
 // links), how to start, the account site. Sent once per subscription by the Stripe webhook.
@@ -1861,25 +1854,37 @@ app.get("/api/platform/licenses", requirePlatform, async (_req, res) => {
   } catch (e) { console.error("[platform/licenses]", e.message); res.status(500).json({ error: "server_error" }); }
 });
 
+// ISSUE A LICENSE TO AN EMAIL (Jeff, 2026-11-01; src/lib/issued-license.js). The preview says what Issue will do -- "This
+// changes license X (email) from A to B", a new license, or a refusal -- before Jeff clicks.
+const issuePreviewBody = (p) => ({ ...p,
+  ...(p.from_plan ? { from_label: issuedPlanLabel(p.from_plan) } : {}), ...(p.to_plan ? { to_label: issuedPlanLabel(p.to_plan) } : {}),
+  ...(p.license ? { license: { ...p.license, label: issuedPlanLabel(p.license.plan) } } : {}) });
+app.post("/api/platform/licenses/preview", requirePlatform, async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const plan = String(req.body?.plan || "");
+    if (!EMAIL_RE.test(email)) return res.status(400).json({ error: "invalid_email" });
+    if (!VALID_PLANS.has(plan)) return res.status(400).json({ error: "invalid_plan" });
+    res.json(issuePreviewBody(await ISSUED.planIssue(pool, { email, plan })));
+  } catch (e) { console.error("[platform/licenses:preview]", e.message); res.status(500).json({ error: "server_error" }); }
+});
 app.post("/api/platform/licenses", requirePlatform, async (req, res) => {
   try {
     const email = String(req.body?.email || "").trim().toLowerCase();
     const plan = String(req.body?.plan || "");
     if (!EMAIL_RE.test(email)) return res.status(400).json({ error: "invalid_email" });
     if (!VALID_PLANS.has(plan)) return res.status(400).json({ error: "invalid_plan", detail: `plan must be one of: ${[...VALID_PLANS].join(", ")}` });
-    const key = generateLicenseKey(plan);
-    const { rows } = await pool.query(
-      `INSERT INTO licenses (email, plan, key_prefix, key_hash) VALUES ($1,$2,$3,$4) RETURNING id`,
-      [email, plan, key.slice(0, 12), await bcrypt.hash(key, 12)]
-    );
-    // Surface the email outcome instead of swallowing it — a failed send must not
-    // look like success (the key is still returned, shown once in the UI).
+    const r = await ISSUED.issueLicense(pool, { email, plan }, { generateLicenseKey, hashKey: (k) => bcrypt.hash(k, 12) });
+    if (r.action === "refuse") return res.status(409).json({ error: "refused", ...issuePreviewBody(r) });
+    // Surface the email outcome instead of swallowing it -- a failed send must not look like success.
     let email_sent = false, email_error = null;
     if (req.body?.send_email) {
-      try { await sendLicenseEmail(email, key, plan); email_sent = true; }
+      try { await sendIssuedEmail(email, plan, { accountExists: !!r.user }); email_sent = true; }
       catch (e) { email_error = e.message; console.error("[Email]", e.message); }
     }
-    res.json({ ok: true, id: rows[0].id, license_key: key, plan, email, email_sent, email_error });
+    console.log(`[platform/licenses] ${r.action} -> license ${r.license_id} (${plan}) for ${email}`);
+    res.json({ ok: true, id: r.license_id, plan, email, email_sent, email_error, ...issuePreviewBody(r),
+      ...(r.license_key ? { license_key: r.license_key } : {}) });   // internal only (the platform shows it once); never emailed
   } catch (e) { console.error("[platform/licenses:create]", e.message); res.status(500).json({ error: "server_error", detail: e.message }); }
 });
 
@@ -2439,6 +2444,8 @@ app.post("/api/user/login", authLimiter, async (req, res) => {
 
 app.get("/api/user/me", requireUser, async (req, res) => {
   try {
+    // a license issued to this (confirmed) email links before the account is read (src/lib/issued-license.js)
+    await ISSUED.linkIssuedLicense(pool, req.user.uid).catch((e) => console.error("[issued-license] link on /me:", e.message));
     const u = (await pool.query(`SELECT * FROM users WHERE id = $1`, [req.user.uid])).rows[0];
     if (!u) return res.status(404).json({ error: "not_found" });
     const lic = u.license_key_id ? (await pool.query(`SELECT * FROM licenses WHERE id = $1`, [u.license_key_id])).rows[0] : null;
@@ -2458,6 +2465,8 @@ app.post("/api/user/verify", authLimiter, async (req, res) => {
   try {
     const r = await emailVerify.confirm(pool, String(req.body?.token || ""));
     if (!r.ok) return res.status(400).json({ error: r.error });
+    // a license issued to this email links now that it is confirmed (src/lib/issued-license.js); never fails the confirm
+    if (r.userId) await ISSUED.linkIssuedLicense(pool, r.userId).catch((e) => console.error("[issued-license] link on confirm:", e.message));
     res.json({ ok: true });
   } catch (e) { console.error("[user/verify]", e.message); res.status(500).json({ error: "server_error" }); }
 });
@@ -2643,8 +2652,11 @@ app.post("/api/user/desktop-activate", authLimiter, async (req, res) => {
   try {
     const email = String(req.body?.email || "").trim().toLowerCase();
     const password = String(req.body?.password || "");
-    const u = (await pool.query(`SELECT * FROM users WHERE email = $1`, [email])).rows[0];
+    let u = (await pool.query(`SELECT * FROM users WHERE email = $1`, [email])).rows[0];
     if (!u || !(await bcrypt.compare(password, u.password_hash))) return res.status(401).json({ error: "invalid_credentials" });
+    // a license issued to this (confirmed) email links before the license is chosen (src/lib/issued-license.js)
+    if (await ISSUED.linkIssuedLicense(pool, u.id).catch((e) => { console.error("[issued-license] link on sign-in:", e.message); return null; }))
+      u = (await pool.query(`SELECT * FROM users WHERE id = $1`, [u.id])).rows[0];
 
     const ent = await userEntitlement(u);
     // WHICH LICENSE (src/lib/desktop-license.js; Jeff, 2026-10-28): the user's own, or — verified email only — the
@@ -5462,23 +5474,17 @@ app.get("/admin/licenses", requireAdmin, async (req, res) => {
 });
 
 app.post("/admin/issue", requireAdmin, async (req, res) => {
+  // the same rules as the platform's Issue (src/lib/issued-license.js)
   const { email, plan = "pro" } = req.body;
   if (!email) return res.status(400).json({ error: "Missing email" });
   if (!VALID_PLANS.has(plan)) {
-    return res.status(400).json({
-      error: "invalid_plan",
-      detail: `plan must be one of: ${[...VALID_PLANS].join(", ")}`,
-    });
+    return res.status(400).json({ error: "invalid_plan", detail: `plan must be one of: ${[...VALID_PLANS].join(", ")}` });
   }
-  const key = generateLicenseKey(plan);
-  const keyPrefix = key.slice(0, 12);
-  const keyHash   = await bcrypt.hash(key, 12);
-  await pool.query(
-    "INSERT INTO licenses (email,plan,key_prefix,key_hash) VALUES ($1,$2,$3,$4)",
-    [email.toLowerCase(), plan, keyPrefix, keyHash]
-  );
-  try { await sendLicenseEmail(email, key, plan); } catch (e) { console.error("[Email]", e.message); }
-  res.json({ ok: true, license_key: key, plan, email });
+  const em = String(email).trim().toLowerCase();
+  const r = await ISSUED.issueLicense(pool, { email: em, plan }, { generateLicenseKey, hashKey: (k) => bcrypt.hash(k, 12) });
+  if (r.action === "refuse") return res.status(409).json({ error: "refused", ...issuePreviewBody(r) });
+  try { await sendIssuedEmail(em, plan, { accountExists: !!r.user }); } catch (e) { console.error("[Email]", e.message); }
+  res.json({ ok: true, plan, email: em, ...issuePreviewBody(r), ...(r.license_key ? { license_key: r.license_key } : {}) });
 });
 
 // ── Stripe webhook ────────────────────────────────────────────
@@ -5532,7 +5538,7 @@ app.post("/webhook/stripe", async (req, res) => {
       pool, validPlans: VALID_PLANS, planByPriceId: PLAN_BY_PRICE_ID, generateLicenseKey,
       subscriptionState: (sub) => BILLING.subscriptionState(sub, PLAN_CATALOG),   // add-on quantities → the license
       graceDays: PLAN_CATALOG.grace.past_due_days,   // a failed or ended subscription → grace_until
-      hashKey: (k) => bcrypt.hash(k, 12), sendLicenseEmail,
+      hashKey: (k) => bcrypt.hash(k, 12), sendLicenseEmail: (email, _key, plan) => sendIssuedEmail(email, plan),   // fallback only; no key is ever emailed
       sendPurchaseEmail, priceInfo: BILLING.priceMap(PLAN_CATALOG),   // the thank-you email (plan, period)
       stripe: process.env.STRIPE_SECRET_KEY ? stripe : null,   // reads the card on file (billing notices); guarded
     });

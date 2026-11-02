@@ -24,10 +24,26 @@ test("a yearly purchase shows the yearly price", () => {
   assert.match(m.bodyHtml, /\(\$790\/year, billed yearly\)/);
 });
 
-test("a buyer without an account (old payment link): told to create the account first, and given the key", () => {
-  const m = purchaseEmail({ ...base, plan: "pro", period: "monthly", hasAccount: false, licenseKey: "ETH-PRO-AAAA-<b>" });
-  assert.match(m.bodyHtml, /create your Ether account at <a href="https:\/\/signup\.ether-cast\.com"/);
-  assert.match(m.bodyHtml, /ETH-PRO-AAAA-&lt;b&gt;/, "the key, escaped");
+test("a buyer without an account (old payment link): Jeff's steps, and NO key", () => {
+  const m = purchaseEmail({ ...base, plan: "pro", period: "monthly", hasAccount: false });
+  assert.match(m.bodyHtml, /Create your account at <a href="https:\/\/signup\.ether-cast\.com"[^>]*>signup\.ether-cast\.com<\/a> with this email address, confirm it, then install Ether and sign in\./);
+  assert.doesNotMatch(m.bodyHtml, /license key|ETH-/i, "no key in a customer email");
+});
+
+test("a license issued in the platform: new license (no account) — Jeff's words, no key; existing account — the new plan", () => {
+  const { issuedLicenseEmail } = require("./purchase-email");
+  const n = issuedLicenseEmail({ ...base, planLabel: "Network" });
+  assert.strictEqual(n.subject, "Your Ether license is ready");
+  assert.match(n.bodyHtml, /Your Ether license is ready\./);
+  assert.match(n.bodyHtml, /Create your account at <a href="https:\/\/signup\.ether-cast\.com"[^>]*>signup\.ether-cast\.com<\/a> with this email address, confirm it, then install Ether and sign in\./);
+  assert.deepStrictEqual(n.button, { label: "Create your account", url: "https://signup.ether-cast.com" });
+  const e = issuedLicenseEmail({ ...base, planLabel: "Live 320", accountExists: true });
+  assert.strictEqual(e.subject, "Your Ether account is now on Live 320");
+  assert.match(e.bodyHtml, /Your Ether account is now on the <strong[^>]*>Live 320<\/strong> plan\. Open Ether and sign in with this email address\./);
+  for (const m of [n, e]) {
+    assert.doesNotMatch(m.bodyHtml, /license key|ETH-|Studio|Enter License Key/i);
+    assert.match(m.bodyHtml, /\/download\/mac"[^>]*>Download for Mac</);
+  }
 });
 
 test("the download links are the account site's (API /download/<os>, which always serves the newest release)", () => {
