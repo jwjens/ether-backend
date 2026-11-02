@@ -1107,7 +1107,9 @@ function emailButton(button) {
 
 // Wrap body HTML in the standard light card + footer. `unsubUrl` (when present) adds the
 // CAN-SPAM unsubscribe link; transactional mail (verify / reset / receipts) passes none.
-function emailShell({ heading, bodyHtml, button, unsubUrl }) {
+// The logo is the real Ether atom (Jeff, 2026-11-02), the account site's own image, an absolute https URL as mail needs.
+const EMAIL_LOGO_URL = "https://signup.ether-cast.com/ether-atom.png";
+function emailShell({ heading, bodyHtml, button, unsubUrl, footerNote = "You're receiving this because you have an Ether account." }) {
   const year = new Date().getFullYear();
   const sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
@@ -1117,7 +1119,7 @@ function emailShell({ heading, bodyHtml, button, unsubUrl }) {
     <tr><td align="center">
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;background:#ffffff;border:1px solid #ececf1;border-radius:14px">
         <tr><td style="padding:32px 32px 30px;font-family:${sans}">
-          <div style="font-size:19px;font-weight:800;color:#8868D8;letter-spacing:-0.02em;margin-bottom:26px">&#x2B22; Ether</div>
+          <div style="font-size:19px;font-weight:800;color:#8868D8;letter-spacing:-0.02em;margin-bottom:26px;line-height:28px"><img src="${EMAIL_LOGO_URL}" width="28" height="28" alt="" style="vertical-align:middle;border:0;margin-right:6px">Ether</div>
           <h1 style="font-size:20px;font-weight:700;color:#18181b;margin:0 0 14px;letter-spacing:-0.01em">${heading}</h1>
           <div style="font-size:15px;line-height:1.65;color:#52525b">${bodyHtml}</div>
           ${emailButton(button)}
@@ -1127,7 +1129,7 @@ function emailShell({ heading, bodyHtml, button, unsubUrl }) {
         <tr><td style="padding:20px 32px;font-family:${sans};font-size:12px;line-height:1.7;color:#a1a1aa">
           <div style="color:#71717a;font-weight:600;margin-bottom:3px">${COMPANY_NAME}</div>
           ${COMPANY_ADDRESS} &middot; <a href="mailto:${SUPPORT_EMAIL}" style="color:#8868D8;text-decoration:none">${SUPPORT_EMAIL}</a>${unsubUrl ? ` &middot; <a href="${unsubUrl}" style="color:#a1a1aa;text-decoration:underline">Unsubscribe</a>` : ""}
-          <div style="margin-top:8px;color:#c4c4cc">&copy; ${year} ${COMPANY_NAME}. You're receiving this because you have an Ether account.</div>
+          <div style="margin-top:8px;color:#c4c4cc">&copy; ${year} ${COMPANY_NAME}. ${footerNote}</div>
         </td></tr>
       </table>
     </td></tr>
@@ -1144,7 +1146,8 @@ async function sendIssuedEmail(email, plan, { accountExists = false } = {}) {
   const m = require("./lib/purchase-email").issuedLicenseEmail({ catalog: PLAN_CATALOG, planLabel: issuedPlanLabel(plan), accountExists,
     accountUrl: ACCOUNT_APP_URL, apiUrl: API_PUBLIC_URL });
   const html = emailShell({ heading: escapeHtml(m.heading), bodyHtml: m.bodyHtml,
-    button: m.button ? { label: escapeHtml(m.button.label), url: escapeHtml(m.button.url) } : null, unsubUrl: null });
+    button: m.button ? { label: escapeHtml(m.button.label), url: escapeHtml(m.button.url) } : null, unsubUrl: null,
+    ...(m.footerNote ? { footerNote: escapeHtml(m.footerNote) } : {}) });
   const { error } = await resend.emails.send({ from, to: email, subject: m.subject, html }) || {};
   if (error) throw new Error(JSON.stringify(error));
 }

@@ -43,7 +43,11 @@ test("no account yet: preview 'create'; Issue makes the license and emails Jeff'
   assert.strictEqual(r.status, 200, r.text); assert.strictEqual(r.body.action, "create");
   const m = lastMailTo(email);
   assert.strictEqual(m.subject, "Your Ether license is ready");
-  assert.match(m.html, /Your Ether license is ready\./);
+  assert.match(m.html, /<h1[^>]*>Your Ether Network license is ready<\/h1>/);
+  assert.strictEqual((m.html.match(/license is ready/g) || []).length, 2, "the hidden preheader + the heading — not repeated in the body");
+  assert.match(m.html, /You're receiving this because a license was issued to this email address\./);
+  assert.match(m.html, /<img src="https:\/\/signup\.ether-cast\.com\/ether-atom\.png"/, "the real Ether atom");
+  assert.ok(!m.html.includes("&#x2B22;"), "not the hexagon");
   assert.match(m.html, /Create your account at <a href="[^"]+"[^>]*>[^<]+<\/a> with this email address, confirm it, then install Ether and sign in\./);
   assert.ok(!m.html.includes(r.body.license_key) && !/license key/i.test(m.html), "no key in the email");
   if (process.env.WRITE_NEW_EMAIL_HTML) fs.writeFileSync(process.env.WRITE_NEW_EMAIL_HTML, m.html);
@@ -69,6 +73,8 @@ test("account confirmed, no license: preview 'create_and_link'; Issue links now;
   assert.strictEqual(m.subject, "Your Ether account is now on Live 128");
   assert.match(m.html, /Your Ether account is now on the <strong[^>]*>Live 128<\/strong> plan\. Open Ether and sign in with this email address\./);
   assert.ok(!/license key/i.test(m.html));
+  assert.match(m.html, /You're receiving this because you have an Ether account\./);
+  assert.match(m.html, /ether-atom\.png/);
   if (process.env.WRITE_EXISTING_EMAIL_HTML) fs.writeFileSync(process.env.WRITE_EXISTING_EMAIL_HTML, m.html);
 });
 

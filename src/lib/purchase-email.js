@@ -77,13 +77,14 @@ function issuedLicenseEmail({ planLabel, accountExists = false, accountUrl, apiU
   const p = (html) => `<p style="margin:0 0 16px">${html}</p>`;
   const lead = accountExists
     ? p(`Your Ether account is now on the <strong style="color:#18181b">${esc(planLabel)}</strong> plan. Open Ether and sign in with this email address.`)
-    : p(`Your Ether license is ready.`) + p(createSteps(account));
+    : p(createSteps(account));   // the heading already says it is ready (Jeff, 2026-11-02: not twice)
   const bodyHtml = lead
     + `<div style="margin:0 0 8px">${downloadButton("Download for Mac", links.mac)}${downloadButton("Download for Windows", links.windows)}</div>`
     + p(`<span style="font-size:12px;color:#8a8a96">The links always download the latest version of Ether.</span>`);
   return accountExists
     ? { subject: `Your Ether account is now on ${planLabel}`, heading: `You're on Ether ${planLabel}`, bodyHtml, button: { label: "Open your account", url: account }, links }
-    : { subject: `Your Ether license is ready`, heading: `Your Ether ${planLabel} license is ready`, bodyHtml, button: { label: "Create your account", url: account }, links };
+    : { subject: `Your Ether license is ready`, heading: `Your Ether ${planLabel} license is ready`, bodyHtml, button: { label: "Create your account", url: account }, links,
+        footerNote: "You're receiving this because a license was issued to this email address." };
 }
 
 module.exports = { purchaseEmail, issuedLicenseEmail, priceText };

@@ -34,7 +34,9 @@ test("a license issued in the platform: new license (no account) — Jeff's word
   const { issuedLicenseEmail } = require("./purchase-email");
   const n = issuedLicenseEmail({ ...base, planLabel: "Network" });
   assert.strictEqual(n.subject, "Your Ether license is ready");
-  assert.match(n.bodyHtml, /Your Ether license is ready\./);
+  assert.doesNotMatch(n.bodyHtml, /license is ready/, "the heading says it; the body does not repeat it");
+  assert.strictEqual(n.footerNote, "You're receiving this because a license was issued to this email address.");
+  assert.strictEqual(issuedLicenseEmail({ ...base, planLabel: "Live 320", accountExists: true }).footerNote, undefined, "an existing account keeps the standard footer");
   assert.match(n.bodyHtml, /Create your account at <a href="https:\/\/signup\.ether-cast\.com"[^>]*>signup\.ether-cast\.com<\/a> with this email address, confirm it, then install Ether and sign in\./);
   assert.deepStrictEqual(n.button, { label: "Create your account", url: "https://signup.ether-cast.com" });
   const e = issuedLicenseEmail({ ...base, planLabel: "Live 320", accountExists: true });
