@@ -116,6 +116,16 @@ app.set("trust proxy", 1);
 // limits use (req.ip, with trust proxy above). The five places that record it used to take the FIRST X-Forwarded-For
 // entry, which a visitor can forge (2026-11-01). IPv4 shown plainly (no "::ffff:" prefix).
 const clientIp = (req) => String(req.ip || req.socket?.remoteAddress || "").replace(/^::ffff:/, "").trim();
+// WHICH ETHER VERSION A DEVICE RUNS (2026-11-01, src/lib/app-version.js): recorded on its device row whenever a desktop
+// request carries it (explicitly, or in the User-Agent every build sends). Only written when known and different; never
+// fails the request. Existing rows are not back-filled.
+const { appVersionOf } = require("./lib/app-version");
+async function recordAppVersion(licenseKey, machineId, req) {
+  const v = appVersionOf(req);
+  if (!v || !licenseKey || !machineId) return;
+  await pool.query(`UPDATE license_activations SET app_version = $3 WHERE license_key = $1 AND machine_id = $2 AND (app_version IS NULL OR app_version <> $3)`,
+    [licenseKey, machineId, v]).catch((e) => console.warn("[app-version]", e.message));
+}
 const pool   = require("./lib/server-pool").makePool();   // Postgres at DATABASE_URL; a test hands in its own (lib/server-pool.js)
 const resend = new Resend(process.env.RESEND_API_KEY);
 
@@ -425,6 +435,8 @@ async function initDB() {
   // A paid license's grace end (2026-11-01): set by the webhook when a payment fails or the subscription ends, cleared
   // when a payment succeeds. Past it the license is lapsed (no cloud); the key keeps working (src/lib/entitlements.js).
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS grace_until TIMESTAMPTZ`);
+  // the Ether version each device runs (2026-11-01, recordAppVersion) — additive; existing rows stay NULL until the device checks in
+  await pool.query(`ALTER TABLE license_activations ADD COLUMN IF NOT EXISTS app_version TEXT`);
   // One license per Stripe subscription (2026-11-01): a unique index; guarded — never fails boot, never changes a license
   // (src/lib/license-subscription-index.js).
   await require("./lib/license-subscription-index").ensureOneLicensePerSubscription(pool);
@@ -2029,7 +2041,7 @@ app.get("/api/platform/licenses/:id/machines", requirePlatform, async (req, res)
     const keys = await _licenseActivationKeys(id);
     if (!keys) return res.status(404).json({ error: "not_found" });
     const { rows } = await pool.query(
-      `SELECT machine_id, machine_name, os, activated_at, last_seen, station_uuid
+      `SELECT machine_id, machine_name, os, activated_at, last_seen, station_uuid, app_version
          FROM license_activations WHERE license_key = ANY($1) AND deauthorized_at IS NULL ORDER BY last_seen DESC`, [keys]);
     const tier = await SEATS.seatTierFor(pool, id);
     res.json({ machines: rows, seats_used: rows.length, ...SEATS.seatFields(tier) });
@@ -2703,6 +2715,7 @@ app.post("/api/user/desktop-activate", authLimiter, async (req, res) => {
     );
     if (existing.rows.length) {
       await pool.query(`UPDATE license_activations SET last_seen=NOW(), ip_address=$1 WHERE id=$2`, [ip, existing.rows[0].id]);
+      await recordAppVersion(activationKey, mid, req);
     } else {
       const { rows: active } = await pool.query(
         `SELECT machine_id, machine_name, os, activated_at, last_seen FROM license_activations WHERE license_key=$1 AND deauthorized_at IS NULL ORDER BY last_seen DESC`, [activationKey]
@@ -2717,6 +2730,7 @@ app.post("/api/user/desktop-activate", authLimiter, async (req, res) => {
          ON CONFLICT (license_key, machine_id) DO UPDATE SET machine_name=EXCLUDED.machine_name, os=EXCLUDED.os, ip_address=EXCLUDED.ip_address, last_seen=NOW(), deauthorized_at=NULL`,
         [activationKey, mid, req.body.machine_name || null, req.body.os || null, ip]
       );
+      await recordAppVersion(activationKey, mid, req);
     }
     await pool.query(`UPDATE licenses SET last_validated=NOW() WHERE id=$1`, [license.id]);
 
@@ -4255,6 +4269,7 @@ app.post("/validate", async (req, res) => {
         "UPDATE license_activations SET last_seen=NOW(), ip_address=$1 WHERE id=$2",
         [ip, existingActivations[0].id]
       );
+      await recordAppVersion(activationKey, mid, req);
     } else {
       // 3. Not activated here — check if we have room. Only active (non-deauthorized) seats count.
       const { rows: activeList } = await pool.query(
@@ -4292,6 +4307,7 @@ app.post("/validate", async (req, res) => {
            deauthorized_at = NULL`,
         [activationKey, mid, machine_name || null, os || null, ip]
       );
+      await recordAppVersion(activationKey, mid, req);
       console.log(`[Activation] license:${license.id} → ${machine_name || mid.slice(0, 8)} (${activeList.length + 1}/${tier.seat_limit ?? "unlimited"})`);
     }
 
@@ -4456,6 +4472,7 @@ app.post("/account/create", async (req, res) => {
            deauthorized_at = NULL`,
         [activationKey, machine_id.trim(), machine_name || null, ip, stationUuid]
       );
+      await recordAppVersion(activationKey, machine_id.trim(), req);
 
       await client.query("COMMIT");
     } catch (e) {
@@ -4518,6 +4535,8 @@ app.post("/account/connect", async (req, res) => {
       "SELECT 1 FROM license_activations WHERE license_key=$1 AND machine_id=$2 AND deauthorized_at IS NULL",
       [activationKey, machine_id.trim()]
     );
+    // keep the device's Ether version current (only an existing device row; connect never creates one)
+    if (alreadySeated.length) await recordAppVersion(activationKey, machine_id.trim(), req);
 
     // Count active seats and pull the full list in one shot — the list is
     // returned either way (in seat_limit_reached responses for Manage Devices,
@@ -4647,6 +4666,7 @@ app.post("/account/bind-seat", async (req, res) => {
            deauthorized_at = NULL`,
         [activationKey, machine_id.trim(), machine_name || null, ip, station_uuid.trim()]
       );
+      await recordAppVersion(activationKey, machine_id.trim(), req);
 
       await client.query("COMMIT");
     } catch (e) {
@@ -4782,6 +4802,7 @@ app.post("/account/add-station", async (req, res) => {
            deauthorized_at = NULL`,
         [activationKey, machine_id.trim(), machine_name || null, ip, stationUuid]
       );
+      await recordAppVersion(activationKey, machine_id.trim(), req);
 
       await client.query("COMMIT");
     } catch (e) {
