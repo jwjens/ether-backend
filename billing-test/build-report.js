@@ -70,6 +70,14 @@ if (rr) {
   R("Rerun 2 · Plan ended after a popup closed the same day", rok("r2-plan-ended"), "Paid again, cancelled; at the period's end \"Your plan ended\" (Choose a plan) popped up at once — no reopen (060).");
   R("Rerun 3 · One purchase makes exactly one license", rok("r3-one-license"),
     a ? `(A) The exact pair of Stripe events that made two licenses in run 2, delivered to the fixed server at the same instant: ${a.A.licenses.length} license, the account linked to it, both webhooks answered 200, no key emailed; server log: "already has license 1 (made at the same moment) — no second license, no email". (B) A new Live 128 purchase (${a.B.email}): ${a.B.licenses.length} license (049).` : "not run");
+  const o = rr["o-event-order"];
+  if (o) {
+    const st2 = o.steps && o.steps[1], st4 = o.steps && o.steps[3];
+    R("Stripe event order · an older 'subscription active' delivered after a failed payment", !!(o.pass && st2),
+      st2 ? `The older message (sent ${st2.delivered.created}, status "${st2.delivered.message_status}") was delivered late and answered ${st2.delivered.answer}; the grace stayed (until ${String(st2.license.grace_until).slice(0, 10)}) because the server now reads the subscription from Stripe (past_due) instead of trusting the message. In run 2 the same kind of late message cleared the grace (065).` : "not run");
+    R("Stripe event order · an older 'payment failed' delivered after paying again", !!(o.pass && st4),
+      st4 ? `Delivered late, answered ${st4.delivered.answer}; no grace came back (Stripe says active) (067).` : "not run");
+  }
   if (raudio) R("Rerun · Audio never stops", raudio.not_playing === 0 && raudio.stalls === 0 && raudio.errors === 0,
     `${raudio.samples} one-second samples, ${raudio.from.slice(11, 19)}–${raudio.to.slice(11, 19)} UTC: deck A playing in every one; output frames advancing every second; 0 device errors.`);
 }

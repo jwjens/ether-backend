@@ -23,3 +23,5 @@ billing-test/results-rerun.json
 billing-test/audio-levels-rerun.jsonl
 billing-test/d-state-rerun.json
 billing-test/report-artifact.html
+billing-test/tokens-order.json
+billing-test/d-state-order.json
