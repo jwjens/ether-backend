@@ -23,3 +23,22 @@ test("wired: trust proxy is one hop, set right after the app is made", () => {
   const src = require("node:fs").readFileSync(require("node:path").join(__dirname, "..", "src", "index.js"), "utf8");
   assert.match(src, /const app {4}= express\(\);\n(\/\/[^\n]*\n)+app\.set\("trust proxy", 1\);/);
 });
+
+test("device records use the same trusted address: a desktop sign-in sending a forged first address records the real one", async () => {
+  const email = "device-ip@limit.test", password = "device-ip-pass-1";
+  const real = "203.0.113.77";
+  const su = await h.call("POST", "/api/user/signup", { headers: { "x-forwarded-for": real }, body: { name: "Device IP", email, password } });
+  assert.ok(su.status === 200 || su.status === 201, su.text);
+  const da = await h.call("POST", "/api/user/desktop-activate", { headers: { "x-forwarded-for": `192.0.2.66, ${real}` },
+    body: { email, password, machine_id: "machine-ip-test", machine_name: "IP test" } });
+  assert.strictEqual(da.status, 200, da.text);
+  const row = (await h.pool.query(`SELECT ip_address FROM license_activations WHERE machine_id = 'machine-ip-test'`)).rows[0];
+  assert.ok(row, "the device was recorded");
+  assert.strictEqual(row.ip_address, real, "the address Railway added, not the forged first entry");
+});
+
+test("wired: no place reads the first X-Forwarded-For entry by hand any more; all five use clientIp(req)", () => {
+  const src = require("node:fs").readFileSync(require("node:path").join(__dirname, "..", "src", "index.js"), "utf8");
+  assert.doesNotMatch(src, /x-forwarded-for"\]\?\.split/);
+  assert.strictEqual((src.match(/const ip = clientIp\(req\);/g) || []).length, 5);
+});

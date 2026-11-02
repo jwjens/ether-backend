@@ -111,6 +111,10 @@ const app    = express();
 // rate limit counts each visitor by their own address. Before this (2026-11-01) trust proxy was off: req.ip was the proxy,
 // so all visitors shared one sign-in limit, and express-rate-limit logged ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
 app.set("trust proxy", 1);
+// The visitor's address for device and audit records (license_activations.ip_address): the SAME trusted address the rate
+// limits use (req.ip, with trust proxy above). The five places that record it used to take the FIRST X-Forwarded-For
+// entry, which a visitor can forge (2026-11-01). IPv4 shown plainly (no "::ffff:" prefix).
+const clientIp = (req) => String(req.ip || req.socket?.remoteAddress || "").replace(/^::ffff:/, "").trim();
 const pool   = require("./lib/server-pool").makePool();   // Postgres at DATABASE_URL; a test hands in its own (lib/server-pool.js)
 const resend = new Resend(process.env.RESEND_API_KEY);
 
@@ -2667,7 +2671,7 @@ app.post("/api/user/desktop-activate", authLimiter, async (req, res) => {
     const activationKey = license.license_key || `lic-${license.id}`;
     const tier = await SEATS.seatTierFor(pool, license);
     const mid = String(req.body.machine_id || "").trim() || `acct-${u.id}`;
-    const ip = (req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress || "").trim();
+    const ip = clientIp(req);
     const existing = await pool.query(
       `SELECT id FROM license_activations WHERE license_key=$1 AND machine_id=$2 AND deauthorized_at IS NULL`, [activationKey, mid]
     );
@@ -4207,7 +4211,7 @@ app.post("/validate", async (req, res) => {
     // use a stable per-license token instead (license.id is the PK → guaranteed unique).
     const activationKey = license.license_key || `lic-${license.id}`;
     const tier = await SEATS.seatTierFor(pool, license);
-    const ip = (req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress || "").trim();
+    const ip = clientIp(req);
 
     // 2. Check if this machine is already activated for this license.
     //    A deauthorized row (deauthorized_at IS NOT NULL) doesn't count — a customer
@@ -4363,7 +4367,7 @@ app.post("/account/create", async (req, res) => {
     if (!license) return res.status(401).json({ error: "invalid_license_key" });
 
     const stationUuid = crypto.randomUUID();
-    const ip = (req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress || "").trim();
+    const ip = clientIp(req);
 
     // license_activations.license_key is NOT NULL. For legacy plaintext rows
     // license.license_key matches the rawKey; for new bcrypt-only rows the
@@ -4558,7 +4562,7 @@ app.post("/account/bind-seat", async (req, res) => {
     if (!license) return res.status(401).json({ error: "invalid_license_key" });
 
     const activationKey = license.license_key ?? rawKey;
-    const ip = (req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress || "").trim();
+    const ip = clientIp(req);
 
     const client = await pool.connect();
     try {
@@ -4659,7 +4663,7 @@ app.post("/account/add-station", async (req, res) => {
 
     const stationUuid = crypto.randomUUID();
     const activationKey = license.license_key ?? rawKey;
-    const ip = (req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress || "").trim();
+    const ip = clientIp(req);
 
     const client = await pool.connect();
     try {
