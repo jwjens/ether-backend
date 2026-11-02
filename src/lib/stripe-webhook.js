@@ -49,12 +49,16 @@ function subscriptionPriceIdOf(sub, planByPriceId) {
 
 const customerIdOf = (obj) => (typeof obj?.customer === "string" ? obj.customer : obj?.customer?.id) || null;
 
-// Subscription status → what it does to licenses.active. null = leave it (grace: Stripe is still retrying).
+// Subscription status → what it does to licenses.active. null = leave it. Stripe never switches a license OFF
+// (Jeff, 2026-11-01): a failed payment or an ended subscription puts the license into GRACE (grace_until, below) and
+// then lapse — the key keeps working and the app keeps running; only cloud features stop after the grace period.
+// active = false stays the operator's own switch.
 function activeForStatus(status) {
   if (status === "active" || status === "trialing") return true;
-  if (status === "canceled" || status === "unpaid" || status === "incomplete_expired") return false;
-  return null;   // past_due, incomplete, paused, unknown → unchanged
+  return null;   // past_due, unpaid, canceled, incomplete, paused, unknown → unchanged
 }
+// Statuses that end paying: the license goes into grace (kept from the first failure if that came first).
+const ENDED_STATUSES = new Set(["canceled", "unpaid", "incomplete_expired"]);
 
 /**
  * Apply one verified platform event. deps: { pool, validPlans:Set, planByPriceId:{}, generateLicenseKey(plan),
@@ -163,14 +167,11 @@ async function applyLicenseEvent(event, deps) {
     return ok({ updated: r.rowCount });
   }
 
-  // ── Cancellation: access ends ──
+  // ── Cancellation: grace, then lapse (applyPaymentState sets grace_until) — never switched off ──
   if (event.type === "customer.subscription.deleted") {
     const subId = subscriptionIdOf(obj);
-    const r = subId
-      ? await pool.query("UPDATE licenses SET active = false WHERE stripe_subscription_id = $1", [subId])
-      : { rowCount: 0 };
-    log.log(`[License] Deactivated sub ${subId} (${r.rowCount} rows)`);
-    return ok({ deactivated: r.rowCount });
+    log.log(`[License] subscription ${subId} ended — the license goes into grace, then lapses; never switched off`);
+    return ok({ grace: true, subscription: subId });
   }
 
   // ── B2: failed payment → grace, not revocation ──
@@ -185,10 +186,13 @@ async function applyLicenseEvent(event, deps) {
 }
 
 // ── BILLING STATE (billing notices, src/lib/billing-notice.js) ──────────────────────────────────────────────────────
-// After the license work above, two more things a platform event can tell us. Neither changes access (a failed payment
-// keeps access during grace, exactly as before):
+// After the license work above, more things a platform event can tell us. None switches a license off:
 //   · payment_failed_at — set on invoice.payment_failed or a subscription turning past_due (kept if already set, so the
 //     date is the FIRST failure); cleared on invoice.payment_succeeded or the subscription turning active again.
+//   · grace_until (Jeff, 2026-11-01) — a paid license's grace end: the first failed payment, or the subscription ending
+//     (canceled / unpaid / deleted), + the catalog's grace days (deps.graceDays = config/plans.json grace.past_due_days).
+//     Kept if already set, so a later failure never pushes it out. Until then cloud features stay on; after it the
+//     license is lapsed (entitlements.js). Cleared, with payment_failed_at, when a payment succeeds.
 //   · the card on file — brand, last 4, expiry of the customer's default card, read from Stripe when it is available.
 //     Guarded: a Stripe error or slowness is logged and never fails the webhook.
 const PAYMENT_FAILED = new Set(["invoice.payment_failed"]);
@@ -199,18 +203,27 @@ function eventTime(event) {
   return event && Number.isFinite(event.created) ? new Date(event.created * 1000) : new Date();
 }
 
-async function setPaymentFailed(pool, { subId, customerId, at }) {
+const graceEnd = (at, graceDays) => new Date(at.getTime() + Math.max(0, Number(graceDays) || 0) * 86400000);
+
+async function setPaymentFailed(pool, { subId, customerId, at, graceDays }) {
+  const g = graceEnd(at, graceDays);
+  const set = `payment_failed_at = COALESCE(payment_failed_at, $2), grace_until = COALESCE(grace_until, $3)`;
   if (subId) {
-    const r = await pool.query(`UPDATE licenses SET payment_failed_at = COALESCE(payment_failed_at, $2) WHERE stripe_subscription_id = $1`, [subId, at]);
+    const r = await pool.query(`UPDATE licenses SET ${set} WHERE stripe_subscription_id = $1`, [subId, at, g]);
     if (r.rowCount || !customerId) return r.rowCount;
   }
   if (!customerId) return 0;
-  return (await pool.query(`UPDATE licenses SET payment_failed_at = COALESCE(payment_failed_at, $2) WHERE stripe_customer_id = $1`, [customerId, at])).rowCount;
+  return (await pool.query(`UPDATE licenses SET ${set} WHERE stripe_customer_id = $1`, [customerId, at, g])).rowCount;
+}
+async function setEnded(pool, { subId, at, graceDays }) {
+  if (!subId) return 0;
+  return (await pool.query(`UPDATE licenses SET grace_until = COALESCE(grace_until, $2) WHERE stripe_subscription_id = $1`, [subId, graceEnd(at, graceDays)])).rowCount;
 }
 async function clearPaymentFailed(pool, { subId, customerId }) {
   let n = 0;
-  if (subId) n += (await pool.query(`UPDATE licenses SET payment_failed_at = NULL WHERE stripe_subscription_id = $1 AND payment_failed_at IS NOT NULL`, [subId])).rowCount;
-  if (!n && customerId) n += (await pool.query(`UPDATE licenses SET payment_failed_at = NULL WHERE stripe_customer_id = $1 AND payment_failed_at IS NOT NULL`, [customerId])).rowCount;
+  const set = `payment_failed_at = NULL, grace_until = NULL`, which = `(payment_failed_at IS NOT NULL OR grace_until IS NOT NULL)`;
+  if (subId) n += (await pool.query(`UPDATE licenses SET ${set} WHERE stripe_subscription_id = $1 AND ${which}`, [subId])).rowCount;
+  if (!n && customerId) n += (await pool.query(`UPDATE licenses SET ${set} WHERE stripe_customer_id = $1 AND ${which}`, [customerId])).rowCount;
   return n;
 }
 
@@ -218,10 +231,13 @@ async function applyPaymentState(event, deps) {
   const obj = (event && event.data && event.data.object) || {};
   const subId = subscriptionIdOf(obj);
   const customerId = customerIdOf(obj);
-  if (PAYMENT_FAILED.has(event.type)) return setPaymentFailed(deps.pool, { subId, customerId, at: eventTime(event) });
+  const at = eventTime(event), graceDays = deps.graceDays;
+  if (PAYMENT_FAILED.has(event.type)) return setPaymentFailed(deps.pool, { subId, customerId, at, graceDays });
   if (PAYMENT_OK.has(event.type)) return clearPaymentFailed(deps.pool, { subId, customerId });
+  if (event.type === "customer.subscription.deleted") return setEnded(deps.pool, { subId, at, graceDays });
   if (event.type === "customer.subscription.updated") {
-    if (obj.status === "past_due") return setPaymentFailed(deps.pool, { subId, customerId: null, at: eventTime(event) });
+    if (obj.status === "past_due") return setPaymentFailed(deps.pool, { subId, customerId: null, at, graceDays });
+    if (ENDED_STATUSES.has(obj.status)) return setEnded(deps.pool, { subId, at, graceDays });
     if (obj.status === "active" || obj.status === "trialing") return clearPaymentFailed(deps.pool, { subId, customerId: null });
   }
   return 0;

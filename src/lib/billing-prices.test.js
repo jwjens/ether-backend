@@ -107,7 +107,7 @@ async function freshPool() {
   await pool.query(`CREATE TABLE licenses (
     id SERIAL PRIMARY KEY, license_key TEXT, email TEXT NOT NULL DEFAULT '', plan TEXT NOT NULL,
     stripe_customer_id TEXT, stripe_subscription_id TEXT, expires_at TIMESTAMPTZ, active BOOLEAN DEFAULT true,
-    key_prefix TEXT, key_hash TEXT, payment_failed_at TIMESTAMPTZ, card_brand TEXT, card_last4 TEXT,
+    key_prefix TEXT, key_hash TEXT, payment_failed_at TIMESTAMPTZ, grace_until TIMESTAMPTZ, card_brand TEXT, card_last4 TEXT,
     card_exp_month INTEGER, card_exp_year INTEGER, extra_stations INTEGER DEFAULT 0, listener_addons INTEGER DEFAULT 0)`);
   await pool.query(`CREATE TABLE users (id SERIAL PRIMARY KEY, email TEXT NOT NULL, license_key_id INTEGER)`);
   return pool;

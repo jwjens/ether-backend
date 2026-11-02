@@ -145,3 +145,24 @@ test("switched off (active = false) or unknown: no cloud", () => {
   assert.equal(ent({ id: 11, plan: "mystery", active: true }).cloud, false);
   assert.equal(ent(null).status, "none");
 });
+
+// ── A PAID license's grace (Jeff, 2026-11-01): grace_until from the Stripe webhook ────────────────────────────────
+test("paid grace: before grace_until the license keeps its own plan's features and limits, add-ons included", () => {
+  const e = ent({ id: 5, plan: "unlimited", active: true, expires_at: null, grace_until: at(NOW + 3 * DAY), extra_stations: 1 });
+  assert.equal(e.status, "grace"); assert.equal(e.level, "unlimited"); assert.equal(e.cloud, true);
+  assert.equal(e.grace_until, at(NOW + 3 * DAY));
+  assert.equal(e.grace_from, at(NOW + 3 * DAY - catalog.grace.past_due_days * DAY));
+  assert.equal(e.limits.stations_included, 6, "add-ons still count during grace");
+  assert.equal(e.paid_grace, true);
+});
+
+test("paid grace: past grace_until the license is lapsed — no cloud, plan kept, never inactive", () => {
+  const e = ent({ id: 5, plan: "station", active: true, expires_at: null, grace_until: at(NOW - DAY) });
+  assert.equal(e.status, "lapsed"); assert.equal(e.plan, "station"); assert.equal(e.level, null); assert.equal(e.cloud, false);
+  assert.equal(e.grace_until, at(NOW - DAY));
+});
+
+test("paid grace: lifetime and platform-made licenses ignore grace_until", () => {
+  assert.equal(ent({ id: 5, plan: "pro_lifetime", active: true, grace_until: at(NOW - DAY) }).status, "exempt");
+  assert.equal(ent({ id: 7, plan: "station", active: true, grace_until: at(NOW - DAY) }, { exemptIds: new Set([7]) }).status, "exempt");
+});

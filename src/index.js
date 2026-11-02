@@ -412,6 +412,9 @@ async function initDB() {
   // the card on file (brand, last 4, expiry) — written only by the Stripe webhook. Banners and emails read them; nothing
   // else does, and nothing in playout ever does (lapse rule).
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS payment_failed_at TIMESTAMPTZ`);
+  // A paid license's grace end (2026-11-01): set by the webhook when a payment fails or the subscription ends, cleared
+  // when a payment succeeds. Past it the license is lapsed (no cloud); the key keeps working (src/lib/entitlements.js).
+  await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS grace_until TIMESTAMPTZ`);
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS card_brand TEXT`);
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS card_last4 TEXT`);
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS card_exp_month INTEGER`);
@@ -5487,6 +5490,7 @@ app.post("/webhook/stripe", async (req, res) => {
     const out = await stripeWebhook.handlePlatformEvent(event, {
       pool, validPlans: VALID_PLANS, planByPriceId: PLAN_BY_PRICE_ID, generateLicenseKey,
       subscriptionState: (sub) => BILLING.subscriptionState(sub, PLAN_CATALOG),   // add-on quantities → the license
+      graceDays: PLAN_CATALOG.grace.past_due_days,   // a failed or ended subscription → grace_until
       hashKey: (k) => bcrypt.hash(k, 12), sendLicenseEmail,
       stripe: process.env.STRIPE_SECRET_KEY ? stripe : null,   // reads the card on file (billing notices); guarded
     });

@@ -70,7 +70,32 @@ function billingNotice({ license = null, user = null, catalog, now = Date.now(),
   const end = ent.trial_ends_at ? new Date(ent.trial_ends_at).getTime() : null;
   const graceUntil = ent.grace_until ? new Date(ent.grace_until).getTime() : null;
 
-  if (ent.status === "lapsed") {
+  if (ent.paid_grace && (ent.status === "grace" || ent.status === "lapsed")) {
+    // A paid subscription whose payment failed or that Stripe ended (Jeff, 2026-11-01): grace from that day, then lapse.
+    const from = new Date(ent.grace_from).getTime();
+    const failed = lic.payment_failed_at ? new Date(lic.payment_failed_at).getTime() : null;
+    const why = failed != null ? `Your card was declined on ${fmtDay(failed)}.` : `Your subscription ended on ${fmtDay(from)}.`;
+    // an ended subscription has no card to update: the way back is choosing the plan again
+    const back = failed != null ? {} : { action: { label: "Choose a plan", url: `${base}/`, portal: false } };
+    const fix = failed != null ? "Update your card" : "Choose your plan again";
+    if (ent.status === "grace") {
+      const days = Math.max(0, Math.ceil((graceUntil - now) / DAY));
+      found.grace = {
+        ...back, severity: "warning", endsAt: iso(graceUntil), daysLeft: days, period_key: isoDay(from), started_at: iso(from),
+        title: failed != null ? `Your payment didn't go through — ${cloud.split(" (")[0]} included until ${fmtDay(graceUntil)}`
+                              : `Your plan ended — ${cloud.split(" (")[0]} included until ${fmtDay(graceUntil)}`,
+        body: `${why} ${cloud[0].toUpperCase() + cloud.slice(1)} stay included until ${fmtDay(graceUntil)} (${plural(days, "day")}). `
+            + `${fix} to keep them. ${PLAYOUT_LINE}`,
+      };
+    } else {
+      found.lapsed = {
+        ...back, severity: "error", endsAt: iso(graceUntil), period_key: isoDay(from), started_at: iso(graceUntil),
+        title: "Your plan has lapsed",
+        body: `${why} The grace period ended on ${fmtDay(graceUntil)}. `
+            + `${cloud[0].toUpperCase() + cloud.slice(1)} are no longer included. ${fix} to turn them back on. ${PLAYOUT_LINE}`,
+      };
+    }
+  } else if (ent.status === "lapsed") {
     found.lapsed = {
       severity: "error", endsAt: iso(graceUntil), period_key: isoDay(end), started_at: iso(graceUntil),
       title: customer ? "Your plan has lapsed" : "Your free trial has ended",
@@ -134,7 +159,7 @@ function billingNotice({ license = null, user = null, catalog, now = Date.now(),
   const kind = PRIORITY.find((k) => found[k]);
   if (!kind) return null;
   const n = found[kind];
-  return { kind, title: n.title, body: n.body, action, severity: n.severity,
+  return { kind, title: n.title, body: n.body, action: n.action || action, severity: n.severity,
            ...(n.endsAt ? { endsAt: n.endsAt } : {}), ...(n.daysLeft != null ? { daysLeft: n.daysLeft } : {}),
            period_key: n.period_key, started_at: n.started_at };
 }

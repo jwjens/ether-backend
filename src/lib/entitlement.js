@@ -22,7 +22,7 @@ function licenseExpired(row, now = Date.now()) {
 /** { status: active|trial|expired|none, plan, trial_days_left } for a users row. */
 async function userEntitlement(pool, u, now = Date.now()) {
   if (u.license_key_id) {
-    const { rows } = await pool.query(`SELECT plan, active, expires_at, stripe_subscription_id FROM licenses WHERE id = $1`, [u.license_key_id]);
+    const { rows } = await pool.query(`SELECT plan, active, expires_at, stripe_subscription_id, grace_until, payment_failed_at FROM licenses WHERE id = $1`, [u.license_key_id]);
     const lic = rows[0];
     if (lic && lic.active && !licenseExpired(lic, now)) {
       // A future expires_at with no Stripe subscription is the trial key desktop-activate mints (expires_at = trial end;
@@ -31,6 +31,11 @@ async function userEntitlement(pool, u, now = Date.now()) {
       if (lic.expires_at && !NEVER_EXPIRES(lic.plan) && !lic.stripe_subscription_id) {
         const ms = new Date(lic.expires_at).getTime() - now;
         return { status: "trial", plan: "trial", trial_days_left: Math.ceil(ms / 86400000) };
+      }
+      // A subscription Stripe ENDED (grace_until set, no failed payment — 2026-11-01): the account page must offer the
+      // plans again, so it is "ended", never "active". A failed payment stays "active" (its way back is Update card).
+      if (lic.grace_until && !lic.payment_failed_at && !NEVER_EXPIRES(lic.plan)) {
+        return { status: "ended", plan: lic.plan, trial_days_left: 0 };
       }
       return { status: "active", plan: lic.plan, trial_days_left: 0 };
     }

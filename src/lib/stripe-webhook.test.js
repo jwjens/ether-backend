@@ -15,7 +15,7 @@ async function freshPool() {
     id SERIAL PRIMARY KEY, license_key TEXT, email TEXT NOT NULL DEFAULT '', plan TEXT NOT NULL,
     stripe_customer_id TEXT, stripe_subscription_id TEXT, status TEXT DEFAULT 'active',
     expires_at TIMESTAMPTZ, active BOOLEAN DEFAULT true, key_prefix TEXT, key_hash TEXT,
-    payment_failed_at TIMESTAMPTZ, card_brand TEXT, card_last4 TEXT, card_exp_month INTEGER, card_exp_year INTEGER)`);   // + initDB's billing columns
+    payment_failed_at TIMESTAMPTZ, card_brand TEXT, card_last4 TEXT, card_exp_month INTEGER, card_exp_year INTEGER, grace_until TIMESTAMPTZ)`);   // + initDB's billing columns
   await pool.query(`CREATE TABLE users (id SERIAL PRIMARY KEY, email TEXT NOT NULL, license_key_id INTEGER)`);
   return pool;
 }
@@ -191,16 +191,15 @@ test("B3: a portal plan change (pro → station) reaches licenses.plan", async (
   assert.strictEqual(r.active, true);
 });
 
-test("B3: status mapping — unpaid/canceled revoke, past_due keeps (grace), active restores", async () => {
+test("B3: status mapping — Stripe never switches a license off (Jeff, 2026-11-01): past_due/unpaid/canceled keep it on, active keeps it on", async () => {
   const pool = await freshPool();
   await pool.query(`INSERT INTO licenses (email, plan, stripe_subscription_id) VALUES ('s@x.com','station','sub_8')`);
   const { d } = deps(pool);
   const set = (status) => W.handlePlatformEvent(ev("customer.subscription.updated", {
     object: "subscription", id: "sub_8", status, items: { data: [{ price: { id: PRICE_STATION } }] } }), d);
-  await set("past_due");  assert.strictEqual((await lic(pool))[0].active, true);
-  await set("unpaid");    assert.strictEqual((await lic(pool))[0].active, false);
-  await set("active");    assert.strictEqual((await lic(pool))[0].active, true);
-  await set("canceled");  assert.strictEqual((await lic(pool))[0].active, false);
+  for (const st of ["past_due", "unpaid", "active", "canceled", "incomplete_expired"]) {
+    await set(st); assert.strictEqual((await lic(pool))[0].active, true, `${st} leaves the license on`);
+  }
 });
 
 test("B3: unknown price on update leaves the plan alone", async () => {
@@ -212,13 +211,77 @@ test("B3: unknown price on update leaves the plan alone", async () => {
   assert.strictEqual((await lic(pool))[0].plan, "pro");
 });
 
-test("cancellation: customer.subscription.deleted deactivates only that subscription's license", async () => {
+test("cancellation: customer.subscription.deleted never switches the license off — that license goes into grace, others untouched", async () => {
   const pool = await freshPool();
   await pool.query(`INSERT INTO licenses (email, plan, stripe_subscription_id) VALUES ('x@x.com','pro','sub_11'), ('y@x.com','pro','sub_12')`);
-  const { d } = deps(pool);
-  const out = await W.handlePlatformEvent(ev("customer.subscription.deleted", { object: "subscription", id: "sub_11" }), d);
-  assert.strictEqual(out.body.deactivated, 1);
-  assert.deepStrictEqual((await lic(pool)).map(r => r.active), [false, true]);
+  const { d } = deps(pool, { graceDays: 7 });
+  const out = await W.handlePlatformEvent({ ...ev("customer.subscription.deleted", { object: "subscription", id: "sub_11" }), created: 1793000000 }, d);
+  assert.strictEqual(out.body.grace, true);
+  const rows = (await pool.query(`SELECT active, grace_until FROM licenses ORDER BY id`)).rows;
+  assert.deepStrictEqual(rows.map(r => r.active), [true, true]);
+  assert.strictEqual(new Date(rows[0].grace_until).getTime(), (1793000000 + 7 * 86400) * 1000);
+  assert.strictEqual(rows[1].grace_until, null);
+});
+
+// ── Grace for a paid license (Jeff, 2026-11-01): failed payment or ended subscription → grace_until → lapse ─────────
+
+const graceOf = async (pool) => (await pool.query(`SELECT grace_until AS g, payment_failed_at AS f, active FROM licenses ORDER BY id`)).rows[0];
+const ms = (v) => (v == null ? null : new Date(v).getTime());
+
+test("grace: the first failed payment sets grace_until = failure + grace days; a later failure never pushes it out", async () => {
+  const pool = await freshPool();
+  await pool.query(`INSERT INTO licenses (email, plan, stripe_subscription_id) VALUES ('g@x.com','station','sub_30')`);
+  const { d } = deps(pool, { graceDays: 7 });
+  await W.handlePlatformEvent({ ...ev("invoice.payment_failed", { object: "invoice", id: "in_1", subscription: "sub_30" }), created: 1793000000 }, d);
+  let r = await graceOf(pool);
+  assert.strictEqual(ms(r.g), (1793000000 + 7 * 86400) * 1000);
+  assert.strictEqual(r.active, true);
+  await W.handlePlatformEvent({ ...ev("invoice.payment_failed", { object: "invoice", id: "in_2", subscription: "sub_30" }), created: 1793300000 }, d);
+  r = await graceOf(pool);
+  assert.strictEqual(ms(r.g), (1793000000 + 7 * 86400) * 1000, "kept from the first failure");
+});
+
+test("grace: subscription past_due sets it; unpaid/canceled after a failure keep the first grace end", async () => {
+  const pool = await freshPool();
+  await pool.query(`INSERT INTO licenses (email, plan, stripe_subscription_id) VALUES ('g@x.com','station','sub_31')`);
+  const { d } = deps(pool, { graceDays: 7 });
+  const set = (status, created) => W.handlePlatformEvent({ ...ev("customer.subscription.updated", {
+    object: "subscription", id: "sub_31", status, items: { data: [{ price: { id: PRICE_STATION } }] } }), created }, d);
+  await set("past_due", 1793000000);
+  await set("unpaid", 1793600000);
+  await set("canceled", 1794000000);
+  const r = await graceOf(pool);
+  assert.strictEqual(ms(r.g), (1793000000 + 7 * 86400) * 1000);
+  assert.strictEqual(r.active, true);
+});
+
+test("grace: a subscription ended with no failed payment (canceled) starts grace from the end", async () => {
+  const pool = await freshPool();
+  await pool.query(`INSERT INTO licenses (email, plan, stripe_subscription_id) VALUES ('g@x.com','pro','sub_32')`);
+  const { d } = deps(pool, { graceDays: 7 });
+  await W.handlePlatformEvent({ ...ev("customer.subscription.updated", {
+    object: "subscription", id: "sub_32", status: "canceled", items: { data: [{ price: { id: PRICE_PRO } }] } }), created: 1795000000 }, d);
+  const r = await graceOf(pool);
+  assert.strictEqual(ms(r.g), (1795000000 + 7 * 86400) * 1000);
+  assert.strictEqual(r.f, null);
+});
+
+test("grace: a payment that succeeds (renewal paid, or the card updated and the invoice paid) clears grace and the failure", async () => {
+  const pool = await freshPool();
+  await pool.query(`INSERT INTO licenses (email, plan, stripe_subscription_id, payment_failed_at, grace_until) VALUES ('g@x.com','station','sub_33', NOW(), NOW())`);
+  const { d } = deps(pool, { graceDays: 7 });
+  await W.handlePlatformEvent(ev("invoice.paid", { object: "invoice", id: "in_9", subscription: "sub_33" }), d);
+  const r = await graceOf(pool);
+  assert.strictEqual(r.g, null); assert.strictEqual(r.f, null); assert.strictEqual(r.active, true);
+});
+
+test("grace: subscription back to active clears grace", async () => {
+  const pool = await freshPool();
+  await pool.query(`INSERT INTO licenses (email, plan, stripe_subscription_id, grace_until) VALUES ('g@x.com','station','sub_34', NOW())`);
+  const { d } = deps(pool, { graceDays: 7 });
+  await W.handlePlatformEvent(ev("customer.subscription.updated", {
+    object: "subscription", id: "sub_34", status: "active", items: { data: [{ price: { id: PRICE_STATION } }] } }), d);
+  assert.strictEqual((await graceOf(pool)).g, null);
 });
 
 test("wired: index.js has no phantom stripe_sub_id in SQL and routes the webhook through the module", () => {

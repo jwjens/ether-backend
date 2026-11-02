@@ -43,9 +43,9 @@ function licenseStatus(lic, { catalog, now = Date.now(), sub = null, exemptIds }
     Object.assign(out, { status: "trial", label: `Trial · ${days} day${days === 1 ? "" : "s"} left`, days_left: days,
                          date_kind: "trial_ends", date: e.trial_ends_at });
   } else if (e.status === "grace") {
-    Object.assign(out, { status: "grace", label: "Grace", date_kind: "expires", date: e.trial_ends_at, grace_until: e.grace_until });
+    Object.assign(out, { status: "grace", label: "Grace", date_kind: "expires", date: e.trial_ends_at || e.grace_from, grace_until: e.grace_until });
   } else if (e.status === "lapsed") {
-    Object.assign(out, { status: "lapsed", label: "Lapsed", date_kind: "expires", date: e.trial_ends_at });
+    Object.assign(out, { status: "lapsed", label: "Lapsed", date_kind: "expires", date: e.trial_ends_at || e.grace_from });
   } else if (e.status === "exempt") {
     out.status = NEVER_EXPIRES(lic.plan) ? "lifetime" : "exempt";
     out.label = out.status === "lifetime" ? "Lifetime" : "Outside plans";

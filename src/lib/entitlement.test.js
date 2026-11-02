@@ -11,7 +11,7 @@ const PAST = new Date(NOW - 5 * 86400000), FUTURE = new Date(NOW + 5 * 86400000)
 
 async function poolWith(plan, active, expires, sub = null) {
   const pool = new (newDb().adapters.createPg().Pool)();
-  await pool.query(`CREATE TABLE licenses (id SERIAL PRIMARY KEY, plan TEXT NOT NULL, active BOOLEAN, expires_at TIMESTAMPTZ, stripe_subscription_id TEXT)`);
+  await pool.query(`CREATE TABLE licenses (id SERIAL PRIMARY KEY, plan TEXT NOT NULL, active BOOLEAN, expires_at TIMESTAMPTZ, stripe_subscription_id TEXT, grace_until TIMESTAMPTZ, payment_failed_at TIMESTAMPTZ)`);
   await pool.query(`INSERT INTO licenses (plan, active, expires_at, stripe_subscription_id) VALUES ($1,$2,$3,$4)`, [plan, active, expires, sub]);
   return pool;
 }
@@ -70,4 +70,12 @@ test("wired: index.js userEntitlement delegates to the module", () => {
   const src = require("node:fs").readFileSync(require("node:path").join(__dirname, "..", "index.js"), "utf8");
   assert.ok(/return computeUserEntitlement\(pool, u\)/.test(src));
   assert.ok(!/SELECT plan, active FROM licenses WHERE id = \$1/.test(src), "old expiry-blind query is gone");
+});
+
+test("an ENDED subscription (grace_until, no failed payment) reads 'ended' so the account page offers the plans; a failed payment stays active", async () => {
+  const pool = await poolWith("station", true, null, "sub_1");
+  await pool.query(`UPDATE licenses SET grace_until = $1`, [FUTURE]);
+  assert.strictEqual((await userEntitlement(pool, { license_key_id: 1 }, NOW)).status, "ended");
+  await pool.query(`UPDATE licenses SET payment_failed_at = $1`, [PAST]);
+  assert.strictEqual((await userEntitlement(pool, { license_key_id: 1 }, NOW)).status, "active");
 });

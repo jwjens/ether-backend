@@ -61,6 +61,20 @@ test("desktop: paid and fine → billing_notice null; lifetime → null whatever
   assert.equal((await connect(life)).body.billing_notice, null);
 });
 
+test("desktop: a PAID license in grace and after it lapses still signs in (200) — the key is never refused (Jeff, 2026-11-01)", async () => {
+  const g = await account({ stripe_subscription_id: "sub_gr", stripe_customer_id: "cus_gr", payment_failed_at: at(-2), grace_until: at(5) });
+  let r = await connect(g);
+  assert.equal(r.status, 200, r.text);
+  assert.equal(r.body.billing_notice.kind, "grace");
+  assert.equal(r.body.entitlements.status, "grace"); assert.equal(r.body.entitlements.cloud, true);
+  const l = await account({ stripe_subscription_id: "sub_lp", stripe_customer_id: "cus_lp", payment_failed_at: at(-10), grace_until: at(-3) });
+  r = await connect(l);
+  assert.equal(r.status, 200, r.text);
+  assert.equal(r.body.billing_notice.kind, "lapsed");
+  assert.equal(r.body.entitlements.status, "lapsed"); assert.equal(r.body.entitlements.cloud, false);
+  assert.ok(Array.isArray(r.body.stations));
+});
+
 test("dashboard: GET /api/account/billing → notice + the facts behind the Billing card", async () => {
   const a = await account({ stripe_subscription_id: "sub_pf", stripe_customer_id: "cus_pf", payment_failed_at: at(-1),
                             card_brand: "visa", card_last4: "0341", card_exp_month: 12, card_exp_year: 2030 });

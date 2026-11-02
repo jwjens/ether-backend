@@ -123,3 +123,23 @@ test("portal return address: our sites only; localhost only when allowed", () =>
   assert.equal(portalReturnUrl("http://localhost:5173"), "https://app.ether-cast.com");
   assert.equal(portalReturnUrl("http://localhost:5173", { allowLocalhost: true }), "http://localhost:5173");
 });
+
+// ── A PAID license's grace (Jeff, 2026-11-01): failed payment or ended subscription → grace → lapsed ──────────────
+test("paid grace after a failed payment: 'payment didn't go through', cloud included until the grace end, Update card", () => {
+  const n = N(paid({ payment_failed_at: at(-2), grace_until: at(5) }));
+  assert.equal(n.kind, "grace"); assert.equal(n.severity, "warning"); assert.equal(n.daysLeft, 5);
+  assert.match(n.title, /payment didn't go through/); assert.match(n.body, /October 29, 2026/); assert.match(n.body, /November 5, 2026/);
+  assert.equal(n.action.label, "Update card"); assert.match(n.body, /keeps playing/);
+});
+
+test("paid grace after the subscription ended (no failed payment): 'plan ended', Choose a plan", () => {
+  const n = N(paid({ grace_until: at(4) }));
+  assert.equal(n.kind, "grace"); assert.match(n.title, /plan ended/);
+  assert.equal(n.action.label, "Choose a plan"); assert.equal(n.action.portal, false);
+});
+
+test("paid lapsed: past grace_until — 'Your plan has lapsed', still says the station keeps playing", () => {
+  const n = N(paid({ payment_failed_at: at(-10), grace_until: at(-3) }));
+  assert.equal(n.kind, "lapsed"); assert.equal(n.severity, "error");
+  assert.match(n.body, /grace period ended on October 28, 2026/); assert.match(n.body, /keeps playing/);
+});

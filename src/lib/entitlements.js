@@ -114,6 +114,15 @@ function entitlementsFor(lic, { catalog, now = Date.now(), exemptIds = exemptIds
     if (ends != null && live) return result(plan, catalog.trial.level, "trial", { trial_ends_at: trialEnds, grace_until: graceUntil });
     if (inGrace) return result(plan, catalog.trial.level, "grace", { trial_ends_at: trialEnds, grace_until: graceUntil });
     if (!live) return result(plan, null, "lapsed", { trial_ends_at: trialEnds, grace_until: graceUntil });
+    // A PAID license whose payment failed or whose subscription ended (Jeff, 2026-11-01): grace_until, written by the
+    // Stripe webhook, ends the grace period. Until then it keeps its own plan's features and limits; after it, lapsed
+    // (no cloud). The key keeps working and nothing local reads this. grace_from = when the grace period began.
+    if (lic.grace_until) {
+      const g = new Date(lic.grace_until).getTime();
+      const extra = { grace_until: new Date(g).toISOString(), grace_from: new Date(g - graceMs).toISOString(), paid_grace: true };
+      if (now < g) return withAddons(result(plan, plan, "grace", extra), lic, catalog);
+      return result(plan, null, "lapsed", extra);
+    }
     return withAddons(result(plan, plan, "active"), lic, catalog);
   }
   return result(null, null, "none");   // an unknown plan key: no cloud, and the account page says so
