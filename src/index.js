@@ -106,6 +106,11 @@ let multer;
 try { multer = require("multer"); } catch { multer = null; }
 
 const app    = express();
+// Railway puts ONE proxy in front of this server; it appends the visitor's address to X-Forwarded-For. Trusting exactly
+// one hop makes req.ip that address (the last entry — the one Railway added, which a visitor cannot forge), so every
+// rate limit counts each visitor by their own address. Before this (2026-11-01) trust proxy was off: req.ip was the proxy,
+// so all visitors shared one sign-in limit, and express-rate-limit logged ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
+app.set("trust proxy", 1);
 const pool   = require("./lib/server-pool").makePool();   // Postgres at DATABASE_URL; a test hands in its own (lib/server-pool.js)
 const resend = new Resend(process.env.RESEND_API_KEY);
 
