@@ -68,6 +68,7 @@ const PLAN_CATALOG = PLANS.load();
 const BILLING = require("./lib/billing-prices");
 const ENT = require("./lib/entitlements");
 const ISSUED = require("./lib/issued-license");   // a license issued to an email: the preview, the issue, the automatic link
+const DashThrottle = require("./lib/dashboard-throttle");   // the dashboard team sign-in: slowed per device / address, never locks a person
 /** What license row `lic` may use now (plan, status, cloud features, limits). Cloud only: nothing local reads it. */
 const entitlementsOf = (lic) => ENT.entitlementsFor(lic || null, { catalog: PLAN_CATALOG });
 // THE ONE BILLING NOTICE (src/lib/billing-notice.js): banner/email text for a license (or, with no license yet, the users
@@ -668,6 +669,9 @@ async function initDB() {
   // desktop install's local console users). The install push only ever touches its
   // own 'install' rows, so it can never clobber a dashboard-managed user.
   await pool.query(`ALTER TABLE account_users ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'dashboard'`);
+
+  // ── Dashboard team sign-in throttle (2026-11-02, lib/dashboard-throttle.js): per device / address, never per person ──
+  await DashThrottle.ensureTable(pool);
 
   // ── Park page staff login (2026-10-13, lib/park-auth.js) ───────────────────
   // The SAME username + PIN users (account_users). Added: the account's lockout numbers as settings (they were
@@ -2858,16 +2862,39 @@ app.post("/api/auth/bootstrap-admin", authLimiter, async (req, res) => {
   }
 });
 
-// Login: license_key identifies the account; username + PIN identify the operator.
+// The account a team sign-in names by its EMAIL (Jeff, 2026-11-02: account email + username + PIN; the email is the
+// license, customers never type a key): the account (users row) with that email, its license — active and not expired,
+// the same test lookupLicense applies to a key. null for anything else (the caller answers invalid_credentials, so an
+// email is never confirmed or denied).
+async function licenseForAccountEmail(rawEmail) {
+  const email = String(rawEmail || "").trim().toLowerCase();
+  if (!email) return null;
+  const u = (await pool.query(`SELECT license_key_id FROM users WHERE lower(email) = $1 AND license_key_id IS NOT NULL LIMIT 1`, [email])).rows[0];
+  if (!u) return null;
+  const row = (await pool.query(`SELECT * FROM licenses WHERE id = $1 AND active = true`, [u.license_key_id])).rows[0];
+  return row && !licenseExpired(row) ? row : null;
+}
+
+// Login: the account's email (the dashboard, 2026-11-02) — or, from an older page, its license key — names the account;
+// username + PIN identify the operator.
 app.post("/api/auth/login", authLimiter, async (req, res) => {
   try {
-    const { license_key } = req.body || {};
+    const { license_key, email } = req.body || {};
     const username = normUsername(req.body?.username);
     const pin = req.body?.pin;
-    if (!license_key?.trim() || !username || !pin) return res.status(400).json({ error: "missing_fields" });
+    if ((!email?.trim() && !license_key?.trim()) || !username || !pin) return res.status(400).json({ error: "missing_fields" });
 
-    const license = await lookupLicense(license_key);
-    if (!license) return res.status(401).json({ error: "invalid_credentials" });
+    // OPTION B (Jeff, 2026-11-02; src/lib/dashboard-throttle.js): a wrong PIN here never locks the PERSON. Guessing is
+    // slowed per device and per address; account_users.failed_attempts / locked_until (the Park page's lockout) are never
+    // read or written by this route, so no dashboard failure can lock a PIN at the Park page (or the Ether console, whose
+    // PINs never come from the server).
+    const keys = DashThrottle.throttleKeys(clientIp(req), req.body?.device_id);
+    const waitUntil = await DashThrottle.checkThrottle(pool, keys);
+    if (waitUntil) return res.status(429).json({ error: "too_many_attempts", until: waitUntil });
+    const fail = async () => { await DashThrottle.recordFailure(pool, keys); return res.status(401).json({ error: "invalid_credentials" }); };
+
+    const license = email?.trim() ? await licenseForAccountEmail(email) : await lookupLicense(license_key);
+    if (!license) return fail();
 
     const { rows } = await pool.query(
       `SELECT * FROM account_users
@@ -2875,27 +2902,9 @@ app.post("/api/auth/login", authLimiter, async (req, res) => {
       [license.id, username]
     );
     const user = rows[0];
-    if (!user) return res.status(401).json({ error: "invalid_credentials" });
+    if (!user || !(await verifyPin(pin, user.pin_hash))) return fail();
 
-    if (user.locked_until && new Date(user.locked_until) > new Date()) {
-      return res.status(423).json({ error: "locked", until: user.locked_until });
-    }
-
-    if (!(await verifyPin(pin, user.pin_hash))) {
-      // The account's lockout settings (Remote page → Users → Login safety) — the Park page login uses the same.
-      const r = parkAuth.afterWrongPin(user.failed_attempts, await lockoutRuleFor(license.id), Date.now());
-      await pool.query(
-        `UPDATE account_users SET failed_attempts = $1, locked_until = $2, updated_at = NOW() WHERE id = $3`,
-        [r.failed_attempts, r.locked_until, user.id]
-      );
-      if (r.locked_until) return res.status(423).json({ error: "locked", until: r.locked_until });
-      return res.status(401).json({ error: "invalid_credentials" });
-    }
-
-    await pool.query(
-      `UPDATE account_users SET failed_attempts = 0, locked_until = NULL, updated_at = NOW() WHERE id = $1`,
-      [user.id]
-    );
+    await DashThrottle.recordSuccess(pool, keys);
     return res.json({ token: signAccountToken(user), user: publicUser(user) });
   } catch (e) {
     console.error("[auth/login]", e.message);
