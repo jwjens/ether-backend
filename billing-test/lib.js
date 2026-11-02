@@ -123,7 +123,7 @@ async function appPage() {
   const br = await chromium.connectOverCDP("http://127.0.0.1:9333");
   for (const ctx of br.contexts()) for (const p of ctx.pages()) {
     const u = p.url();
-    if (/^http:\/\/127\.0\.0\.1:1420\/(#?)$/.test(u) || u === "http://127.0.0.1:1420/") return { br, page: p };
+    if (/^http:\/\/127\.0\.0\.1:1420\//.test(u) && !/#(popout|desk|nowplaying|guesteditor)/.test(u)) return { br, page: p };
   }
   throw new Error("EtherCast main window not found on CDP 9333");
 }
@@ -131,22 +131,27 @@ async function appPage() {
 /** Pull the audio level samples the page has collected (installLevelLog) and append them to billing-test/audio-levels.jsonl. */
 const LEVELS = path.join(__dirname, "audio-levels.jsonl");
 async function installLevelLog(page) {
+  // Once a second, in the app page: the engine's own counters (frames_total = samples rendered, rt_callbacks = output
+  // callbacks — they only climb while audio is being output), deck A's and the master's level, deck A's status, and how
+  // many audio:levels pushes arrived in that second. Installed once per page load (window.__lvl2).
   await page.evaluate(() => {
-    if (window.__lvlInstalled) return;
-    window.__lvlInstalled = true; window.__lvl = []; let last = 0, peak = 0, n = 0;
-    window.ether.audio.onLevels((v) => {
-      n++;
-      const vals = JSON.stringify(v).match(/-?\d+(\.\d+)?/g) || [];
-      const p = Math.max(0, ...vals.map(Number).filter((x) => x >= 0 && x <= 1.5));
-      if (p > peak) peak = p;
-      const t = Date.now();
-      if (t - last >= 1000) { window.__lvl.push({ t, peak: +peak.toFixed(4), callbacks: n, sample: v }); last = t; peak = 0; n = 0; if (window.__lvl.length > 20000) window.__lvl.shift(); }
-    });
+    if (window.__lvl2) return;
+    window.__lvl2 = true; window.__lvl = []; let pushes = 0;
+    window.ether.audio.onLevels(() => { pushes++; });
+    setInterval(async () => {
+      try {
+        const [l, st] = await Promise.all([window.ether.audio.getLevels(1), window.ether.audio.getState(1)]);
+        window.__lvl.push({ t: Date.now(), a: l.a, master: l.master, frames_total: l.frames_total, rt_callbacks: l.rt_callbacks,
+                            device_errors: l.rt_device_errors, deckA: st && st.deckA && st.deckA.status, pushes });
+      } catch (e) { window.__lvl.push({ t: Date.now(), error: String((e && e.message) || e), pushes }); }
+      pushes = 0;
+      if (window.__lvl.length > 20000) window.__lvl.shift();
+    }, 1000);
   });
 }
 async function drainLevels(page, stage) {
-  const rows = await page.evaluate(() => { const r = window.__lvl || []; window.__lvl = []; return r; });
-  fs.appendFileSync(LEVELS, rows.map((r) => JSON.stringify({ stage, at: new Date(r.t).toISOString(), peak: r.peak, callbacks: r.callbacks })).join("\n") + (rows.length ? "\n" : ""));
+  const rows = (await page.evaluate(() => { const r = window.__lvl || []; window.__lvl = []; return r; })).filter((r) => !("sample" in r));   // the first version's rows (this page load) are dropped
+  fs.appendFileSync(LEVELS, rows.map(({ t, ...r }) => JSON.stringify({ stage, at: new Date(t).toISOString(), ...r })).join("\n") + (rows.length ? "\n" : ""));
   return rows;
 }
 

@@ -8,3 +8,12 @@ billing-test/*.log
 billing-test/tokens.json
 billing-test/desktop-profile/
 billing-test/audio/
+billing-test/screens/
+billing-test/run1/
+billing-test/superseded/
+billing-test/report.html
+billing-test/results.json
+billing-test/audio-levels.jsonl
+billing-test/audio-summary.json
+billing-test/d-state.json
+billing-test/look.png
