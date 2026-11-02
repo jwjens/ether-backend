@@ -26,8 +26,9 @@ Set these in Railway dashboard → Variables:
 
 - `STRIPE_SECRET_KEY` — from Stripe Dashboard → Developers → API keys
 - `STRIPE_WEBHOOK_SECRET` — from Stripe Dashboard → Webhooks (after adding endpoint)
-- `PRICE_PRO` — Stripe price ID for Ether Pro
-- `PRICE_STATION` — Stripe price ID for Ether Station
+- `PRICE_LOCAL_MONTHLY`, `PRICE_LOCAL_ANNUAL`, `PRICE_STATION_MONTHLY`, `PRICE_STATION_ANNUAL`, `PRICE_PRO_MONTHLY`,
+  `PRICE_PRO_ANNUAL`, `PRICE_UNLIMITED_MONTHLY`, `PRICE_UNLIMITED_ANNUAL`, `PRICE_NETWORK_EXTRA_STATION_MONTHLY`,
+  `PRICE_LISTENERS_50_MONTHLY` — the Stripe price IDs (names from `config/plans.json` → `stripe_price_env`)
 - `RESEND_API_KEY` — from resend.com (free tier)
 - `ADMIN_SECRET` — any long random string you choose
 - `DATABASE_URL` — auto-set by Railway when you add PostgreSQL

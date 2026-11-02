@@ -19,11 +19,11 @@ const ENV = {
   PRICE_STATION: "price_old_station", PRICE_PRO: "price_old_pro",
 };
 
-test("every price id comes from the env variable the catalog names; plans and add-ons are told apart; legacy two kept", () => {
+test("every price id comes from the env variable the catalog names; plans and add-ons are told apart; the old PRICE_STATION / PRICE_PRO are not read", () => {
   const plans = B.planByPriceId(CATALOG, ENV);
   assert.deepStrictEqual(plans, {
     price_lm: "local", price_la: "local", price_sm: "station", price_sa: "station", price_pm: "pro", price_pa: "pro",
-    price_um: "unlimited", price_ua: "unlimited", price_old_station: "station", price_old_pro: "pro",
+    price_um: "unlimited", price_ua: "unlimited",
   });
   assert.deepStrictEqual(B.addonByPriceId(CATALOG, ENV), { price_xs: "network_extra_station", price_l50: "listeners_50" });
   assert.deepStrictEqual(B.planByPriceId(CATALOG, {}), {}, "no env → nothing sold (no hardcoded id)");
@@ -52,7 +52,7 @@ test("checkout: unknown plan, unknown period, or a price that is not set up → 
   assert.strictEqual(B.checkoutItems(CATALOG, ENV, { plan: "operator" }).error, "invalid_plan");
   assert.strictEqual(B.checkoutItems(CATALOG, ENV, { plan: "pro", period: "weekly" }).error, "invalid_period");
   assert.strictEqual(B.checkoutItems(CATALOG, { PRICE_PRO: "price_old_pro" }, { plan: "pro" }).error, "invalid_plan",
-    "the legacy PRICE_PRO is mapped for renewals but not sold at new checkouts");
+    "the old PRICE_PRO is neither sold nor mapped");
   assert.strictEqual(B.checkoutItems(CATALOG, { PRICE_UNLIMITED_MONTHLY: "price_um" }, { plan: "unlimited", extra_stations: 1 }).error, "addon_unavailable");
 });
 
@@ -173,4 +173,14 @@ test("wired: index.js builds the price map from billing-prices, sells from env, 
   assert.match(src, /subscriptionState: \(sub\) => BILLING\.subscriptionState\(sub, PLAN_CATALOG\)/);
   assert.doesNotMatch(src, /["']price_[A-Za-z0-9]{8,}["']/, "no Stripe price id literal in the server");
   assert.match(src, /"local",\n\]\);/);
+});
+
+test("nothing in the server reads the old PRICE_STATION / PRICE_PRO any more (safe to remove from Railway)", () => {
+  const fs = require("node:fs"), path = require("node:path");
+  const files = ["index.js", "lib/billing-prices.js", "lib/stripe-webhook.js", "lib/plans.js"].map((f) => path.join(__dirname, "..", f));
+  for (const f of files) {
+    const code = fs.readFileSync(f, "utf8").split("\n").filter((l) => !/^\s*(\/\/|\*)/.test(l)).join("\n");
+    assert.doesNotMatch(code, /process\.env\.PRICE_(STATION|PRO)\b|env\.PRICE_(STATION|PRO)\b/, `${path.basename(f)} reads an old price variable`);
+  }
+  assert.deepStrictEqual(Object.keys(B.priceMap(CATALOG, { PRICE_STATION: "price_s", PRICE_PRO: "price_p" })), [], "the old ones map to nothing");
 });

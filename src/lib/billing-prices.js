@@ -6,8 +6,8 @@
 //   plan prices    local / station (Live 128) / pro (Live 320) / unlimited (Network), each monthly or annual
 //   add-ons        network_extra_station (Network only, $15, +1 station and +50 listeners to the pool)
 //                  listeners_50 (Live 128, Live 320, Network: +50 listeners), both bought as a quantity
-//   legacy         PRICE_STATION / PRICE_PRO (the prices sold before 2026-11-01) still map to their plans, so a
-//                  subscription bought on them keeps renewing into the right license.
+//   The old PRICE_STATION / PRICE_PRO are no longer read (Jeff, 2026-11-01: removed once nothing read them; no license
+//   had a Stripe subscription on them).
 const { priceIndex } = require("./plans");
 
 const PLAN_KEYS = ["local", "station", "pro", "unlimited"];
@@ -22,8 +22,6 @@ function priceMap(catalog, env = process.env) {
   for (const [id, { key, period }] of Object.entries(priceIndex(catalog, env))) {
     out[id] = { kind: PLAN_KEYS.includes(key) ? "plan" : "addon", key, period };
   }
-  if (env.PRICE_STATION && !out[env.PRICE_STATION]) out[env.PRICE_STATION] = { kind: "plan", key: "station", period: "monthly", legacy: true };
-  if (env.PRICE_PRO && !out[env.PRICE_PRO]) out[env.PRICE_PRO] = { kind: "plan", key: "pro", period: "monthly", legacy: true };
   return out;
 }
 

@@ -29,7 +29,7 @@
  *
  * Required Railway env vars (already set):
  *   DATABASE_URL, STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET,
- *   RESEND_API_KEY, PRICE_PRO, PRICE_STATION, ADMIN_SECRET
+ *   RESEND_API_KEY, ADMIN_SECRET, and the PRICE_… variables config/plans.json names (stripe_price_env)
  *
  * Add these two:
  *   BACKUP_MAX_MB = 50
@@ -1040,8 +1040,8 @@ const VALID_PLANS = new Set([
 // station_lifetime, operator have no Stripe products today — they're
 // admin-issued only.
 //
-// Since 2026-11-01 the map is built from config/plans.json's stripe_price_env (every plan, monthly and annual) plus the
-// legacy PRICE_PRO / PRICE_STATION (src/lib/billing-prices.js). Unset variables are skipped, as before.
+// Since 2026-11-01 the map is built from config/plans.json's stripe_price_env (every plan, monthly and annual; the old
+// PRICE_PRO / PRICE_STATION are no longer read — src/lib/billing-prices.js). Unset variables are skipped, as before.
 const PLAN_BY_PRICE_ID = BILLING.planByPriceId(PLAN_CATALOG);
 
 // Per-plan station limits enforced server-side in /account/add-station (EB2).
@@ -1434,8 +1434,8 @@ app.get("/api/platform/diag", requirePlatform, async (_req, res) => {
   const out = {
     stripe_key_suffix: k ? k.slice(-4) : null,
     stripe_key_mode: k.startsWith("sk_live") ? "live" : k.startsWith("sk_test") ? "test" : "unknown",
-    price_pro_env: process.env.PRICE_PRO || null,
-    price_station_env: process.env.PRICE_STATION || null,
+    // every price variable the catalog names (config/plans.json stripe_price_env) and the id it holds
+    prices_env: Object.fromEntries(Object.values(PLAN_CATALOG.stripe_price_env).map((n) => [n, process.env[n] || null])),
     stripe_webhook_secret_set: !!process.env.STRIPE_WEBHOOK_SECRET,
     account_app_url: process.env.ACCOUNT_APP_URL || null,
   };
@@ -1449,8 +1449,13 @@ app.get("/api/platform/diag", requirePlatform, async (_req, res) => {
         id: p.id, amount: p.unit_amount, interval: p.recurring?.interval || "one-time",
         product: (p.product && p.product.name) || String(p.product), active: p.active,
       }));
-      out.price_pro_found = prices.data.some((p) => p.id === process.env.PRICE_PRO);
-      out.price_station_found = prices.data.some((p) => p.id === process.env.PRICE_STATION);
+      // each configured price, read by id (the 20-price list above can miss one)
+      out.prices_found = {};
+      for (const [n, id] of Object.entries(out.prices_env)) {
+        if (!id) { out.prices_found[n] = null; continue; }
+        try { const p = await stripe.prices.retrieve(id); out.prices_found[n] = { amount: p.unit_amount, interval: p.recurring?.interval || "one-time", active: p.active }; }
+        catch (e) { out.prices_found[n] = { error: e.message }; }
+      }
     } catch (e) { out.stripe_error = e.message; }
   }
   res.json(out);
