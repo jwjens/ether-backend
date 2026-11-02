@@ -1194,6 +1194,10 @@ function runBillingEmails(opts = {}) {
 //   Old keys (plaintext):  license_key direct string match
 // Any future endpoint needing license validation should call this rather than
 // duplicating the query logic.
+// LIFETIME AND OPERATOR LICENSES NEVER EXPIRE, whatever end date they carry (Jeff, 2026-11-01; Rulings 2026-10-05): the
+// key checks use the same rule as the entitlements (src/lib/entitlement.js licenseExpired / NEVER_EXPIRES). Before, a
+// lifetime license with a stale end date (license 22) was treated as an expired trial by every cloud route.
+const { licenseExpired } = require("./lib/entitlement");
 async function lookupLicense(rawKey) {
   const prefix = rawKey.slice(0, 12);
   const { rows } = await pool.query(
@@ -1203,7 +1207,7 @@ async function lookupLicense(rawKey) {
   ).catch(() => ({ rows: [] }));
   for (const row of rows) {
     // Expired trial license → treat as no match (paid licenses have expires_at = NULL, always pass).
-    if (row.expires_at && new Date(row.expires_at).getTime() < Date.now()) continue;
+    if (licenseExpired(row)) continue;   // lifetime / operator never expire, whatever end date they carry
     if (row.key_hash != null) {
       if (await bcrypt.compare(rawKey, row.key_hash)) return row;
     } else if (rawKey === row.license_key) {
@@ -1232,7 +1236,7 @@ async function lookupLicenseDetailed(rawKey) {
       : rawKey === row.license_key;
     if (!keyMatches) continue;
     // Key matches this row. If it carries a past expires_at, it's a lapsed trial.
-    if (row.expires_at && new Date(row.expires_at).getTime() < Date.now()) { expiredRow = expiredRow || row; continue; }
+    if (licenseExpired(row)) { expiredRow = expiredRow || row; continue; }   // lifetime / operator never expire
     return { row, reason: "ok" };
   }
   // expiredRow: the matched row of a lapsed trial, so the caller can say what the account has (entitlements); it is
@@ -2653,7 +2657,8 @@ app.post("/api/user/desktop-activate", authLimiter, async (req, res) => {
     const lapsed = ent.status === "expired";
     const pick = await resolveDesktopLicense(pool, u, { generateLicenseKey, entitled: ent.status !== "none" });
     if (!pick)
-      return res.status(403).json({ error: "trial_expired", message: "Your free trial has ended. Subscribe to activate Ether, or continue on the free Solo plan." });
+      // Jeff, 2026-11-01: the old text offered a "free Solo plan" that isn't on that screen. Plain text (4.6.57 shows it as is).
+      return res.status(403).json({ error: "trial_expired", message: `Your free trial has ended. Choose a plan at ${ACCOUNT_APP_URL.replace(/^https?:\/\//, "").replace(/\/$/, "")}.` });
     let license = pick.license;
     // A member never re-keys the owner's license (the mint below replaces the stored key). A hash-only license has no key
     // to hand a member: the owner activates once first, which mints it.

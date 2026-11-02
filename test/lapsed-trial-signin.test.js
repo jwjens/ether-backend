@@ -65,3 +65,11 @@ test("an account with no trial at all and no license is still refused (never han
   assert.strictEqual(a.status, 403); assert.strictEqual(a.body.error, "trial_expired");
   assert.strictEqual((await h.pool.query(`SELECT license_key_id FROM users WHERE email = 'none@lapsed.test'`)).rows[0].license_key_id, null);
 });
+
+test("the old refusal text now points to the account site (Jeff, 2026-11-01)", async () => {
+  await account("none2@lapsed.test", null);
+  const a = await activate("none2@lapsed.test", "m-n2");
+  assert.strictEqual(a.status, 403);
+  assert.match(a.body.message, /^Your free trial has ended\. Choose a plan at [a-z0-9.-]+\.[a-z]+(\/\S*)?\.$/);
+  assert.doesNotMatch(a.body.message, /Solo/);
+});
