@@ -140,7 +140,7 @@ test("webhook: subscription.created/updated set the plan from the plan item (not
   assert.deepStrictEqual(r, { plan: "unlimited", extra_stations: 1, listener_addons: 1 });
 });
 
-test("webhook: a finished checkout reads the subscription from Stripe for its add-ons; a Stripe error never fails it", async () => {
+test("webhook: a finished checkout reads the subscription from Stripe for its add-ons; Stripe unreachable → 503, nothing written, the redelivery makes it", async () => {
   const pool = await freshPool();
   await pool.query(`INSERT INTO users (email) VALUES ('n@x.com')`);
   const stripe = { subscriptions: { retrieve: async (id) => sub([["price_um", 1], ["price_xs", 2]], id) }, customers: { retrieve: async () => ({ deleted: true }) } };
@@ -156,7 +156,13 @@ test("webhook: a finished checkout reads the subscription from Stripe for its ad
   const out2 = await W.handlePlatformEvent(ev("checkout.session.completed", {
     mode: "subscription", client_reference_id: "1", customer_email: "n@x.com", metadata: { plan: "local" }, subscription: "sub_8",
   }), deps(pool2, { stripe: bad }));
-  assert.strictEqual(out2.status, 200);
+  assert.strictEqual(out2.status, 503, "Stripe could not be read: Stripe is told to deliver it again");
+  assert.strictEqual((await pool2.query(`SELECT COUNT(*)::int n FROM licenses`)).rows[0].n, 0, "nothing written");
+  const good = { subscriptions: { retrieve: async (id) => sub([["price_lm", 1]], id) }, customers: { retrieve: async () => ({ deleted: true }) } };
+  const out3 = await W.handlePlatformEvent(ev("checkout.session.completed", {
+    mode: "subscription", client_reference_id: "1", customer_email: "n@x.com", metadata: { plan: "local" }, subscription: "sub_8",
+  }), deps(pool2, { stripe: good }));
+  assert.strictEqual(out3.status, 200);
   assert.deepStrictEqual((await pool2.query(`SELECT plan, extra_stations FROM licenses`)).rows[0], { plan: "local", extra_stations: 0 });
 });
 

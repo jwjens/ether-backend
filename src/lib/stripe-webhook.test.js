@@ -303,6 +303,8 @@ function fakeStripe({ defaultPm = null, list = [], fail = false } = {}) {
   return {
     calls,
     customers: { retrieve: async (id, opts) => { calls.push(["customers.retrieve", id, opts]); if (fail) throw new Error("boom"); return { id, invoice_settings: { default_payment_method: defaultPm } }; } },
+    // the subscription as Stripe has it now (handlePlatformEvent reads it for every subscription event)
+    subscriptions: { retrieve: async (id) => { calls.push(["subscriptions.retrieve", id]); return { object: "subscription", id, status: "active", items: { data: [{ price: { id: PRICE_STATION } }] } }; } },
     paymentMethods: {
       retrieve: async (id) => { calls.push(["paymentMethods.retrieve", id]); return { id, card: { brand: "mastercard", last4: "4444", exp_month: 3, exp_year: 2028 } }; },
       list: async (q) => { calls.push(["paymentMethods.list", q]); return { data: list }; },
@@ -428,4 +430,66 @@ test("one license per subscription: the same message delivered twice at once mak
   await Promise.all([W.handlePlatformEvent(invoiceEv(), d), W.handlePlatformEvent(invoiceEv(), d)]);
   assert.strictEqual((await pool.query(`SELECT COUNT(*)::int n FROM licenses WHERE stripe_subscription_id = 'sub_race'`)).rows[0].n, 1);
   assert.strictEqual(sent.length, 1);
+});
+
+// ── Event order (2026-11-01): an older Stripe message never overwrites a newer state ─────────────────────────────────
+// Every subscription event reads the subscription from Stripe as it is NOW and acts on that.
+function stripeNow(status, priceId = PRICE_STATION) {
+  return { subscriptions: { retrieve: async (id) => ({ object: "subscription", id, status, items: { data: [{ price: { id: priceId } }] } }) },
+           customers: { retrieve: async () => ({ deleted: true }) } };
+}
+const graceRow = async (pool) => (await pool.query(`SELECT grace_until AS g, payment_failed_at AS f, plan, active FROM licenses ORDER BY id`)).rows[0];
+
+test("order: a late 'subscription active' after a failed payment does not clear the grace (Stripe says past_due now)", async () => {
+  const pool = await freshPool();
+  await pool.query(`INSERT INTO licenses (email, plan, stripe_subscription_id, payment_failed_at, grace_until) VALUES ('o@x.com','station','sub_o1', NOW(), NOW() + INTERVAL '7 days')`);
+  const { d } = deps(pool, { stripe: stripeNow("past_due"), graceDays: 7 });
+  const out = await W.handlePlatformEvent({ ...ev("customer.subscription.updated", { object: "subscription", id: "sub_o1", status: "active", items: { data: [{ price: { id: PRICE_STATION } }] } }), created: 1 }, d);
+  assert.strictEqual(out.status, 200);
+  const r = await graceRow(pool);
+  assert.ok(r.g && r.f, "grace and the failure kept");
+});
+
+test("order: a late 'payment failed' after the subscription was paid again sets no grace (Stripe says active now)", async () => {
+  const pool = await freshPool();
+  await pool.query(`INSERT INTO licenses (email, plan, stripe_subscription_id) VALUES ('o@x.com','station','sub_o2')`);
+  const { d } = deps(pool, { stripe: stripeNow("active"), graceDays: 7 });
+  await W.handlePlatformEvent(ev("invoice.payment_failed", { object: "invoice", id: "in_old", subscription: "sub_o2", customer: "cus_o2" }), d);
+  const r = await graceRow(pool);
+  assert.strictEqual(r.g, null); assert.strictEqual(r.f, null);
+});
+
+test("order: a late 'invoice paid' after a newer failure does not clear the grace (Stripe says past_due now)", async () => {
+  const pool = await freshPool();
+  await pool.query(`INSERT INTO licenses (email, plan, stripe_subscription_id, payment_failed_at, grace_until) VALUES ('o@x.com','station','sub_o3', NOW(), NOW() + INTERVAL '7 days')`);
+  const { d } = deps(pool, { stripe: stripeNow("past_due"), graceDays: 7 });
+  await W.handlePlatformEvent(ev("invoice.paid", { object: "invoice", id: "in_older", subscription: "sub_o3", customer: "cus_o3" }), d);
+  const r = await graceRow(pool);
+  assert.ok(r.g && r.f, "grace kept");
+});
+
+test("order: a late plan change carries the plan Stripe has NOW, not the message's", async () => {
+  const pool = await freshPool();
+  await pool.query(`INSERT INTO licenses (email, plan, stripe_subscription_id) VALUES ('o@x.com','pro','sub_o4')`);
+  const { d } = deps(pool, { stripe: stripeNow("active", PRICE_PRO), graceDays: 7 });
+  await W.handlePlatformEvent(ev("customer.subscription.updated", { object: "subscription", id: "sub_o4", status: "active", items: { data: [{ price: { id: PRICE_STATION } }] } }), d);
+  assert.strictEqual((await graceRow(pool)).plan, "pro");
+});
+
+test("order: the current-state message itself still works (paid now → grace cleared; past_due now → grace set)", async () => {
+  const pool = await freshPool();
+  await pool.query(`INSERT INTO licenses (email, plan, stripe_subscription_id, payment_failed_at, grace_until) VALUES ('o@x.com','station','sub_o5', NOW(), NOW())`);
+  await W.handlePlatformEvent(ev("invoice.paid", { object: "invoice", id: "in_new", subscription: "sub_o5" }), deps(pool, { stripe: stripeNow("active"), graceDays: 7 }).d);
+  assert.strictEqual((await graceRow(pool)).g, null);
+  await W.handlePlatformEvent({ ...ev("invoice.payment_failed", { object: "invoice", id: "in_new2", subscription: "sub_o5" }), created: 1793000000 }, deps(pool, { stripe: stripeNow("past_due"), graceDays: 7 }).d);
+  assert.strictEqual(new Date((await graceRow(pool)).g).getTime(), (1793000000 + 7 * 86400) * 1000);
+});
+
+test("order: Stripe unreachable → 503 and nothing written (Stripe delivers it again)", async () => {
+  const pool = await freshPool();
+  await pool.query(`INSERT INTO licenses (email, plan, stripe_subscription_id, payment_failed_at, grace_until) VALUES ('o@x.com','station','sub_o6', NOW(), NOW())`);
+  const down = { subscriptions: { retrieve: async () => { throw new Error("down"); } } };
+  const out = await W.handlePlatformEvent(ev("customer.subscription.updated", { object: "subscription", id: "sub_o6", status: "active" }), deps(pool, { stripe: down }).d);
+  assert.strictEqual(out.status, 503);
+  assert.ok((await graceRow(pool)).g, "unchanged");
 });

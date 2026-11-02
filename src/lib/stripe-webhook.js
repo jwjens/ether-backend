@@ -251,8 +251,17 @@ async function applyPaymentState(event, deps) {
   const subId = subscriptionIdOf(obj);
   const customerId = customerIdOf(obj);
   const at = eventTime(event), graceDays = deps.graceDays;
-  if (PAYMENT_FAILED.has(event.type)) return setPaymentFailed(deps.pool, { subId, customerId, at, graceDays });
-  if (PAYMENT_OK.has(event.type)) return clearPaymentFailed(deps.pool, { subId, customerId });
+  // The subscription as Stripe has it NOW (handlePlatformEvent, deps.current), when there is one: an invoice message
+  // can arrive after a newer one (Stripe does not promise order), so it only acts when the current state agrees.
+  const now = deps.current && deps.current.status;
+  if (PAYMENT_FAILED.has(event.type)) {
+    if (now === "active" || now === "trialing") return 0;   // an older failure; the subscription has been paid since
+    return setPaymentFailed(deps.pool, { subId, customerId, at, graceDays });
+  }
+  if (PAYMENT_OK.has(event.type)) {
+    if (now && now !== "active" && now !== "trialing") return 0;   // an older payment; a newer one has failed
+    return clearPaymentFailed(deps.pool, { subId, customerId });
+  }
   if (event.type === "customer.subscription.deleted") return setEnded(deps.pool, { subId, at, graceDays });
   if (event.type === "customer.subscription.updated") {
     if (obj.status === "past_due") return setPaymentFailed(deps.pool, { subId, customerId: null, at, graceDays });
@@ -336,12 +345,43 @@ async function recordAddons(event, deps) {
   return r.rowCount;
 }
 
+// ── EVENT ORDER (2026-11-01) ───────────────────────────────────────────────────────────────────────────────────────
+// Stripe does not promise to deliver events in order. A late "subscription active" arriving after a failed payment
+// used to clear the grace (seen in the billing test when an older event was delivered after a newer one). So for every
+// event about a subscription, the subscription is read from Stripe as it is NOW, once, and every decision is made from
+// that: a subscription event is handled with the current copy in place of the event's, and an invoice event acts only
+// when the current state agrees (applyPaymentState). An older message can no longer overwrite a newer state.
+// Stripe unreachable: 503 and nothing written, so Stripe delivers it again later. No Stripe client (no key — tests and
+// local tools): the event's own copy, as before.
+const SUBSCRIPTION_EVENTS = new Set(["customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"]);
+
+async function currentSubscription(event, deps) {
+  if (!deps.stripe) return { sub: null };
+  const obj = (event && event.data && event.data.object) || {};
+  const subId = subscriptionIdOf(obj);
+  if (!subId) return { sub: null };
+  try {
+    const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("stripe timeout")), deps.cardTimeoutMs || 5000).unref());
+    return { sub: await Promise.race([deps.stripe.subscriptions.retrieve(subId), timeout]) };
+  } catch (e) {
+    return { error: e.message, subId };
+  }
+}
+
 async function handlePlatformEvent(event, deps) {
-  const out = await applyLicenseEvent(event, deps);
+  const log = deps.log || console;
+  const cur = await currentSubscription(event, deps);
+  if (cur.error) {
+    log.warn(`[Stripe] ${event.type}: could not read subscription ${cur.subId} from Stripe (${cur.error}) — nothing written; Stripe will deliver it again`);
+    return { status: 503, body: { error: "stripe_unavailable" } };
+  }
+  const ev = cur.sub && SUBSCRIPTION_EVENTS.has(event.type) ? { ...event, data: { ...event.data, object: cur.sub } } : event;
+  const d = cur.sub ? { ...deps, current: cur.sub } : deps;
+  const out = await applyLicenseEvent(ev, d);
   if (out.status !== 200) return out;
-  await applyPaymentState(event, deps);
-  await recordCard(event, deps);
-  await recordAddons(event, deps);
+  await applyPaymentState(ev, d);
+  await recordCard(ev, d);
+  await recordAddons(ev, d);
   return out;
 }
 
