@@ -41,10 +41,10 @@ test("/account/connect (the desktop's sign-in to its stations) carries the plan'
   assert.equal(r.body.entitlements.features.public_page, true);
 });
 
-test("a trial that ended: connect still answers trial_expired as before, and now says the account is in its grace", async () => {
+test("a trial that ended: connect answers normally (never refused, Jeff 2026-11-01) and says the account is in its grace", async () => {
   await license("station", "ETH-STN-GRCE-0001-AAAA", iso(Date.now() - 2 * DAY));
   const r = await h.call("POST", "/account/connect", { body: { license_key: "ETH-STN-GRCE-0001-AAAA", machine_id: "m-g" } });
-  assert.equal(r.status, 401); assert.equal(r.body.error, "trial_expired");
+  assert.equal(r.status, 200, r.text); assert.ok(Array.isArray(r.body.stations));
   assert.equal(r.body.entitlements.status, "grace");
   const g = await h.call("GET", "/api/entitlements", { headers: { "x-license-key": "ETH-STN-GRCE-0001-AAAA" } });
   assert.equal(g.status, 200); assert.equal(g.body.entitlements.status, "grace");

@@ -2645,7 +2645,13 @@ app.post("/api/user/desktop-activate", authLimiter, async (req, res) => {
     const ent = await userEntitlement(u);
     // WHICH LICENSE (src/lib/desktop-license.js; Jeff, 2026-10-28): the user's own, or — verified email only — the
     // account they were invited to, or a brand-new trial of their own. NEVER an existing license found by email.
-    const pick = await resolveDesktopLicense(pool, u, { generateLicenseKey, entitled: !(ent.status === "expired" || ent.status === "none") });
+    // A TRIAL THAT ENDED (or a lapsed plan) IS NEVER REFUSED HERE (Jeff, 2026-11-01): the sign-in answers normally with
+    // the account's own — lapsed — license (or a new one that is already lapsed: its end date is the trial's), so Ether
+    // opens and playout runs; cloud features stay off by its entitlements. Only an account with no trial at all is
+    // refused (handing it a license would give it one that never ends). Before: 403 trial_expired, and 4.6.57 stopped at
+    // the sign-in screen with no way in (docs/desktop-4.6.57-server-text-and-expired-trial-2026-11-01.md, desktop repo).
+    const lapsed = ent.status === "expired";
+    const pick = await resolveDesktopLicense(pool, u, { generateLicenseKey, entitled: ent.status !== "none" });
     if (!pick)
       return res.status(403).json({ error: "trial_expired", message: "Your free trial has ended. Subscribe to activate Ether, or continue on the free Solo plan." });
     let license = pick.license;
@@ -2701,8 +2707,10 @@ app.post("/api/user/desktop-activate", authLimiter, async (req, res) => {
       name: u.name || null,
       license_key: license.license_key || null,   // trial keys are plaintext; paid bcrypt keys omit it
       entitlements: entitlementsOf(license),
-      trial: ent.status === "trial",
-      trial_ends_at: ent.status === "trial" ? u.trial_ends_at : null,
+      // a lapsed trial is reported as a trial with its (past) end date, so a desktop that keeps a trial clock (4.6.57's
+      // trial-ended overlay) shows its own reminder — dismissible, never a block
+      trial: ent.status === "trial" || lapsed,
+      trial_ends_at: ent.status === "trial" || lapsed ? (u.trial_ends_at || license.expires_at || null) : null,
       // RBAC foundation: a user JWT so the desktop can read /api/me/memberships (the accounts +
       // accessible stations this person belongs to). Read-only use; existing clients ignore it.
       token: signUserToken(u),
@@ -4475,11 +4483,10 @@ app.post("/account/connect", async (req, res) => {
     // destroys data (expiry only gates access) — the stations/library remain and resume
     // on renewal. renew_url points the operator at the plan picker.
     const looked = await lookupLicenseDetailed(rawKey);
-    if (looked.reason === "expired") {
-      return res.status(401).json({ error: "trial_expired", renew_url: "https://signup.ether-technologies.com",
-        entitlements: entitlementsOf(looked.expiredRow), billing_notice: noticeOf(looked.expiredRow) });
-    }
-    const license = looked.row;
+    // A trial that ended (or a lapsed plan) is NEVER refused (Jeff, 2026-11-01): connect answers normally with the
+    // account's stations; its entitlements say lapsed (no cloud) and billing_notice carries the reminder. Before: 401
+    // trial_expired, which kept 4.6.57 at the sign-in screen. Cloud routes still refuse a lapsed key (lookupLicense).
+    const license = looked.row || (looked.reason === "expired" ? looked.expiredRow : null);
     if (!license) return res.status(401).json({ error: "invalid_license_key" });
 
     // license_activations.license_key fallback — see EB1 in close-out-tracker.

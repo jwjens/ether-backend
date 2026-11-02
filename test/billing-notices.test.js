@@ -47,11 +47,11 @@ test("desktop: /account/connect carries billing_notice (trial ending in 2 days)"
   assert.equal(r.body.billing_notice.action.label, "Add a card");
 });
 
-test("desktop: a lapsed trial's refusal still carries the notice (banner, never a block)", async () => {
+test("desktop: a lapsed trial is answered normally and carries the notice (banner, never a block — Jeff 2026-11-01)", async () => {
   const a = await account({ expires_at: at(-1) });
   const r = await connect(a);
-  assert.equal(r.status, 401);
-  assert.equal(r.body.error, "trial_expired");
+  assert.equal(r.status, 200, r.text);
+  assert.ok(Array.isArray(r.body.stations));
   assert.equal(r.body.billing_notice.kind, "trial_ended");
 });
 
