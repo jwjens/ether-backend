@@ -20,7 +20,8 @@ test("two different addresses get separate sign-in limits; a forged first entry 
 });
 
 test("wired: trust proxy is one hop, set right after the app is made", () => {
-  const src = require("node:fs").readFileSync(require("node:path").join(__dirname, "..", "src", "index.js"), "utf8");
+  // line endings normalised: a Windows working copy can have CRLF
+  const src = require("node:fs").readFileSync(require("node:path").join(__dirname, "..", "src", "index.js"), "utf8").replace(/\r\n/g, "\n");
   assert.match(src, /const app {4}= express\(\);\n(\/\/[^\n]*\n)+app\.set\("trust proxy", 1\);/);
 });
 
