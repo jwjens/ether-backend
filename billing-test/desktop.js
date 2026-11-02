@@ -1,39 +1,40 @@
 'use strict';
-// The EtherCast DEV build (C:\openair) for the billing test, driven by Playwright's Electron driver.
-//   · its own empty profile (APPDATA and LOCALAPPDATA under billing-test\desktop-profile) — never the real one
-//   · pointed at the LOCAL backend (ETHER_BACKEND_URL_DEV / VITE_ETHER_BACKEND_URL = http://127.0.0.1:8787; the vite dev
-//     server on :1420 must be started with VITE_ETHER_BACKEND_URL set — see run notes)
-// Window captures: the app window's own screenshot (page.screenshot), saved by lib.shot.
+// The EtherCast DEV build (C:\openair) for the billing test — launched and left running; the drivers attach over CDP
+// (127.0.0.1:9333, chromium.connectOverCDP) to sign in, read the popup and take window captures.
+//   node billing-test/desktop.js            (runs until killed; app output → billing-test/desktop-app.log)
+//
+//   · its own empty profile: ETHER_ISOLATED_DEV=1 + --user-data-dir (own userData, own engine pipe, no :3400) and
+//     LOCALAPPDATA under billing-test\desktop-profile (own database, machine id and staged engine) — never the real one
+//   · pointed at the LOCAL backend: ETHER_BACKEND_URL_DEV (main process); the renderer comes from the vite on :1420
+//     started with VITE_ETHER_BACKEND_URL=http://127.0.0.1:8787
 const fs = require("node:fs");
 const path = require("node:path");
-const PW = process.env.PW_DIR || "C:\\Users\\jensj\\AppData\\Local\\Temp\\claude\\C--openair\\d859f1fc-74c8-4861-901b-87db15ad2780\\scratchpad\\pw\\node_modules\\playwright-core";
-const { _electron } = require(PW);
+const { spawn } = require("node:child_process");
 
 const OPENAIR = "C:\\openair";
 const PROFILE = path.join(__dirname, "desktop-profile");
+const CDP_PORT = 9333;
 
-async function launch() {
-  for (const d of ["Roaming", "Local"]) fs.mkdirSync(path.join(PROFILE, d), { recursive: true });
+if (require.main === module) {
+  for (const d of ["Roaming\\Ether", "Local"]) fs.mkdirSync(path.join(PROFILE, d), { recursive: true });
   const env = {
     ...process.env,
-    APPDATA: path.join(PROFILE, "Roaming"),
     LOCALAPPDATA: path.join(PROFILE, "Local"),
     NODE_ENV: "development",
+    ETHER_ISOLATED_DEV: "1",
     ETHER_BACKEND_URL_DEV: "http://127.0.0.1:8787",
     VITE_ETHER_BACKEND_URL: "http://127.0.0.1:8787",
   };
-  delete env.ETHER_ALLOW_DEV_PUSH;
-  const app = await _electron.launch({
-    executablePath: path.join(OPENAIR, "node_modules", "electron", "dist", "electron.exe"),
-    args: [path.join(OPENAIR, "electron", "main.js")],
-    cwd: OPENAIR, env, timeout: 120000,
-  });
-  const logs = [];
-  app.process().stdout.on("data", (d) => logs.push(String(d)));
-  app.process().stderr.on("data", (d) => logs.push(String(d)));
-  const win = await app.firstWindow({ timeout: 120000 });
-  await win.waitForLoadState("domcontentloaded");
-  return { app, win, logs, PROFILE };
+  delete env.ETHER_ALLOW_DEV_PUSH; delete env.ETHER_SMOKE;
+  const log = fs.createWriteStream(path.join(__dirname, "desktop-app.log"), { flags: "a" });
+  const app = spawn(path.join(OPENAIR, "node_modules", "electron", "dist", "electron.exe"),
+    [path.join(OPENAIR, "electron", "main.js"), `--user-data-dir=${path.join(PROFILE, "Roaming", "Ether")}`, `--remote-debugging-port=${CDP_PORT}`],
+    { cwd: OPENAIR, env });
+  app.stdout.pipe(log); app.stderr.pipe(log);
+  console.log(`[desktop] started pid ${app.pid}; CDP on 127.0.0.1:${CDP_PORT}`);
+  app.on("exit", (c) => { console.log(`[desktop] exited ${c}`); process.exit(0); });
+  const stop = () => { try { app.kill(); } catch {} };
+  process.on("SIGINT", stop); process.on("SIGTERM", stop);
 }
 
-module.exports = { launch, PROFILE, OPENAIR };
+module.exports = { PROFILE, OPENAIR, CDP_PORT };

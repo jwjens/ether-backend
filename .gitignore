@@ -7,3 +7,4 @@ dist/
 billing-test/*.log
 billing-test/tokens.json
 billing-test/desktop-profile/
+billing-test/audio/

@@ -171,11 +171,15 @@ async function main() {
   return h;
 }
 
-/** The test driver's port (127.0.0.1 only): read-only SELECTs, confirm a sign-up, the recorded emails. */
+const REAL_NOW = Date.now.bind(Date);
+const CLOCK = { offset: 0 };
+
+/** The test driver's port (127.0.0.1 only): read-only SELECTs, confirm a sign-up, the recorded emails, the clock. */
 function startControl(h, port) {
+  Date.now = () => REAL_NOW() + CLOCK.offset;
   const http = require("node:http");
   const send = (res, code, body) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(body, null, 1)); };
-  http.createServer(async (req, res) => {
+  return http.createServer(async (req, res) => {
     try {
       const u = new URL(req.url, "http://127.0.0.1");
       if (req.method === "GET" && u.pathname === "/db") {
@@ -190,6 +194,15 @@ function startControl(h, port) {
         return send(res, 200, { verified: r.rowCount });
       }
       if (req.method === "GET" && u.pathname === "/emails") return send(res, 200, h.emails.map((m) => ({ to: m.to, subject: m.subject })));
+      // POST /clock {now} — move this server's Date.now() to `now` (ms or ISO), to follow a Stripe TEST CLOCK: the grace
+      // and notice rules read Date.now(), and Stripe's clock is simulated. {now: null} = back to real time. Test only.
+      if (req.method === "POST" && u.pathname === "/clock") {
+        let raw = ""; for await (const c of req) raw += c;
+        const want = JSON.parse(raw || "{}").now;
+        CLOCK.offset = want == null ? 0 : new Date(want).getTime() - REAL_NOW();
+        return send(res, 200, { now: new Date(Date.now()).toISOString(), offset_ms: CLOCK.offset });
+      }
+      if (req.method === "GET" && u.pathname === "/clock") return send(res, 200, { now: new Date(Date.now()).toISOString(), offset_ms: CLOCK.offset });
       send(res, 404, { error: "not_found" });
     } catch (e) { send(res, 500, { error: e.message }); }
   }).listen(port, "127.0.0.1", () => console.log(`  Control:   http://127.0.0.1:${port} (/db?sql=SELECT…, POST /verify, /emails) — test driver only`));
@@ -199,4 +212,4 @@ if (require.main === module) {
   main().catch((e) => { console.error(e.message); process.exit(1); });
 }
 
-module.exports = { parseEnvFile, refuseLiveKeys, accounts, PASSWORD };
+module.exports = { parseEnvFile, refuseLiveKeys, accounts, PASSWORD, startControl, CLOCK };

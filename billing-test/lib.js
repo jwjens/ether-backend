@@ -96,7 +96,7 @@ async function siteLogin(page, email) {
 }
 
 /** Fill Stripe Checkout (hosted, test mode) with a test card and pay. */
-async function payCheckout(page, card, beforePay) {
+async function payCheckout(page, card, beforePay, { expiry = "12 / 34" } = {}) {
   await page.waitForURL(/checkout\.stripe\.com/, { timeout: 30000 });
   await page.waitForLoadState("networkidle").catch(() => {});
   const cardBtn = page.locator('[data-testid="card-accordion-item-button"]');
@@ -108,7 +108,7 @@ async function payCheckout(page, card, beforePay) {
   }
   await page.waitForSelector("#cardNumber", { timeout: 30000 });
   await page.fill("#cardNumber", card);
-  await page.fill("#cardExpiry", "12 / 34");
+  await page.fill("#cardExpiry", expiry);
   await page.fill("#cardCvc", "123");
   if (await page.locator("#billingName").count()) await page.fill("#billingName", "Ether Test");
   if (await page.locator("#billingPostalCode").count()) await page.fill("#billingPostalCode", "89101");
@@ -118,6 +118,38 @@ async function payCheckout(page, card, beforePay) {
   await page.click('[data-testid="hosted-payment-submit-button"], button.SubmitButton');
 }
 
+/** The running EtherCast dev window (billing-test/desktop.js, CDP 127.0.0.1:9333): { br, page }. br.close() only detaches. */
+async function appPage() {
+  const br = await chromium.connectOverCDP("http://127.0.0.1:9333");
+  for (const ctx of br.contexts()) for (const p of ctx.pages()) {
+    const u = p.url();
+    if (/^http:\/\/127\.0\.0\.1:1420\/(#?)$/.test(u) || u === "http://127.0.0.1:1420/") return { br, page: p };
+  }
+  throw new Error("EtherCast main window not found on CDP 9333");
+}
+
+/** Pull the audio level samples the page has collected (installLevelLog) and append them to billing-test/audio-levels.jsonl. */
+const LEVELS = path.join(__dirname, "audio-levels.jsonl");
+async function installLevelLog(page) {
+  await page.evaluate(() => {
+    if (window.__lvlInstalled) return;
+    window.__lvlInstalled = true; window.__lvl = []; let last = 0, peak = 0, n = 0;
+    window.ether.audio.onLevels((v) => {
+      n++;
+      const vals = JSON.stringify(v).match(/-?\d+(\.\d+)?/g) || [];
+      const p = Math.max(0, ...vals.map(Number).filter((x) => x >= 0 && x <= 1.5));
+      if (p > peak) peak = p;
+      const t = Date.now();
+      if (t - last >= 1000) { window.__lvl.push({ t, peak: +peak.toFixed(4), callbacks: n, sample: v }); last = t; peak = 0; n = 0; if (window.__lvl.length > 20000) window.__lvl.shift(); }
+    });
+  });
+}
+async function drainLevels(page, stage) {
+  const rows = await page.evaluate(() => { const r = window.__lvl || []; window.__lvl = []; return r; });
+  fs.appendFileSync(LEVELS, rows.map((r) => JSON.stringify({ stage, at: new Date(r.t).toISOString(), peak: r.peak, callbacks: r.callbacks })).join("\n") + (rows.length ? "\n" : ""));
+  return rows;
+}
+
 async function waitFor(fn, ms = 60000, every = 1000) {
   const end = Date.now() + ms;
   let last;
@@ -125,4 +157,4 @@ async function waitFor(fn, ms = 60000, every = 1000) {
   return last;
 }
 
-module.exports = { API, CTL, SITE, PASSWORD, SCREENS, stripe, db, api, signup, shot, caption, record, browser, siteLogin, payCheckout, waitFor };
+module.exports = { API, CTL, SITE, PASSWORD, SCREENS, stripe, db, api, signup, shot, caption, record, browser, siteLogin, payCheckout, waitFor, appPage, installLevelLog, drainLevels, LEVELS };

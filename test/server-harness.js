@@ -53,20 +53,6 @@ const PG_MEM_GAPS = [
       return { rows, rowCount: rows.length };
     },
   },
-  {
-    // pg-mem keeps NOT NULL on licenses.license_key's UNIQUE index after initDB's `ALTER COLUMN license_key DROP NOT NULL`,
-    // so a license stored by hash only (key_prefix + key_hash, license_key NULL — the Stripe webhook's INSERTs) is
-    // refused with "Cannot add a null record in index licenses_license_key_key". Production Postgres stores NULL there
-    // (UNIQUE allows any number of NULLs). The test stores a unique placeholder that can never equal a real key.
-    why: "NULL in a UNIQUE column whose NOT NULL was dropped (licenses.license_key)",
-    match: (sql) => /^\s*INSERT INTO licenses \(/i.test(sql) && !/license_key/.test(sql.slice(0, sql.indexOf(")"))) && /\)\s*VALUES\s*\(/i.test(sql),
-    run: async (q, sql, params = []) => {
-      const n = params.length + 1;
-      const out = sql.replace(/INSERT INTO licenses \(/i, "INSERT INTO licenses (license_key, ")
-                     .replace(/\)\s*VALUES\s*\(/i, (m) => `${m}$${n}, `);
-      return q(out, [...params, `pgmem-null-${crypto.randomUUID()}`]);
-    },
-  },
 ];
 
 function registerFunctions(db) {
@@ -104,6 +90,13 @@ async function startServer(opts = {}) {
   const emails = [];
   srv.resend.emails.send = async (msg) => { emails.push(msg); return { data: { id: `test-${emails.length}` }, error: null }; };
   await srv.initDB();
+  // pg-mem keeps NOT NULL on licenses.license_key's UNIQUE index after initDB's `ALTER COLUMN license_key DROP NOT NULL`,
+  // so a license stored by hash only (key_prefix + key_hash, license_key NULL — the Stripe webhook's INSERTs) was refused
+  // with "Cannot add a null record in index licenses_license_key_key". Production Postgres's UNIQUE allows any number of
+  // NULLs: the index is rebuilt to that (unique among keys that are set). (A placeholder key, tried first on 2026-11-01,
+  // made desktop-activate hand the placeholder back as the license key — a test-only false failure.)
+  await raw(`ALTER TABLE licenses DROP CONSTRAINT licenses_license_key_key`);
+  await raw(`CREATE UNIQUE INDEX licenses_license_key_set ON licenses (license_key) WHERE license_key IS NOT NULL`);
   const server = http.createServer(srv.app);
   await new Promise(r => server.listen(opts.port || 0, "127.0.0.1", r));
   const base = `http://127.0.0.1:${server.address().port}`;

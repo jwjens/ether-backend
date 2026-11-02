@@ -51,3 +51,17 @@ test("each seeded TEST account shows its notice (and paid OK none)", () => {
     assert.match(a.name, /^TEST /);
   }
 });
+
+test("control port /clock moves the server's Date.now() to a test clock's time and back (test only)", async () => {
+  const { startControl, CLOCK } = require("../scripts/billing-test-server");
+  const srv = startControl({ pool: null, emails: [] }, 0);
+  await new Promise((r) => srv.on("listening", r));
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  try {
+    const set = await (await fetch(`${base}/clock`, { method: "POST", body: JSON.stringify({ now: "2027-01-02T00:00:00Z" }) })).json();
+    assert.equal(set.now.slice(0, 16), "2027-01-02T00:00");
+    assert.ok(Math.abs(Date.now() - Date.parse("2027-01-02T00:00:00Z")) < 5000);
+    const back = await (await fetch(`${base}/clock`, { method: "POST", body: JSON.stringify({ now: null }) })).json();
+    assert.equal(back.offset_ms, 0); assert.equal(CLOCK.offset, 0);
+  } finally { srv.close(); }
+});
