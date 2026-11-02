@@ -396,3 +396,36 @@ test("wired: the webhook route hands the Stripe client to the module only when a
   const src = require("node:fs").readFileSync(require("node:path").join(__dirname, "..", "index.js"), "utf8");
   assert.ok(/stripe: process\.env\.STRIPE_SECRET_KEY \? stripe : null/.test(src));
 });
+
+// ── One license per subscription (billing test 2026-11-01: one purchase made TWO licenses) ──────────────────────────
+// checkout.session.completed (account checkout) and invoice.payment_succeeded arrive together; both used to look the
+// subscription up, find nothing, and each insert a license (the second one's key emailed).
+async function poolWithIndex() {
+  const pool = await freshPool();
+  await pool.query(`CREATE UNIQUE INDEX licenses_one_per_stripe_subscription ON licenses (stripe_subscription_id) WHERE stripe_subscription_id IS NOT NULL`);
+  return pool;
+}
+const checkoutEv = () => ev("checkout.session.completed", { client_reference_id: "1", customer_email: "r@x.com", metadata: { plan: "station" }, subscription: "sub_race", customer: "cus_race" });
+const invoiceEv = () => ev("invoice.payment_succeeded", { object: "invoice", id: "in_race", customer_email: "r@x.com", subscription: "sub_race", customer: "cus_race", lines: { data: [{ price: { id: PRICE_STATION } }] } });
+
+test("one license per subscription: checkout.session.completed and invoice.payment_succeeded at the same moment make ONE license, linked, no second key emailed", async () => {
+  for (const order of [[checkoutEv, invoiceEv], [invoiceEv, checkoutEv]]) {
+    const pool = await poolWithIndex();
+    await pool.query(`INSERT INTO users (email) VALUES ('r@x.com')`);
+    const { d, sent } = deps(pool, { hashKey: async (k) => { await new Promise((r) => setTimeout(r, 20)); return `hash:${k}`; } });   // bcrypt takes time: both lookups happen before either insert
+    const outs = await Promise.all(order.map((e) => W.handlePlatformEvent(e(), d)));
+    assert.deepStrictEqual(outs.map((o) => o.status), [200, 200]);
+    const rows = (await pool.query(`SELECT id FROM licenses WHERE stripe_subscription_id = 'sub_race'`)).rows;
+    assert.strictEqual(rows.length, 1, `one license, got ${rows.length}`);
+    assert.strictEqual((await pool.query(`SELECT license_key_id FROM users WHERE id = 1`)).rows[0].license_key_id, rows[0].id, "the account is linked to it");
+    assert.ok(sent.length <= 1, `at most one key email, got ${sent.length}`);
+  }
+});
+
+test("one license per subscription: the same message delivered twice at once makes one license", async () => {
+  const pool = await poolWithIndex();
+  const { d, sent } = deps(pool, { hashKey: async (k) => { await new Promise((r) => setTimeout(r, 20)); return `hash:${k}`; } });
+  await Promise.all([W.handlePlatformEvent(invoiceEv(), d), W.handlePlatformEvent(invoiceEv(), d)]);
+  assert.strictEqual((await pool.query(`SELECT COUNT(*)::int n FROM licenses WHERE stripe_subscription_id = 'sub_race'`)).rows[0].n, 1);
+  assert.strictEqual(sent.length, 1);
+});

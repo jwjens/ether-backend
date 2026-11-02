@@ -415,6 +415,9 @@ async function initDB() {
   // A paid license's grace end (2026-11-01): set by the webhook when a payment fails or the subscription ends, cleared
   // when a payment succeeds. Past it the license is lapsed (no cloud); the key keeps working (src/lib/entitlements.js).
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS grace_until TIMESTAMPTZ`);
+  // One license per Stripe subscription (2026-11-01): a unique index; guarded — never fails boot, never changes a license
+  // (src/lib/license-subscription-index.js).
+  await require("./lib/license-subscription-index").ensureOneLicensePerSubscription(pool);
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS card_brand TEXT`);
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS card_last4 TEXT`);
   await pool.query(`ALTER TABLE licenses ADD COLUMN IF NOT EXISTS card_exp_month INTEGER`);

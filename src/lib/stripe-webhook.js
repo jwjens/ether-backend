@@ -82,20 +82,28 @@ async function applyLicenseEvent(event, deps) {
       log.warn(`[Stripe] account checkout missing userId/plan (ref=${obj.client_reference_id}, plan=${plan})`);
       return ok();
     }
+    const update = (id) => pool.query(
+      "UPDATE licenses SET active = true, plan = $1, email = $2, stripe_customer_id = COALESCE($3, stripe_customer_id) WHERE id = $4",
+      [plan, email || null, customerId, id]);
     const { rows: existing } = await pool.query("SELECT id FROM licenses WHERE stripe_subscription_id = $1", [subId]);
     let licId;
     if (existing.length) {
-      await pool.query(
-        "UPDATE licenses SET active = true, plan = $1, email = $2, stripe_customer_id = COALESCE($3, stripe_customer_id) WHERE id = $4",
-        [plan, email || null, customerId, existing[0].id]);
+      await update(existing[0].id);
       licId = existing[0].id;
     } else {
       const key = generateLicenseKey(plan);
+      // ONE LICENSE PER SUBSCRIPTION: invoice.payment_succeeded can be inserting this subscription's license at the same
+      // moment. The unique index (licenses_one_per_stripe_subscription) lets only one insert win; the other does
+      // nothing and uses the winner's license.
       const r = await pool.query(
         `INSERT INTO licenses (email, plan, stripe_subscription_id, stripe_customer_id, key_prefix, key_hash)
-         VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+         VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING RETURNING id`,
         [email || null, plan, subId, customerId, key.slice(0, 12), await hashKey(key)]);
-      licId = r.rows[0].id;
+      if (r.rows.length) licId = r.rows[0].id;
+      else {
+        licId = (await pool.query("SELECT id FROM licenses WHERE stripe_subscription_id = $1", [subId])).rows[0].id;
+        await update(licId);
+      }
     }
     await pool.query("UPDATE users SET license_key_id = $1 WHERE id = $2", [licId, userId]);
     log.log(`[Stripe] account subscription: user ${userId} → license ${licId} (${plan})`);
@@ -129,10 +137,21 @@ async function applyLicenseEvent(event, deps) {
     const tx = await pool.connect();
     try {
       await tx.query("BEGIN");
-      await tx.query(
+      // ONE LICENSE PER SUBSCRIPTION: the account checkout (branch A) or a second delivery of this event can be inserting
+      // the same subscription's license at this moment; the unique index lets one win. The loser emails nothing and
+      // reactivates the winner's license, exactly as a renewal of a known subscription does.
+      const ins = await tx.query(
         `INSERT INTO licenses (email, plan, stripe_subscription_id, stripe_customer_id, key_prefix, key_hash)
-         VALUES ($1,$2,$3,$4,$5,$6)`,
+         VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING RETURNING id`,
         [email, plan, subId, customerId, licenseKey.slice(0, 12), keyHash]);
+      if (!ins.rows.length) {
+        await tx.query("ROLLBACK");
+        const { rows: won } = await pool.query("SELECT id FROM licenses WHERE stripe_subscription_id = $1", [subId]);
+        await pool.query("UPDATE licenses SET active = true, email = $1, stripe_customer_id = COALESCE($2, stripe_customer_id) WHERE id = $3",
+          [email, customerId, won[0].id]);
+        log.log(`[License] ${subId} already has license ${won[0].id} (made at the same moment) — no second license, no email`);
+        return ok();
+      }
       await sendLicenseEmail(email, licenseKey, plan);
       await tx.query("COMMIT");
       log.log(`[License] Issued: ${licenseKey.slice(0, 12)}... → ${email} (${plan})`);
