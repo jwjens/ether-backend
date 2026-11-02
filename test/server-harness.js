@@ -53,6 +53,19 @@ const PG_MEM_GAPS = [
       return { rows, rowCount: rows.length };
     },
   },
+  {
+    // pg-mem returns nothing for `license_key = ANY($1)` with an array parameter (production Postgres matches it). The
+    // platform's machine list is run once per key and merged, newest check-in first, exactly as the one query orders it.
+    why: "= ANY($1) with an array parameter (platform machine list)",
+    match: (sql) => /FROM license_activations WHERE license_key = ANY\(\$1\) AND deauthorized_at IS NULL ORDER BY last_seen DESC/.test(sql),
+    run: async (q, sql, params = []) => {
+      const one = sql.replace("license_key = ANY($1)", "license_key = $1");
+      const rows = [];
+      for (const k of params[0] || []) rows.push(...(await q(one, [k])).rows);
+      rows.sort((a, b) => new Date(b.last_seen) - new Date(a.last_seen));
+      return { rows, rowCount: rows.length };
+    },
+  },
 ];
 
 function registerFunctions(db) {

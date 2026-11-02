@@ -49,3 +49,15 @@ test("the account check never creates a device row (only updates an existing one
   await h.call("POST", "/account/connect", { headers: { "user-agent": UA("4.6.57") }, body: { license_key: "ETH-STN-OLDV-0001", machine_id: "never-seated" } });
   assert.strictEqual(await row("never-seated"), undefined);
 });
+
+test("the platform's machine list shows each machine's Ether version (and none for a machine that hasn't reported)", async () => {
+  const licId = (await h.pool.query(`SELECT license_key_id FROM users WHERE email = 'ver@device.test'`)).rows[0].license_key_id;
+  const m = await h.call("GET", `/api/platform/licenses/${licId}/machines`, { headers: { authorization: `Bearer ${platform}` } });
+  assert.strictEqual(m.status, 200, m.text);
+  assert.strictEqual(m.body.machines.length, 1);
+  assert.strictEqual(m.body.machines[0].machine_name, "Studio PC");
+  assert.strictEqual(m.body.machines[0].app_version, "4.6.71");
+  const oldId = (await h.pool.query(`SELECT id FROM licenses WHERE license_key = 'ETH-STN-OLDV-0001'`)).rows[0].id;
+  const o = await h.call("GET", `/api/platform/licenses/${oldId}/machines`, { headers: { authorization: `Bearer ${platform}` } });
+  assert.strictEqual(o.body.machines[0].app_version, null);
+});
