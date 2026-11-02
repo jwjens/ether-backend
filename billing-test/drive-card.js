@@ -8,7 +8,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const L = require("./lib");
 (async () => {
-  const st = JSON.parse(fs.readFileSync(path.join(__dirname, "d-state.json"), "utf8"));
+  const st = JSON.parse(fs.readFileSync(path.join(__dirname, process.env.BT_STATE || "d-state.json"), "utf8"));
   const { s } = L.stripe();
   const pm = await s.paymentMethods.attach(process.argv[2], { customer: st.customer });
   await s.customers.update(st.customer, { invoice_settings: { default_payment_method: pm.id } });

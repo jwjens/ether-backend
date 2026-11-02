@@ -17,3 +17,9 @@ billing-test/audio-levels.jsonl
 billing-test/audio-summary.json
 billing-test/d-state.json
 billing-test/look.png
+billing-test/desktop-profile-rerun/
+billing-test/tokens-rerun.json
+billing-test/results-rerun.json
+billing-test/audio-levels-rerun.jsonl
+billing-test/d-state-rerun.json
+billing-test/report-artifact.html

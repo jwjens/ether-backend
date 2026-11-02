@@ -18,6 +18,8 @@ const ROOT = path.join(__dirname, "..");
 const ENV_FILE = path.join(ROOT, ".env.stripe-test");
 const STRIPE = process.env.STRIPE_CLI || path.join(process.env.LOCALAPPDATA, "Microsoft", "WinGet", "Links", "stripe.exe");
 const { parseEnvFile } = require("../scripts/billing-test-server");
+// A second run beside the first (2026-11-01 rerun): BT_PORT / BT_CONTROL_PORT / BT_SITE (defaults 8787 / 8788 / 5174).
+const PORT = process.env.BT_PORT || "8787", CONTROL = process.env.BT_CONTROL_PORT || "8788", SITE = process.env.BT_SITE || "http://localhost:5174";
 
 const env = parseEnvFile(fs.readFileSync(ENV_FILE, "utf8"));
 const key = String(env.STRIPE_SECRET_KEY || "").trim();
@@ -32,11 +34,11 @@ console.log(`[run-local] webhook signing secret written to ${ENV_FILE} (whsec_â€
 
 const stamp = (name) => (d) => process.stdout.write(String(d).split(/\r?\n/).filter(Boolean).map((l) => `[${name}] ${l}`).join("\n") + "\n");
 const server = spawn(process.execPath, [path.join(ROOT, "scripts", "billing-test-server.js")], {
-  env: { ...process.env, BILLING_TEST_ENV_FILE: ENV_FILE, BILLING_TEST_SEED: "0", BILLING_TEST_CONTROL_PORT: "8788", BILLING_TEST_ACCOUNT_URL: "http://localhost:5174" },
+  env: { ...process.env, BILLING_TEST_ENV_FILE: ENV_FILE, BILLING_TEST_SEED: "0", BILLING_TEST_PORT: PORT, BILLING_TEST_CONTROL_PORT: CONTROL, BILLING_TEST_ACCOUNT_URL: SITE },
 });
 server.stdout.on("data", stamp("server")); server.stderr.on("data", stamp("server!"));
 const EVENTS = "checkout.session.completed,invoice.payment_succeeded,invoice.paid,invoice.payment_failed,customer.subscription.created,customer.subscription.updated,customer.subscription.deleted,payment_method.attached,customer.updated";
-const listen = spawn(STRIPE, ["listen", "--api-key", key, "--events", EVENTS, "--forward-to", "http://127.0.0.1:8787/webhook/stripe"]);
+const listen = spawn(STRIPE, ["listen", "--api-key", key, "--events", EVENTS, "--forward-to", `http://127.0.0.1:${PORT}/webhook/stripe`]);
 listen.stdout.on("data", stamp("stripe")); listen.stderr.on("data", stamp("stripe"));
 const stop = () => { try { server.kill(); } catch {} try { listen.kill(); } catch {} process.exit(0); };
 process.on("SIGINT", stop); process.on("SIGTERM", stop);

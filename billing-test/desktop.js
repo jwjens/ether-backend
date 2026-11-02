@@ -12,7 +12,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 
 const OPENAIR = "C:\\openair";
-const PROFILE = path.join(__dirname, "desktop-profile");
+const PROFILE = path.join(__dirname, process.env.BT_PROFILE || "desktop-profile");
 const CDP_PORT = 9333;
 
 if (require.main === module) {
@@ -22,8 +22,8 @@ if (require.main === module) {
     LOCALAPPDATA: path.join(PROFILE, "Local"),
     NODE_ENV: "development",
     ETHER_ISOLATED_DEV: "1",
-    ETHER_BACKEND_URL_DEV: "http://127.0.0.1:8787",
-    VITE_ETHER_BACKEND_URL: "http://127.0.0.1:8787",
+    ETHER_BACKEND_URL_DEV: `http://127.0.0.1:${process.env.BT_PORT || 8787}`,
+    VITE_ETHER_BACKEND_URL: `http://127.0.0.1:${process.env.BT_PORT || 8787}`,
   };
   delete env.ETHER_ALLOW_DEV_PUSH; delete env.ETHER_SMOKE;
   const log = fs.createWriteStream(path.join(__dirname, "desktop-app.log"), { flags: "a" });

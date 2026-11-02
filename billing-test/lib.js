@@ -7,12 +7,13 @@ const PW = process.env.PW_DIR || "C:\\Users\\jensj\\AppData\\Local\\Temp\\claude
 const { chromium } = require(PW);
 const { parseEnvFile } = require("../scripts/billing-test-server");
 
-const API = "http://127.0.0.1:8787";
-const CTL = "http://127.0.0.1:8788";
-const SITE = "http://localhost:5174";
+// A second run beside the first (2026-11-01 rerun): BT_PORT / BT_CONTROL_PORT / BT_SITE.
+const API = `http://127.0.0.1:${process.env.BT_PORT || 8787}`;
+const CTL = `http://127.0.0.1:${process.env.BT_CONTROL_PORT || 8788}`;
+const SITE = process.env.BT_SITE || "http://localhost:5174";
 const PASSWORD = "ether-test-1";
-const SCREENS = path.join(__dirname, "screens");
-const RESULTS = path.join(__dirname, "results.json");
+const SCREENS = path.join(__dirname, process.env.BT_SCREENS || "screens");
+const RESULTS = path.join(__dirname, process.env.BT_RESULTS || "results.json");
 fs.mkdirSync(SCREENS, { recursive: true });
 
 function stripe() {
@@ -37,7 +38,7 @@ async function api(method, p, body, token) {
 }
 // One sign-in per account per run (the server allows 40 sign-ins per 15 minutes per address): tokens are kept in
 // billing-test/tokens.json (gitignored) and reused while the server answers them.
-const TOKENS = path.join(__dirname, "tokens.json");
+const TOKENS = path.join(__dirname, process.env.BT_TOKENS || "tokens.json");
 const tokens = () => { try { return JSON.parse(fs.readFileSync(TOKENS, "utf8")); } catch { return {}; } };
 async function signup(email, name) {
   const t = tokens()[email];
@@ -129,7 +130,7 @@ async function appPage() {
 }
 
 /** Pull the audio level samples the page has collected (installLevelLog) and append them to billing-test/audio-levels.jsonl. */
-const LEVELS = path.join(__dirname, "audio-levels.jsonl");
+const LEVELS = path.join(__dirname, process.env.BT_LEVELS || "audio-levels.jsonl");
 async function installLevelLog(page) {
   // Once a second, in the app page: the engine's own counters (frames_total = samples rendered, rt_callbacks = output
   // callbacks — they only climb while audio is being output), deck A's and the master's level, deck A's status, and how

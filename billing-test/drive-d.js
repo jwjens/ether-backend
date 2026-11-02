@@ -8,7 +8,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const L = require("./lib");
-const STATE = path.join(__dirname, "d-state.json");
+const STATE = path.join(__dirname, process.env.BT_STATE || "d-state.json");
 
 const args = process.argv.slice(2);
 const stage = args[0];
