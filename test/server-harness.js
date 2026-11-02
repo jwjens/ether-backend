@@ -53,6 +53,20 @@ const PG_MEM_GAPS = [
       return { rows, rowCount: rows.length };
     },
   },
+  {
+    // pg-mem keeps NOT NULL on licenses.license_key's UNIQUE index after initDB's `ALTER COLUMN license_key DROP NOT NULL`,
+    // so a license stored by hash only (key_prefix + key_hash, license_key NULL — the Stripe webhook's INSERTs) is
+    // refused with "Cannot add a null record in index licenses_license_key_key". Production Postgres stores NULL there
+    // (UNIQUE allows any number of NULLs). The test stores a unique placeholder that can never equal a real key.
+    why: "NULL in a UNIQUE column whose NOT NULL was dropped (licenses.license_key)",
+    match: (sql) => /^\s*INSERT INTO licenses \(/i.test(sql) && !/license_key/.test(sql.slice(0, sql.indexOf(")"))) && /\)\s*VALUES\s*\(/i.test(sql),
+    run: async (q, sql, params = []) => {
+      const n = params.length + 1;
+      const out = sql.replace(/INSERT INTO licenses \(/i, "INSERT INTO licenses (license_key, ")
+                     .replace(/\)\s*VALUES\s*\(/i, (m) => `${m}$${n}, `);
+      return q(out, [...params, `pgmem-null-${crypto.randomUUID()}`]);
+    },
+  },
 ];
 
 function registerFunctions(db) {
@@ -75,11 +89,15 @@ async function startServer(opts = {}) {
   const { Pool } = db.adapters.createPg();
   const pool = new Pool();
   const raw = pool.query.bind(pool);
-  pool.query = (sql, params) => {
+  const withGaps = (run) => (sql, params) => {
     const text = typeof sql === "string" ? sql : sql && sql.text;
     const gap = text && PG_MEM_GAPS.find(g => g.match(text));
-    return gap ? gap.run(raw, text) : raw(sql, params);
+    return gap ? gap.run(run, text, params) : run(sql, params);
   };
+  pool.query = withGaps(raw);
+  // a transaction's client (pool.connect) gets the same stand-ins
+  const rawConnect = pool.connect.bind(pool);
+  pool.connect = async (...a) => { const c = await rawConnect(...a); const cq = c.query.bind(c); c.query = withGaps(cq); return c; };
   require("../src/lib/server-pool").useTestPool(pool);
   const srv = require("../src/index.js");
   // email leaves the machine: record it instead

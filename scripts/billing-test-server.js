@@ -23,6 +23,12 @@ const ENV_FILE = process.env.BILLING_TEST_ENV_FILE || path.join(ROOT, ".env.bill
 const PORT = Number(process.env.BILLING_TEST_PORT || 8787);
 const PASSWORD = "ether-test-1";
 const ACCOUNT_URL = process.env.BILLING_TEST_ACCOUNT_URL || "http://localhost:5174";
+// BILLING_TEST_SEED=0: start with an EMPTY database (no seeded state accounts) — the purchase run makes its own accounts.
+const SEED = process.env.BILLING_TEST_SEED !== "0";
+// BILLING_TEST_CONTROL_PORT: a second port on 127.0.0.1 only, for the test driver: GET /db?sql=SELECT… (read-only
+// SELECT on the in-memory database), POST /verify {email} (marks the sign-up confirmed — the email is recorded, never
+// sent), GET /emails (what would have been sent). Off unless set.
+const CONTROL_PORT = Number(process.env.BILLING_TEST_CONTROL_PORT || 0);
 
 /** KEY=VALUE lines (# comments, optional quotes). Never dotenv: it must not pick up any other file. */
 function parseEnvFile(text) {
@@ -108,7 +114,7 @@ async function main() {
   const bcrypt = require("bcrypt");
   const hash = await bcrypt.hash(PASSWORD, 8);
   const rows = [];
-  for (const a of accounts()) {
+  for (const a of SEED ? accounts() : []) {
     const email = `test+${a.slug}@ether-test.invalid`;
     const key = `ETH-STN-TEST-${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
     const lic = { email, license_key: key, key_prefix: key.slice(0, 12), plan: "station", active: true, account_name: a.name, ...a.lic };
@@ -133,7 +139,8 @@ async function main() {
   }
 
   // 4. One pass of the billing emails — recorded, never sent.
-  const mail = await srv.runBillingEmails();
+  const mail = SEED ? await srv.runBillingEmails() : { sent: [] };
+  if (CONTROL_PORT) startControl(h, CONTROL_PORT);
 
   const L = [];
   L.push("", "ETHER BILLING TEST SERVER — in-memory database, nothing reaches production, email recorded only", "");
@@ -162,6 +169,30 @@ async function main() {
   L.push("Ctrl+C stops it; everything is discarded.", "");
   console.log(L.join("\n"));
   return h;
+}
+
+/** The test driver's port (127.0.0.1 only): read-only SELECTs, confirm a sign-up, the recorded emails. */
+function startControl(h, port) {
+  const http = require("node:http");
+  const send = (res, code, body) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(body, null, 1)); };
+  http.createServer(async (req, res) => {
+    try {
+      const u = new URL(req.url, "http://127.0.0.1");
+      if (req.method === "GET" && u.pathname === "/db") {
+        const sql = String(u.searchParams.get("sql") || "").trim();
+        if (!/^select\s/i.test(sql) || /;\s*\S/.test(sql)) return send(res, 400, { error: "SELECT only" });
+        return send(res, 200, (await h.pool.query(sql)).rows);
+      }
+      if (req.method === "POST" && u.pathname === "/verify") {
+        let raw = ""; for await (const c of req) raw += c;
+        const email = String(JSON.parse(raw || "{}").email || "").toLowerCase();
+        const r = await h.pool.query(`UPDATE users SET email_verified = true WHERE lower(email) = $1`, [email]);
+        return send(res, 200, { verified: r.rowCount });
+      }
+      if (req.method === "GET" && u.pathname === "/emails") return send(res, 200, h.emails.map((m) => ({ to: m.to, subject: m.subject })));
+      send(res, 404, { error: "not_found" });
+    } catch (e) { send(res, 500, { error: e.message }); }
+  }).listen(port, "127.0.0.1", () => console.log(`  Control:   http://127.0.0.1:${port} (/db?sql=SELECT…, POST /verify, /emails) — test driver only`));
 }
 
 if (require.main === module) {
