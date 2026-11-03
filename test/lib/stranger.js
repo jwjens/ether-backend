@@ -41,6 +41,12 @@ async function seedAccount(pool, tag) {
   const opsKey = crypto.randomBytes(16).toString("hex");
   await q(`INSERT INTO station_ops_token (station_uuid, token) VALUES ($1,$2)`, [uuid, opsKey]);
   const parkTok = crypto.randomBytes(16).toString("hex");
+  // ONE PARK PAGE PER CLUSTER (2026-11-02): the account's handle is its cluster name, and a cluster login has no station.
+  const cluster = `acct-${tag.toLowerCase()}-${crypto.randomBytes(3).toString("hex")}`;
+  await q(`UPDATE licenses SET account_slug = $1 WHERE id = $2`, [cluster, lic]);
+  const parkClusterTok = crypto.randomBytes(16).toString("hex");
+  await q(`INSERT INTO park_sessions (token_hash, license_key_id, username_lower, station_uuid, pin_fp) VALUES ($1,$2,'admin',NULL,$3)`,
+    [parkAuth.tokenHash(parkClusterTok), lic, parkAuth.pinFingerprint(pinHash)]);
   await q(`INSERT INTO park_sessions (token_hash, license_key_id, username_lower, station_uuid, pin_fp) VALUES ($1,$2,'admin',$3,$4)`,
     [parkAuth.tokenHash(parkTok), lic, uuid, parkAuth.pinFingerprint(pinHash)]);
   const hash = crypto.createHash("sha256").update(`song-${tag}`).digest("hex");
@@ -60,7 +66,7 @@ async function seedAccount(pool, tag) {
   await q(`INSERT INTO auth_sessions (id, user_id, machine_id, device_name, method, refresh_hash) VALUES ($1,$2,$3,'PC','password',$4)`,
     [sessionId, uid, machine, crypto.randomBytes(16).toString("hex")]);
   await q(`INSERT INTO station_attachments (license_key_id, surface_id, machine_name, station_uuid, role) VALUES ($1,$2,$3,$4,'playout')`, [lic, machine, `PC ${tag}`, uuid]);
-  return { tag, key, email, lic, uid, opId, uuid, stationId, stationName, slug, machine, opsKey, parkTok, songHash: hash, rowUuid, backupId, sessionId };
+  return { tag, key, email, lic, uid, opId, uuid, stationId, stationName, slug, machine, opsKey, parkTok, parkClusterTok, cluster, songHash: hash, rowUuid, backupId, sessionId };
 }
 
 function tokensFor(acct, secret) {
@@ -81,6 +87,7 @@ function credentialsOf(B, secret) {
     { name: "B user token", headers: { authorization: `Bearer ${t.user}` } },
     { name: "B owner token", headers: { authorization: `Bearer ${t.owner}` } },
     { name: "B Park session", headers: { "x-park-session": B.parkTok } },
+    { name: "B Park cluster login", headers: { "x-park-session": B.parkClusterTok } },
     { name: "B Park key", headers: { "x-ops-token": B.opsKey } },
   ];
 }
@@ -88,7 +95,7 @@ function credentialsOf(B, secret) {
 /** A's ids for each path parameter name. `:id` is the license id unless the route says otherwise (overrides). */
 function paramsFor(A) {
   return { uuid: A.uuid, accountId: A.lic, id: A.lic, machineId: A.machine, slug: A.slug, key: A.key, content_hash: A.songHash,
-           table: "categories", rowUuid: A.rowUuid, membershipId: 1, cmd_id: "cmd-a", token: A.parkTok, email: A.email, granteeId: A.lic };
+           table: "categories", rowUuid: A.rowUuid, membershipId: 1, cmd_id: "cmd-a", token: A.parkTok, email: A.email, granteeId: A.lic, name: A.cluster };
 }
 
 /** A's ids in the fields routes read them from. B's own key rides along where a route takes a key in the body. */

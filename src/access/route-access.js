@@ -193,6 +193,11 @@ const ROUTES = {
   "POST /public/ops/:slug/talk/warm/stop": A("park"),
   "POST /public/ops/:slug/talk": A("park"),
   "POST /public/ops/:slug/talk/stop": A("park"),
+  "GET /public/park/:name": P("the cluster Park page's public face: the cluster's name and its published stations (names and slugs, as the listen hub shows)"),
+  "POST /public/park/:name/login": A("park"),
+  "GET /public/park/:name/me": A("park"),
+  "PUT /public/park/:name/last-station": A("park"),
+  "POST /public/park/:name/logout": A("park"),
   "POST /internal/mediamtx/auth": A("park"),
 
   // ── jukebox ────────────────────────────────────────────────────────────────────────────────────────────────────────

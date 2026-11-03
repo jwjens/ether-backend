@@ -30,15 +30,22 @@ const pinFingerprint = (pinHash) => sha256('park-pin:' + String(pinHash || ''));
 
 /**
  * Is this device session still good?
- * @param {{ended_at:any, pin_fp:string, station_uuid:string}|null} session
+ * @param {{ended_at:any, pin_fp:string, station_uuid:string|null, license_key_id:number}|null} session
+ *        station_uuid NULL = a CLUSTER login (park-cluster.js): one sign-in for every station of the account
  * @param {{pin_hash:string}|null} user   the live account_users row for that username (null = removed)
  * @param {string} stationUuid                 the station the request is for
+ * @param {number|string|null} [stationLicenseId]  that station's account (license); needed for a cluster login
  * @returns {{ok:true}|{ok:false, reason:string, message:string}}
  */
-function sessionVerdict(session, user, stationUuid) {
+function sessionVerdict(session, user, stationUuid, stationLicenseId = null) {
   if (!session) return { ok: false, reason: 'no_session', message: 'Please log in.' };
   if (session.ended_at) return { ok: false, reason: 'logged_out', message: 'You were logged out. Please log in again.' };
-  if (session.station_uuid !== stationUuid) return { ok: false, reason: 'other_station', message: 'This login is for a different station. Please log in here.' };
+  if (session.station_uuid == null) {
+    // A cluster login: good for a station of the SAME account only — checked here on every request, station by station.
+    if (stationLicenseId == null || Number(stationLicenseId) !== Number(session.license_key_id)) {
+      return { ok: false, reason: 'other_account', message: 'This login is for a different park. Please log in here.' };
+    }
+  } else if (session.station_uuid !== stationUuid) return { ok: false, reason: 'other_station', message: 'This login is for a different station. Please log in here.' };
   if (!user) return { ok: false, reason: 'user_removed', message: 'This user was removed. Ask the station manager.' };
   if (pinFingerprint(user.pin_hash) !== session.pin_fp) return { ok: false, reason: 'pin_changed', message: 'Your PIN was changed. Please log in with the new PIN.' };
   return { ok: true };

@@ -6,5 +6,6 @@ const { runArea } = require("./lib/stranger");
 runArea("park", {
   overrides: {
     "POST /public/ops/:slug/login": { ignoreColumns: { account_users: ["failed_attempts", "locked_until", "updated_at"] } },
+    "POST /public/park/:name/login": { ignoreColumns: { account_users: ["failed_attempts", "locked_until", "updated_at"] } },
   },
 });

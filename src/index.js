@@ -52,6 +52,7 @@ const opsCore = require("./ops-core");   // Park Ops: closing-time resolution + 
 const { deriveStationState, parseSourceFields, resolveSourceMachineId, sourceFields } = require("./station-state");
 const broadcastOwner = require("./lib/broadcast-owner"); // ONE broadcast owner per station (2026-10-13)
 const parkAuth = require("./lib/park-auth");             // Park page staff login with the existing username + PIN users
+const parkCluster = require("./lib/park-cluster");       // ONE Park page per cluster (account handle): park.ether-cast.com/<cluster>
 const parkSound = require("./lib/park-sound");
 const { ListenBook, pathOf: listenPathOf, bufferMsOf, STATION_LEASE_SEC } = require("./lib/park-listen");
 const { TalkBook: ParkTalkBook, warmPathOf, STATION_LEASE_SEC: TALK_LEASE_SEC } = require("./lib/park-talk");   // Hold to talk (2026-10-16)   // Park page Listen (2026-10-13)           // the Park page fader stays steady (older-build pushes, owner online)
@@ -695,6 +696,18 @@ async function initDB() {
       last_seen_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       ended_at       TIMESTAMPTZ,
       end_reason     TEXT
+    )
+  `);
+  // ONE PARK PAGE PER CLUSTER (2026-11-02, lib/park-cluster.js): a cluster login is a session with no station (station_uuid
+  // NULL), good for every station of its account; and the station each login picked last, remembered per login.
+  await pool.query(`ALTER TABLE park_sessions ALTER COLUMN station_uuid DROP NOT NULL`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS park_user_prefs (
+      license_key_id    INTEGER NOT NULL REFERENCES licenses(id) ON DELETE CASCADE,
+      username_lower    TEXT NOT NULL,
+      last_station_uuid TEXT REFERENCES stations(uuid) ON DELETE SET NULL,
+      updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (license_key_id, username_lower)
     )
   `);
   await pool.query(`
@@ -2578,6 +2591,12 @@ app.post("/api/user/account-slug", requireAuth, async (req, res) => {
       const reserved = (await pool.query(
         `SELECT 1 FROM account_slug_history WHERE lower(old_slug) = $1 AND license_key_id <> $2 LIMIT 1`, [slug, req.auth.lk])).rows[0];
       if (reserved) return res.status(409).json({ error: "taken" });
+      // The handle is also the Park page's cluster address (park.ether-cast.com/<handle>, lib/park-cluster.js), which shares
+      // its first path segment with the old per-station Park links: another account's station slug cannot be taken.
+      const stationsNamed = (await pool.query(
+        `SELECT s.license_key_id FROM station_metadata m JOIN stations s ON s.uuid = m.station_uuid
+          WHERE lower(m.slug) = $1 AND m.public_enabled = true`, [slug])).rows;
+      if (parkCluster.clusterNameClash(stationsNamed, req.auth.lk)) return res.status(409).json({ error: "taken" });
 
       // Breadcrumb the old handle so its promoted links redirect to the new one.
       if (currentSlug) {
@@ -6192,6 +6211,11 @@ app.post("/api/ops/token", async (req, res) => {
 // is what actually governs what airs. emitCommand queues when no install is connected and drains on
 // reconnect, so a change made while the park's machine is off still lands when it comes back.
 // ── Park page staff login (2026-10-13) ─────────────────────────────────────────────────────────────────────────────
+/** The account (license id) that owns a station, or null. A cluster login is good only for its own account's stations. */
+async function stationLicenseOf(stationUuid) {
+  const { rows } = await pool.query(`SELECT license_key_id FROM stations WHERE uuid = $1`, [stationUuid]);
+  return rows.length ? rows[0].license_key_id : null;
+}
 /** The account's lockout rule (Remote page → Users → Login safety); unset = the values that applied before. */
 async function lockoutRuleFor(licenseId) {
   const { rows } = await pool.query(`SELECT pin_max_fails, pin_lockout_minutes FROM account_security_settings WHERE license_key_id = $1`, [licenseId]);
@@ -6212,7 +6236,7 @@ async function parkActor(req, stationUuid) {
         `SELECT id, username, display_name, pin_hash FROM account_users
           WHERE license_key_id = $1 AND lower(username) = $2 AND deleted_at IS NULL`, [s.license_key_id, s.username_lower])).rows[0] || null;
     }
-    const v = parkAuth.sessionVerdict(s, user, stationUuid);
+    const v = parkAuth.sessionVerdict(s, user, stationUuid, await stationLicenseOf(stationUuid));
     if (!v.ok) {
       if (s && !s.ended_at) await pool.query(`UPDATE park_sessions SET ended_at = NOW(), end_reason = $2 WHERE token_hash = $1`, [s.token_hash, v.reason]);
       return { ok: false, status: 401, body: { ok: false, error: v.message, reason: v.reason, logged_out: true } };
@@ -6249,7 +6273,7 @@ async function parkViewerIsStaff(req, stationUuid) {
       const user = (await pool.query(
         `SELECT id, username, display_name, pin_hash FROM account_users
           WHERE license_key_id = $1 AND lower(username) = $2 AND deleted_at IS NULL`, [s.license_key_id, s.username_lower])).rows[0] || null;
-      return parkAuth.sessionVerdict(s, user, stationUuid).ok;
+      return parkAuth.sessionVerdict(s, user, stationUuid, await stationLicenseOf(stationUuid)).ok;
     }
     const supplied = String(req.query.k || req.headers["x-ops-token"] || "");
     if (!supplied) return false;
@@ -6334,6 +6358,155 @@ app.post("/public/ops/:slug/logout", async (req, res) => {
     }
     res.json({ ok: true });
   } catch (e) { console.error("[public/ops logout]", e.message); res.status(500).json({ ok: false, error: "server_error" }); }
+});
+
+
+// ── ONE PARK PAGE PER CLUSTER (Jeff, 2026-11-02; lib/park-cluster.js) ───────────────────────────────────────────────────
+// park.ether-cast.com/<cluster>: the account's handle (Ether → Station Manager: name + handle). The page asks
+// /public/park/<name> what the name is, signs in ONCE for the whole cluster, and then drives every station through the
+// per-station /public/ops/<station-slug>/… routes above, unchanged: each of them checks the cluster login against that
+// station (park-auth.sessionVerdict), so access is decided station by station on every request.
+
+/** The cluster (license) behind a handle, its stations (published, with a slug), or null. */
+async function parkClusterBySlug(name) {
+  const lic = (await pool.query(`SELECT id, account_slug, account_name, account_logo_url FROM licenses WHERE lower(account_slug) = $1 LIMIT 1`, [name])).rows[0];
+  if (!lic) return null;
+  const stations = (await pool.query(
+    `SELECT m.slug, m.display_name, m.logo_url, s.uuid, s.name
+       FROM stations s JOIN station_metadata m ON m.station_uuid = s.uuid
+      WHERE s.license_key_id = $1 AND m.public_enabled = true AND m.slug IS NOT NULL
+      ORDER BY lower(COALESCE(m.display_name, s.name, m.slug))`, [lic.id])).rows;
+  return { id: lic.id, slug: lic.account_slug.toLowerCase(), name: lic.account_name || null, logo_url: lic.account_logo_url || null,
+           stations: stations.map(r => ({ slug: r.slug, name: r.display_name || r.name || r.slug, logo_url: r.logo_url || null, uuid: r.uuid })) };
+}
+const publicStations = (c) => c.stations.map(({ slug, name, logo_url }) => ({ slug, name, logo_url }));
+
+app.get("/public/park/:name", async (req, res) => {
+  const name = String(req.params.name || "").toLowerCase();
+  try {
+    const cluster = await parkClusterBySlug(name);
+    let renamed = null, station = null;
+    if (!cluster) {
+      const h = (await pool.query(
+        `SELECT l.account_slug FROM account_slug_history h JOIN licenses l ON l.id = h.license_key_id
+          WHERE lower(h.old_slug) = $1 AND l.account_slug IS NOT NULL LIMIT 1`, [name])).rows[0];
+      if (h) renamed = { slug: h.account_slug.toLowerCase() };
+      else {
+        const found = await resolveOpsSlug(name);   // a station slug (or a renamed one) — the old per-station links
+        if (found) {
+          const st = (await pool.query(
+            `SELECT m.slug, l.account_slug FROM station_metadata m JOIN stations s ON s.uuid = m.station_uuid
+               JOIN licenses l ON l.id = s.license_key_id WHERE m.station_uuid = $1`, [found.uuid])).rows[0];
+          if (st) station = { slug: st.slug, clusterSlug: st.account_slug ? st.account_slug.toLowerCase() : null };
+        }
+      }
+    }
+    const d = parkCluster.resolveParkName(name, cluster, renamed, station);
+    if (d.kind === "not_found") return res.status(404).json({ error: "not_found" });
+    if (d.kind === "cluster") return res.json({ ok: true, kind: "cluster", cluster: { slug: cluster.slug, name: cluster.name, logo_url: cluster.logo_url }, stations: publicStations(cluster) });
+    return res.json({ ok: true, ...d });
+  } catch (e) { console.error("[public/park]", e.message); res.status(500).json({ error: "server_error" }); }
+});
+
+/** The live login for a cluster request: the session (station_uuid NULL, this cluster's account) and its user. */
+async function parkClusterSession(req, cluster) {
+  const tok = String(req.headers["x-park-session"] || "");
+  if (!tok) return { ok: false, status: 200, body: { ok: false, reason: "no_session" } };
+  const s = (await pool.query(`SELECT * FROM park_sessions WHERE token_hash = $1`, [parkAuth.tokenHash(tok)])).rows[0] || null;
+  const user = s ? (await pool.query(
+    `SELECT id, username, display_name, pin_hash FROM account_users WHERE license_key_id = $1 AND lower(username) = $2 AND deleted_at IS NULL`,
+    [s.license_key_id, s.username_lower])).rows[0] || null : null;
+  // A cluster login only (a per-station login belongs to that station's own page), and only for THIS cluster's account.
+  const v = s && s.station_uuid != null ? { ok: false, reason: "other_station", message: "Please log in here." }
+                                         : parkAuth.sessionVerdict(s, user, null, cluster.id);
+  if (!v.ok) {
+    if (s && !s.ended_at && s.station_uuid == null) await pool.query(`UPDATE park_sessions SET ended_at = NOW(), end_reason = $2 WHERE token_hash = $1`, [s.token_hash, v.reason]);
+    return { ok: false, status: 401, body: { ok: false, error: v.message, reason: v.reason, logged_out: true } };
+  }
+  await pool.query(`UPDATE park_sessions SET last_seen_at = NOW() WHERE token_hash = $1`, [s.token_hash]);
+  return { ok: true, session: s, user, name: user.display_name || user.username };
+}
+async function parkRemembered(cluster, usernameLower) {
+  const r = (await pool.query(
+    `SELECT m.slug FROM park_user_prefs p JOIN station_metadata m ON m.station_uuid = p.last_station_uuid
+      WHERE p.license_key_id = $1 AND p.username_lower = $2`, [cluster.id, usernameLower])).rows[0];
+  return r ? r.slug : null;
+}
+
+// LOG IN ONCE for the whole cluster: the account's username + PIN users and the account's lockout rule, exactly as the
+// per-station login. The answer names the station this login picked last (null = never picked one).
+app.post("/public/park/:name/login", authLimiter, async (req, res) => {
+  const name = String(req.params.name || "").toLowerCase();
+  try {
+    const cluster = await parkClusterBySlug(name);
+    if (!cluster) return res.status(404).json({ ok: false, error: "not_found" });
+    const username = normUsername(req.body?.username);
+    const pin = String(req.body?.pin || "");
+    if (!username || !pin) return res.status(400).json({ ok: false, error: "Enter your username and PIN." });
+    const user = (await pool.query(
+      `SELECT * FROM account_users WHERE license_key_id = $1 AND lower(username) = lower($2) AND deleted_at IS NULL`,
+      [cluster.id, username])).rows[0];
+    if (!user) return res.status(401).json({ ok: false, error: "Wrong username or PIN." });
+    if (user.locked_until && new Date(user.locked_until) > new Date()) {
+      return res.status(423).json({ ok: false, error: "Too many wrong PINs. Try again later.", until: user.locked_until });
+    }
+    if (!(await verifyPin(pin, user.pin_hash))) {
+      const r = parkAuth.afterWrongPin(user.failed_attempts, await lockoutRuleFor(cluster.id), Date.now());
+      await pool.query(`UPDATE account_users SET failed_attempts = $1, locked_until = $2, updated_at = NOW() WHERE id = $3`,
+        [r.failed_attempts, r.locked_until, user.id]);
+      if (r.locked_until) return res.status(423).json({ ok: false, error: "Too many wrong PINs. Try again later.", until: r.locked_until });
+      return res.status(401).json({ ok: false, error: "Wrong username or PIN." });
+    }
+    await pool.query(`UPDATE account_users SET failed_attempts = 0, locked_until = NULL, updated_at = NOW() WHERE id = $1`, [user.id]);
+    const ul = String(user.username).toLowerCase();
+    const who = user.display_name || user.username;
+    const sess = parkAuth.newSession();
+    await pool.query(
+      `INSERT INTO park_sessions (token_hash, license_key_id, username_lower, station_uuid, pin_fp) VALUES ($1,$2,$3,NULL,$4)`,
+      [sess.tokenHash, cluster.id, ul, parkAuth.pinFingerprint(user.pin_hash)]);
+    const last = await parkRemembered(cluster, ul);
+    const auditOn = cluster.stations.find(s => s.slug === last) || cluster.stations[0];
+    if (auditOn) await parkAudit(auditOn.uuid, { name: who, via: "login" }, "logged in (cluster page)", { cluster: cluster.slug });
+    res.json({ ok: true, token: sess.token, name: who, last_station: last });
+  } catch (e) { console.error("[public/park login]", e.message); res.status(500).json({ ok: false, error: "server_error" }); }
+});
+// WHO AM I, and the station this login picked last.
+app.get("/public/park/:name/me", async (req, res) => {
+  try {
+    const cluster = await parkClusterBySlug(String(req.params.name || "").toLowerCase());
+    if (!cluster) return res.status(404).json({ ok: false, error: "not_found" });
+    const a = await parkClusterSession(req, cluster);
+    if (!a.ok) return res.status(a.status).json(a.body);
+    res.json({ ok: true, name: a.name, last_station: await parkRemembered(cluster, a.session.username_lower) });
+  } catch (e) { console.error("[public/park me]", e.message); res.status(500).json({ ok: false, error: "server_error" }); }
+});
+// REMEMBER the station this login picked (one of this cluster's own stations, nothing else).
+app.put("/public/park/:name/last-station", async (req, res) => {
+  try {
+    const cluster = await parkClusterBySlug(String(req.params.name || "").toLowerCase());
+    if (!cluster) return res.status(404).json({ ok: false, error: "not_found" });
+    const a = await parkClusterSession(req, cluster);
+    if (!a.ok) return res.status(a.status === 200 ? 401 : a.status).json(a.body.reason === "no_session" ? { ok: false, error: "Log in first." } : a.body);
+    const st = cluster.stations.find(s => s.slug === String(req.body?.station || "").toLowerCase());
+    if (!st) return res.status(404).json({ ok: false, error: "That station is not in this park." });
+    await pool.query(
+      `INSERT INTO park_user_prefs (license_key_id, username_lower, last_station_uuid, updated_at) VALUES ($1,$2,$3,NOW())
+       ON CONFLICT (license_key_id, username_lower) DO UPDATE SET last_station_uuid = EXCLUDED.last_station_uuid, updated_at = NOW()`,
+      [cluster.id, a.session.username_lower, st.uuid]);
+    res.json({ ok: true, station: st.slug });
+  } catch (e) { console.error("[public/park last-station]", e.message); res.status(500).json({ ok: false, error: "server_error" }); }
+});
+app.post("/public/park/:name/logout", async (req, res) => {
+  try {
+    const tok = String(req.headers["x-park-session"] || "");
+    const cluster = await parkClusterBySlug(String(req.params.name || "").toLowerCase());
+    if (cluster && tok) {
+      await pool.query(`UPDATE park_sessions SET ended_at = NOW(), end_reason = 'log_out'
+                         WHERE token_hash = $1 AND ended_at IS NULL AND station_uuid IS NULL AND license_key_id = $2`,
+        [parkAuth.tokenHash(tok), cluster.id]);
+    }
+    res.json({ ok: true });
+  } catch (e) { console.error("[public/park logout]", e.message); res.status(500).json({ ok: false, error: "server_error" }); }
 });
 
 
