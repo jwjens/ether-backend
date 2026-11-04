@@ -8026,6 +8026,13 @@ app.use('/library', requireLicenseOrMember, libraryRouter);
 // v2 subscription model: station attach/detach (POST /account/attach, /account/detach). Auth via
 // license_key in body (same as /account/connect), so mounted plainly at /account.
 const attachmentsRouter = require('./routes/attachments')(pool, lookupLicense);
+// IRIS STAGE 1 — built-in help (desktop repo docs/iris-stage1-plan-2026-11-04.md). The AI key is Ether's, in Railway's
+// ANTHROPIC_API_KEY; without it /api/iris/ask answers 503 and the desktop answers from the manual.
+const _AnthropicSdk = require("@anthropic-ai/sdk");
+const _Anthropic = _AnthropicSdk.default || _AnthropicSdk;
+app.use('/api/iris', require('./routes/iris')(pool, lookupLicense, {
+  anthropic: process.env.ANTHROPIC_API_KEY ? new _Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }) : null,
+}));
 app.use('/account', attachmentsRouter);
 
 // Remote Link pairing (Jeff's ruling 2026-10-04: the link key is never copied by hand). Same account: machines

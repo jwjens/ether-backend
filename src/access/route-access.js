@@ -111,6 +111,14 @@ const ROUTES = {
   "POST /api/station/:uuid/logo-upload-url": A("stations"),
   "POST /api/station/:uuid/now-playing-art-upload-url": A("stations"),
   "POST /api/now-playing": A("stations"),
+  // ── Iris (built-in help; src/routes/iris.js). The license key is the only key; each reaches only its own usage row. ──
+  "GET /api/iris/knowledge": P("the user manual for one Ether version, the same text shipped in every installer; no account data"),
+  "POST /api/iris/knowledge": P("CI publishes the manual pack with the admin secret; no account data"),
+  "GET /api/iris/capability": P("license key in, that license's own Iris voice tier and this month's use; no other account reachable"),
+  "POST /api/iris/ask": P("license key in, an answer from the public manual + the settings the caller sent; writes only that license's own usage row"),
+  "POST /api/iris/manual-answer": P("license key in, adds one to that license's own usage row; nothing else"),
+  "POST /api/iris/speak": P("voice not built: always 501"),
+  "POST /api/iris/listen": P("voice not built: always 501"),
 
   // ── analytics, play history, billing ───────────────────────────────────────────────────────────────────────────────
   "POST /api/account/play-history": A("analytics"),

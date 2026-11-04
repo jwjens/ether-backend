@@ -30,8 +30,9 @@ test("each entry is account (with a known area) or public (with a reason)", () =
   }
 });
 
-test("the inventory's size is what was reviewed (203 routes: account and public)", () => {
+// 203 + the 7 Iris routes (src/routes/iris.js, 2026-11-04), each classified public with its reason.
+test("the inventory's size is what was reviewed (210 routes: account and public)", () => {
   const n = (a) => Object.values(ROUTES).filter(v => v.access === a).length;
-  assert.equal(routes.length, 203);
+  assert.equal(routes.length, 210);
   console.log(`routes ${routes.length}: account ${n("account")}, public ${n("public")}`);
 });

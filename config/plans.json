@@ -34,6 +34,10 @@
     "hosted_streams": "unlimited", "max_bitrate_kbps": 320, "listener_pool": 250, "r2_quota_gb": 500, "priority_support": true
   },
   "features": {
+    "iris": {
+      "label": "Includes Iris, Ether's built-in help (Local: she answers in text and speaks; every other plan: type or speak)",
+      "plans": ["local", "station", "pro", "unlimited"]
+    },
     "public_page":    { "label": "Public listener page, account hub, embeds", "plans": ["local", "station", "pro", "unlimited"] },
     "now_playing":    { "label": "Now-playing for the listener page",         "plans": ["local", "station", "pro", "unlimited"] },
     "hosted_stream":  { "label": "Hosted stream (Ether's Icecast)",           "plans": ["station", "pro", "unlimited"] },

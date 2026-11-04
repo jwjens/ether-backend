@@ -49,7 +49,8 @@ test("catalog: Local has no cloud; the Remote Link relay is Station and up", () 
   assert.equal(catalog.plans.local.cloud, false);
   assert.deepEqual(catalog.features.link_relay.plans, ["station", "pro", "unlimited"]);
   for (const [f, d] of Object.entries(catalog.features))
-    if (!["public_page", "now_playing"].includes(f)) assert.ok(!d.plans.includes("local"), `Local carries cloud feature ${f}`);
+    // iris: Jeff, 2026-11-04 — "Includes Iris" on every plan, including Local (desktop docs/iris-stage1-plan-2026-11-04.md).
+    if (!["public_page", "now_playing", "iris"].includes(f)) assert.ok(!d.plans.includes("local"), `Local carries cloud feature ${f}`);
 });
 
 test("catalog: validation refuses a bad catalog (the server would not boot on it)", () => {
