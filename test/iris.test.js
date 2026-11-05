@@ -141,3 +141,28 @@ test("no AI key configured → 503, so the desktop answers from the manual", asy
     assert.equal((await s.call("POST", "/ask", { key: "lk-live", body: { version: "4.6.71", question: "x?" } })).status, 503);
   } finally { await s.close(); }
 });
+
+test("knowledge publish reads ETHER_ADMIN_SECRET, not the master ADMIN_SECRET; unset refuses everyone", async () => {
+  const db = newDb();
+  const { Pool } = db.adapters.createPg();
+  const app = express();
+  app.use(express.json({ limit: "10mb" }));
+  app.use("/api/iris", iris(new Pool(), async () => null, { anthropic: null }));
+  const srv = await new Promise(r => { const s = http.createServer(app).listen(0, "127.0.0.1", () => r(s)); });
+  const post = (secret) => fetch(`http://127.0.0.1:${srv.address().port}/api/iris/knowledge`, { method: "POST",
+    headers: { "Content-Type": "application/json", ...(secret ? { "x-admin-secret": secret } : {}) }, body: JSON.stringify(PACK) });
+  const saved = { e: process.env.ETHER_ADMIN_SECRET, a: process.env.ADMIN_SECRET };
+  try {
+    process.env.ADMIN_SECRET = "master";
+    delete process.env.ETHER_ADMIN_SECRET;
+    assert.equal((await post("master")).status, 403);
+    assert.equal((await post()).status, 403);
+    process.env.ETHER_ADMIN_SECRET = "publisher";
+    assert.equal((await post("master")).status, 403);
+    assert.equal((await post("publisher")).status, 200);
+  } finally {
+    if (saved.e === undefined) delete process.env.ETHER_ADMIN_SECRET; else process.env.ETHER_ADMIN_SECRET = saved.e;
+    if (saved.a === undefined) delete process.env.ADMIN_SECRET; else process.env.ADMIN_SECRET = saved.a;
+    await new Promise(r => srv.close(r));
+  }
+});

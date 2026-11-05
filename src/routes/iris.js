@@ -3,7 +3,7 @@
 // contract's help-mode section, docs/iris-ether-contract.md §7).
 //
 //   GET  /api/iris/knowledge?version=4.6.71   the manual pack for that version (or the nearest earlier one); public
-//   POST /api/iris/knowledge                  CI publishes a pack (x-admin-secret)
+//   POST /api/iris/knowledge                  CI publishes a pack (x-admin-secret = ETHER_ADMIN_SECRET)
 //   GET  /api/iris/capability                 what this license gets: voice flags + this month's use (x-license-key)
 //   POST /api/iris/ask                        { version, question, sectionIds[], settings[], history[] } → answer
 //   POST /api/iris/speak, /api/iris/listen    voice: designed in, not built yet (501)
@@ -90,7 +90,7 @@ function cmpVersion(a, b) {
   return 0;
 }
 
-module.exports = function irisRouter(pool, lookupLicense, { anthropic = null, adminSecret = () => process.env.ADMIN_SECRET } = {}) {
+module.exports = function irisRouter(pool, lookupLicense, { anthropic = null, adminSecret = () => process.env.ETHER_ADMIN_SECRET } = {}) {
   const router = express.Router();
   let ready = null;
   const ensure = () => ready || (ready = (async () => {
